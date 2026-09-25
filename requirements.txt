@@ -1,0 +1,9 @@
+laya
+fastapi[standard]
+uvicorn[standard]
+pyautogui
+mss
+psutil
+Pillow
+jinja2
+python-multipart

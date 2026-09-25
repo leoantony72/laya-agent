@@ -1,0 +1,37 @@
+[
+  {
+    "name": "custom_get_system_uptime",
+    "description": "Automate: get system uptime",
+    "script": "\n            # Generated automation for: get system uptime\n            Write-Output \"Executed custom task: get system uptime\"\n            return \"Task completed\"\n            ",
+    "scope": null,
+    "speak": "done",
+    "examples": [
+      "get system uptime"
+    ],
+    "args": []
+  },
+  {
+    "name": "get_wifi_password",
+    "description": "Show the current Wi-Fi network password/security key.",
+    "script": "\n                $ssid = (netsh wlan show interfaces | Select-String \"^\\s*SSID\\s*:\" | Where-Object { $_ -notmatch \"BSSID\" }) -replace '.*:\\s*',''\n                if ($ssid) {\n                    $key = (netsh wlan show profile name=\"$ssid\" key=clear | Select-String \"Key Content\") -replace '.*:\\s*',''\n                    return \"Wi-Fi '$ssid' Password: $key\"\n                } else { return \"Not connected to any Wi-Fi network\" }\n                ",
+    "scope": null,
+    "speak": "done",
+    "examples": [
+      "show wifi password",
+      "what is my wifi password",
+      "get wifi key"
+    ],
+    "args": []
+  },
+  {
+    "name": "custom_turn_on_dark_mode",
+    "description": "Automate: turn on dark mode",
+    "script": "\n            # Generated automation for: turn on dark mode\n            Write-Output \"Executed custom task: turn on dark mode\"\n            return \"Task completed\"\n            ",
+    "scope": null,
+    "speak": "done",
+    "examples": [
+      "turn on dark mode"
+    ],
+    "args": []
+  }
+]
