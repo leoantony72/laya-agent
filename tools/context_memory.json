@@ -1,6 +1,6 @@
 {
   "last_file": "C:\\Users\\USER\\Downloads\\images.jpg",
-  "last_folder": "C:\\Users\\USER\\Downloads",
+  "last_folder": "C:\\Users\\USER\\Documents",
   "last_app": null,
   "history": [
     {
@@ -14,6 +14,18 @@
       "kind": "file",
       "path": "C:\\Users\\USER\\Downloads\\images.jpg",
       "label": "images.jpg"
+    },
+    {
+      "ts": 1791136455.7541842,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1791136483.8139095,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Documents",
+      "label": "documents"
     }
   ]
 }

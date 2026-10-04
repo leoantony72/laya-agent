@@ -22,3 +22,6 @@
 {"ts": 1791135543.9117424, "type": "command", "utterance": "open images.jpg", "tier": "heuristic", "tool": "open_file", "confidence": 0.9, "route_latency_ms": 5160.8, "success": true, "total_elapsed_ms": 9605.8}
 {"ts": 1791135585.5998456, "type": "command", "utterance": "close the downloads foler", "tier": "heuristic", "tool": null, "confidence": 0.5, "route_latency_ms": 5021.0, "success": false, "total_elapsed_ms": 10775.6}
 {"ts": 1791135597.2022328, "type": "command", "utterance": "close the downloads folder", "tier": "heuristic", "tool": null, "confidence": 0.5, "route_latency_ms": 5093.9, "success": false, "total_elapsed_ms": 10140.2}
+{"ts": 1791136455.8133097, "type": "command", "utterance": "can you open the downloads folder", "tier": "heuristic", "tool": "open_folder", "confidence": 0.92, "route_latency_ms": 5087.6, "success": true, "total_elapsed_ms": 8143.2}
+{"ts": 1791136483.816293, "type": "command", "utterance": "please open the documents folder", "tier": "heuristic", "tool": "open_folder", "confidence": 0.92, "route_latency_ms": 5044.8, "success": true, "total_elapsed_ms": 5661.1}
+{"ts": 1791136527.676985, "type": "command", "utterance": "lock", "tier": "heuristic", "tool": null, "confidence": 0.5, "route_latency_ms": 5043.7, "success": false, "total_elapsed_ms": 12244.6}

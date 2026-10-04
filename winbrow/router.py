@@ -22,6 +22,7 @@ from typing import Any, Optional
 from .registry import MAX_CHOICE_OPTIONS, Tool, ToolRegistry
 from .resolvers import resolve_file as _resolve_file
 from . import files as _files
+from . import small_llm
 from .windows import WindowsContext
 
 log = logging.getLogger("winbrow.router")
@@ -32,6 +33,13 @@ STOP = "stop"
 
 MIN_TOOL_CONFIDENCE = 0.35
 NEW_ACTION_MIN_CONFIDENCE = 0.55
+
+# Nicknames the bundled folder tools understand. Kept in one place so the
+# open/close fallback branches agree on what a "folder" can be.
+_SYSTEM_FOLDERS = frozenset({
+    "downloads", "documents", "desktop", "pictures", "music",
+    "videos", "home", "appdata", "temp", "startup", "recycle",
+})
 
 
 def _laya_timeout_default() -> float:
@@ -299,7 +307,45 @@ class WinBrowRouter:
             log.warning(f"Laya routing failed ({e}); using exact-intent fallback.")
 
         # 2. Fallback: only intents that must never fail.
-        return self._fallback_route(text, tools, t0, ctx, memory=memory)
+        fb = self._fallback_route(text, tools, t0, ctx, memory=memory)
+        if fb.kind != NEW_ACTION:
+            return fb
+
+        # 3. Opt-in small local LLM (Ollama) for paraphrases, typos, and word
+        #    orders the fallback cannot cover. Disabled by default; its output
+        #    is validated exactly like Laya output before use.
+        try:
+            llm_route = await self._route_with_llm(text, tools, ctx, t0)
+            if llm_route is not None:
+                return llm_route
+        except Exception as e:
+            log.warning(f"Small-LLM routing failed ({e}); using fallback result.")
+        return fb
+
+    async def _route_with_llm(
+        self, text: str, tools: list[Tool], ctx: WindowsContext, t0: float
+    ) -> Optional[Route]:
+        """Constrained small-model routing. None = fall through to NEW_ACTION."""
+        choice = await small_llm.route_with_llm(
+            text, tools,
+            context_line=f"{ctx.active_title} ({ctx.active_app})",
+        )
+        if choice is None:
+            return None
+        name, args, conf = choice
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        if name == CHAT:
+            return Route(kind=CHAT, confidence=conf, latency_ms=elapsed_ms, tier="llm")
+        if name == STOP:
+            return Route(kind=STOP, confidence=conf, latency_ms=elapsed_ms, tier="llm")
+        if name == NEW_ACTION or conf < MIN_TOOL_CONFIDENCE:
+            return Route(kind=NEW_ACTION, confidence=conf, latency_ms=elapsed_ms,
+                         reason="Small model found no matching tool", tier="llm")
+        tool = self.registry.get(name)
+        if tool is None:
+            return None
+        return Route(kind="tool", tool=tool, args=args, confidence=conf,
+                     probabilities={name: conf}, latency_ms=elapsed_ms, tier="llm")
 
     def _build_questions(self, text: str, tools: list[Tool], ctx: WindowsContext) -> dict[str, Any]:
         """Build the Laya tool-choice question over the real registry options."""
@@ -487,10 +533,11 @@ class WinBrowRouter:
         """Exact-intent fallback, used ONLY when Laya errors, times out, or is unavailable.
 
         Covers the intents that must never fail: volume level, mute, lock
-        screen, open_folder gated on a real directory on disk, and open_file
-        gated on a real file on disk (Downloads searched first). Anything
-        else returns NEW_ACTION so the generator tier can try. This method
-        never maps phrases to tools beyond these exact intents.
+        screen, open_folder / close_folder_window gated on a real directory
+        on disk, and open_file gated on a real file on disk (Downloads
+        searched first). Anything else returns NEW_ACTION so the generator
+        tier can try. This method never maps phrases to tools beyond these
+        exact intents.
         """
         _ = tools  # tool choice belongs to Laya; the fallback picks no tools by keywords.
         _ = ctx
@@ -529,9 +576,7 @@ class WinBrowRouter:
         # No "open anything" fallback: unresolved names go to NEW_ACTION.
         folder_arg = self._extract_text_arg(text, "open_folder", "folder")
         if folder_arg:
-            known_system = {"downloads", "documents", "desktop", "pictures", "music",
-                            "videos", "home", "appdata", "temp", "startup", "recycle"}
-            if folder_arg.lower() in known_system or _folder_exists_on_disk(folder_arg):
+            if folder_arg.lower() in _SYSTEM_FOLDERS or _folder_exists_on_disk(folder_arg):
                 t = self.registry.get("open_folder")
                 if t:
                     return Route(kind="tool", tool=t, args={"folder": folder_arg}, confidence=0.92, latency_ms=elapsed_ms, tier="heuristic")
@@ -545,6 +590,22 @@ class WinBrowRouter:
             t = self.registry.get("open_file")
             if t:
                 return Route(kind="tool", tool=t, args={"target": target, "app": app}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+
+        # Close an Explorer window — ONLY when a known folder nickname is
+        # present AND resolves to a real directory. Matched by nickname, so
+        # word order, filler ("please") and typos in other words ("foler")
+        # do not matter; unresolved names go to NEW_ACTION.
+        if re.search(r"\bclose\b", lower):
+            hit = None
+            hit_pos = len(lower) + 1
+            for nick in _SYSTEM_FOLDERS:
+                pos = lower.find(nick)
+                if 0 <= pos < hit_pos:
+                    hit, hit_pos = nick, pos
+            if hit and _folder_exists_on_disk(hit):
+                t = self.registry.get("close_folder_window")
+                if t:
+                    return Route(kind="tool", tool=t, args={"folder": hit}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
 
         return Route(kind=NEW_ACTION, confidence=0.5, latency_ms=elapsed_ms, tier="heuristic")
 

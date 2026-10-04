@@ -325,5 +325,115 @@ class TestWinBrowRegistryAndRouter(unittest.TestCase):
             self.assertEqual(
                 agent.memory.last_folder, "C:\\Users\\USER\\Downloads")
 
+    # -- fallback close-folder (nickname-gated, typo-proof) ------------
+    def test_fallback_close_downloads_folder(self):
+        route = self._fallback_mem("close the downloads folder")
+        self.assertEqual(route.tool_name, "close_folder_window")
+        self.assertEqual(route.args.get("folder"), "downloads")
+
+    def test_fallback_close_folder_typo(self):
+        # Typo is in "foler", which routing never reads: match is by nickname.
+        route = self._fallback_mem("close the downloads foler")
+        self.assertEqual(route.tool_name, "close_folder_window")
+        self.assertEqual(route.args.get("folder"), "downloads")
+
+    def test_fallback_close_folder_filler(self):
+        route = self._fallback_mem("close the downloads folder please")
+        self.assertEqual(route.tool_name, "close_folder_window")
+        self.assertEqual(route.args.get("folder"), "downloads")
+
+    def test_fallback_close_without_folder_is_new_action(self):
+        route = self._fallback_mem("close chrome")
+        self.assertEqual(route.kind, NEW_ACTION)
+        self.assertIsNone(route.tool_name)
+
+    # -- small-LLM tier -------------------------------------------------
+    def test_small_llm_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WINBROW_ROUTER_LLM", None)
+            from winbrow import small_llm
+            self.assertFalse(small_llm.enabled())
+            res = asyncio.run(small_llm.route_with_llm(
+                "close the downloads foler", self.registry.all_tools()))
+            self.assertIsNone(res)
+
+    def test_small_llm_valid_choice(self):
+        from winbrow import small_llm
+        tools = self.registry.all_tools()
+        payload = {"tool": "open_folder",
+                   "args": {"folder": "downloads"},
+                   "confidence": 0.88}
+        self.assertEqual(
+            small_llm.validate_choice(payload, tools),
+            ("open_folder", {"folder": "downloads"}, 0.88))
+
+    def test_small_llm_rejects_unknown_tool(self):
+        from winbrow import small_llm
+        tools = self.registry.all_tools()
+        self.assertIsNone(small_llm.validate_choice(
+            {"tool": "delete_everything", "args": {}, "confidence": 0.99},
+            tools))
+
+    def test_small_llm_coerces_bad_enum_and_drops_unknown_args(self):
+        from winbrow import small_llm
+        tools = self.registry.all_tools()
+        out = small_llm.validate_choice(
+            {"tool": "open_common_app",
+             "args": {"app": "not_a_real_app", "evil": "rm -rf"},
+             "confidence": 0.7},
+            tools)
+        self.assertIsNotNone(out)
+        name, args, conf = out
+        self.assertEqual(name, "open_common_app")
+        self.assertEqual(args.get("app"), "calculator")  # default wins
+        self.assertNotIn("evil", args)
+        self.assertEqual(conf, 0.7)
+
+    def test_small_llm_rejects_bad_confidence(self):
+        from winbrow import small_llm
+        tools = self.registry.all_tools()
+        self.assertIsNone(small_llm.validate_choice(
+            {"tool": "open_folder", "args": {}, "confidence": "high"}, tools))
+        self.assertIsNone(small_llm.validate_choice(
+            {"tool": "open_folder", "args": {}, "confidence": 1.5}, tools))
+        self.assertIsNone(small_llm.validate_choice("not a dict", tools))
+
+    def test_small_llm_route_parses_model_json(self):
+        from winbrow import small_llm
+        tools = self.registry.all_tools()
+        body = {"message": {"content":
+                'Sure thing: {"tool": "close_folder_window", '
+                '"args": {"folder": "downloads"}, "confidence": 0.91}'}}
+        with patch.dict(os.environ, {"WINBROW_ROUTER_LLM": "1"}):
+            with patch("winbrow.small_llm._http_post", return_value=body):
+                res = asyncio.run(small_llm.route_with_llm(
+                    "shut the downloads folder", tools))
+        self.assertEqual(
+            res, ("close_folder_window", {"folder": "downloads"}, 0.91))
+
+    def test_llm_tier_routes_after_fallback_miss(self):
+        # Laya down + fallback miss + LLM enabled -> llm tier tool route.
+        self._mock_laya(error=RuntimeError("Laya unavailable"))
+        body = {"message": {"content":
+                '{"tool": "close_folder_window", '
+                '"args": {"folder": "downloads"}, "confidence": 0.9}'}}
+        with patch.dict(os.environ, {"WINBROW_ROUTER_LLM": "1"}):
+            with patch("winbrow.small_llm._http_post", return_value=body):
+                route = asyncio.run(
+                    self.router.route("shut the downloads folder", self.ctx))
+        self.assertEqual(route.tool_name, "close_folder_window")
+        self.assertEqual(route.args.get("folder"), "downloads")
+        self.assertEqual(route.tier, "llm")
+
+    def test_llm_tier_low_confidence_is_new_action(self):
+        self._mock_laya(error=RuntimeError("Laya unavailable"))
+        body = {"message": {"content":
+                '{"tool": "open_folder", "args": {}, "confidence": 0.2}'}}
+        with patch.dict(os.environ, {"WINBROW_ROUTER_LLM": "1"}):
+            with patch("winbrow.small_llm._http_post", return_value=body):
+                route = asyncio.run(
+                    self.router.route("something vague here", self.ctx))
+        self.assertEqual(route.kind, NEW_ACTION)
+
 if __name__ == "__main__":
     unittest.main()
