@@ -100,4 +100,22 @@ Navigate to:
 | `search google for latest AI news` | Opens Chrome/Edge and performs search | Browser Task |
 | `open sound settings` | Opens Windows Sound Settings pane | Built-in |
 | `minimize window` | Minimizes the active foreground window | Built-in |
-| `clean temp files` | Removes temporary cache files from Windows Temp | Dynamic Tool |
+| `clean temp files` | Removes temporary cache files from Windows Temp | Built-in |
+| `what time is it` | Shows current time, date, day, and timezone | Built-in |
+| `open downloads folder` | Opens Downloads folder in File Explorer | Built-in |
+| `find files named report` | Searches Desktop/Documents/Downloads for matching files | Built-in |
+| `set volume to 40%` | Sets Windows audio level directly to exact percentage | Built-in |
+| `increase brightness` | Adjusts monitor/laptop screen brightness | Built-in |
+| `take screenshot to clipboard` | Copies full screenshot to clipboard (ready to paste) | Built-in |
+| `type Hello World` | Types text into active focused input field via clipboard paste | Built-in |
+| `open calculator` | Launches Calculator, Paint, Terminal, Snipping Tool, Task Manager, etc. | Built-in |
+| `system uptime` | Shows days/hours computer has been running since boot | Built-in |
+| `find large files` | Scans user folders for largest space-consuming files | Built-in |
+| `turn on night light` | Opens Night Light / blue light filter settings | Built-in |
+| `show running apps` | Lists all open apps with window titles and memory usage | Built-in |
+| `create a note` | Creates a timestamped text file on Desktop and opens in Notepad | Built-in |
+| `open bluetooth settings` | Deep links to Windows Bluetooth device management | Built-in |
+| `shutdown in 1 hour` | Schedules a Windows shutdown or restart timer | Built-in |
+| `lock screen` | Secures PC immediately via Win32 LockWorkStation | Built-in |
+| `what is my public ip` | Retrieves public IP address and copies to clipboard | Built-in |
+

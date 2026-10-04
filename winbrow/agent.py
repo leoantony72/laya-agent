@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any, Optional
 
 from .browser_task import BrowserController
 from .generator import ScriptGenerator
+from .last_opened import ContextMemory
 from .registry import Tool, ToolRegistry
+from .resolvers import resolve_file, resolve_folder
 from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter
-from .windows import WindowsContext, get_current_windows_context, run_powershell
+from .windows import WindowsContext, get_current_windows_context, run_powershell, set_windows_volume
 
 log = logging.getLogger("winbrow.agent")
 
@@ -40,7 +43,17 @@ BROWSER_KEYWORDS = [
 
 def _is_browser_intent(utterance: str) -> bool:
     lower = utterance.lower()
-    return any(kw in lower for kw in BROWSER_KEYWORDS)
+    for kw in BROWSER_KEYWORDS:
+        if " " in kw or "://" in kw:
+            # Multi-word phrases / URLs: substring match is safe.
+            if kw in lower:
+                return True
+        else:
+            # Single words need boundaries (allow plural): "tab" must not
+            # match "tables", "reload" must not match "reloaded", etc.
+            if re.search(r"\b" + re.escape(kw) + r"s?\b", lower):
+                return True
+    return False
 
 
 class WinBrowAgent:
@@ -51,11 +64,36 @@ class WinBrowAgent:
         self.router = WinBrowRouter(self.registry)
         self.generator = ScriptGenerator(self.registry)
         self.browser = BrowserController()
+        self.memory = ContextMemory()
         self.history: list[dict[str, Any]] = []
 
     def get_context(self) -> WindowsContext:
         """Capture live Windows environment context."""
         return get_current_windows_context()
+
+    def _record_open_result(self, tool_name: str | None, args: dict[str, str], success: bool) -> None:
+        """Record successful opens into context memory (for "that file" follow-ups).
+
+        Re-resolves the argument to a real path so only verified locations
+        are remembered. Never raises; never affects execution.
+        """
+        try:
+            if not success or not tool_name:
+                return
+            if tool_name == "open_file":
+                target = (args or {}).get("target", "")
+                if target:
+                    path = resolve_file(target)
+                    if path:
+                        self.memory.record_open("file", path, target)
+            elif tool_name == "open_folder":
+                folder = (args or {}).get("folder", "")
+                if folder:
+                    path = resolve_folder(folder)
+                    if path:
+                        self.memory.record_open("folder", path, folder)
+        except Exception:
+            pass
 
     async def _dispatch_browser(self, utterance: str) -> dict[str, Any]:
         """
@@ -186,7 +224,10 @@ class WinBrowAgent:
         5. Return structured trace
         """
         t0 = time.perf_counter()
-        ctx = self.get_context()
+        # Context capture does process enumeration + COM reads (15-600ms);
+        # keep it off the event loop so routing/execution stay responsive.
+        loop = asyncio.get_event_loop()
+        ctx = await loop.run_in_executor(None, self.get_context)
 
         # Fast-path browser intent detection (before Laya routing overhead)
         utterance_lower = utterance.lower()
@@ -200,8 +241,8 @@ class WinBrowAgent:
             "tab", "reload", "scroll", "screenshot", "find on page", "incognito"
         ])
 
-        # 1. Laya Routing
-        route: Route = await self.router.route(utterance, ctx)
+        # 1. Laya Routing (context memory lets "that file" resolve)
+        route: Route = await self.router.route(utterance, ctx, memory=self.memory)
         log.info(f"Routed '{utterance}' → {route.kind} (tool: {route.tool.name if route.tool else None}, conf: {route.confidence:.2f})")
 
         result: dict[str, Any] = {
@@ -213,6 +254,7 @@ class WinBrowAgent:
                 "confidence": round(route.confidence, 3),
                 "latency_ms": route.latency_ms,
                 "probabilities": route.probabilities,
+                "tier": route.tier or route.kind,
             },
             "context": ctx.to_dict(),
             "execution": {},
@@ -220,18 +262,31 @@ class WinBrowAgent:
 
         # 2. Dispatch
         if route.kind == "tool" and route.tool:
-            # Render script with arguments
-            rendered = route.tool.render_script(route.args)
-            exec_out = await run_powershell(rendered)
-            result["execution"] = {
-                "type": "tool_execution",
-                "tool": route.tool.name,
-                "is_learned": route.tool.is_learned,
-                "script": rendered,
-                "success": exec_out.get("success", False),
-                "output": exec_out.get("stdout") or exec_out.get("stderr") or "Done",
-                "elapsed_ms": exec_out.get("elapsed_ms", 0),
-            }
+            if route.tool.name == "volume_set_level":
+                level_arg = route.args.get("level", "50")
+                out_msg = set_windows_volume(level_arg)
+                result["execution"] = {
+                    "type": "tool_execution",
+                    "tool": route.tool.name,
+                    "is_learned": False,
+                    "script": f"set_windows_volume({level_arg})",
+                    "success": "set to" in out_msg.lower(),
+                    "output": out_msg,
+                    "elapsed_ms": 1.0,
+                }
+            else:
+                # Render script with arguments
+                rendered = route.tool.render_script(route.args)
+                exec_out = await run_powershell(rendered)
+                result["execution"] = {
+                    "type": "tool_execution",
+                    "tool": route.tool.name,
+                    "is_learned": route.tool.is_learned,
+                    "script": rendered,
+                    "success": exec_out.get("success", False),
+                    "output": exec_out.get("stdout") or exec_out.get("stderr") or "Done",
+                    "elapsed_ms": exec_out.get("elapsed_ms", 0),
+                }
 
         elif browser_fast and not is_search and route.kind != "tool":
             # Browser fast-path
@@ -291,5 +346,27 @@ class WinBrowAgent:
         self.history.append(result)
         if len(self.history) > 100:
             self.history = self.history[-100:]
+
+        # Remember successful opens for follow-up references.
+        if route.kind == "tool" and route.tool:
+            self._record_open_result(
+                route.tool.name, route.args,
+                result.get("execution", {}).get("success"),
+            )
+
+        # M0 instrumentation: persistent JSONL trace (never breaks execution)
+        try:
+            from .trace import command_event
+            command_event(
+                utterance=utterance,
+                tier=route.tier or route.kind,
+                tool_name=route.tool.name if route.tool else None,
+                confidence=route.confidence,
+                route_latency_ms=route.latency_ms,
+                success=result.get("execution", {}).get("success"),
+                total_elapsed_ms=total_ms,
+            )
+        except Exception:
+            pass
 
         return result

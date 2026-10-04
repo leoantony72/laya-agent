@@ -121,8 +121,24 @@ class ScriptGenerator:
         # 5. Execute the script
         exec_result = await run_powershell(rendered_script, timeout=30)
 
-        # 6. If successful, persist to learned tools!
+        # 6. If successful, persist to learned tools — EXCEPT generic
+        # placeholder scripts ("Executed custom task:"), which do nothing
+        # real. Persisting those pollutes learned.json with fake successes.
         if exec_result.get("success", False):
+            if "Executed custom task:" in tool.script:
+                return {
+                    "success": False,
+                    "tool": tool,
+                    "rendered_script": rendered_script,
+                    "stdout": "",
+                    "stderr": "",
+                    "reason": (
+                        "I couldn't figure out how to automate that yet — no real "
+                        "action was taken. Try rephrasing with a concrete target "
+                        "(e.g. which image, file, or setting you mean)."
+                    ),
+                    "elapsed_ms": exec_result.get("elapsed_ms", 0),
+                }
             try:
                 self.registry.save_learned(tool)
             except Exception as e:
@@ -204,7 +220,14 @@ class ScriptGenerator:
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
         )
         loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, urllib.request.urlopen, req)
+        try:
+            # Hard timeout: a hanging local/remote LLM must not stall commands.
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=10)),
+                timeout=12,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(f"LLM request to {url} timed out") from e
         res_data = json.loads(resp.read().decode("utf-8"))
         content = res_data["choices"][0]["message"]["content"]
         # Extract JSON
@@ -354,10 +377,21 @@ class ScriptGenerator:
 
         # -- Screenshot full screen -------------------------------------------
         if "screenshot" in lower or "screen capture" in lower or "capture screen" in lower:
+            dest = "[Environment]::GetFolderPath('Desktop')"
+            dest_name = "Desktop"
+            if "download" in lower:
+                dest = "Join-Path $env:USERPROFILE 'Downloads'"
+                dest_name = "Downloads"
+            elif "document" in lower:
+                dest = "[Environment]::GetFolderPath('MyDocuments')"
+                dest_name = "Documents"
+            elif any(w in lower for w in ["picture", "photo", "image"]):
+                dest = "[Environment]::GetFolderPath('MyPictures')"
+                dest_name = "Pictures"
             ts = "screenshot_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
             return {
                 "feasible": True, "tool_name": "take_screenshot",
-                "description": "Capture the full screen and save to Desktop.",
+                "description": f"Capture the full screen and save to {dest_name}.",
                 "scope": None, "args": [],
                 "script": f"""
                 Add-Type -AssemblyName System.Windows.Forms,System.Drawing
@@ -365,7 +399,7 @@ class ScriptGenerator:
                 $bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)
                 $g = [System.Drawing.Graphics]::FromImage($bmp)
                 $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)
-                $path = [IO.Path]::Combine([Environment]::GetFolderPath('Desktop'), "{ts}.png")
+                $path = [IO.Path]::Combine({dest}, "{ts}.png")
                 $bmp.Save($path); $g.Dispose(); $bmp.Dispose()
                 return "Screenshot saved to $path"
                 """,

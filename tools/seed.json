@@ -1,0 +1,827 @@
+[
+  {
+    "name": "system_volume",
+    "description": "Adjust system audio volume, mute, or unmute speaker sound.",
+    "examples": [
+      "volume up",
+      "turn it down",
+      "mute the sound"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "action",
+        "kind": "enum",
+        "instructions": "Volume action requested",
+        "criteria": {
+          "up": "increase volume, louder, turn it up",
+          "down": "decrease volume, quieter, lower sound",
+          "mute": "mute sound, silence, quiet",
+          "unmute": "unmute, restore sound"
+        },
+        "default": "up"
+      }
+    ],
+    "script": "\n            $w = New-Object -ComObject WScript.Shell\n            switch (\"{{action}}\") {\n                \"up\"     { for($i=0; $i -lt 5; $i++) { $w.SendKeys([char]175) }; return \"Volume increased\" }\n                \"down\"   { for($i=0; $i -lt 5; $i++) { $w.SendKeys([char]174) }; return \"Volume decreased\" }\n                \"mute\"   { $w.SendKeys([char]173); return \"Volume muted\" }\n                \"unmute\" { $w.SendKeys([char]173); return \"Volume unmuted\" }\n                default  { return \"Volume adjusted\" }\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "media_playback",
+    "description": "Control media playback like play, pause, next track, or previous song.",
+    "examples": [
+      "pause the music",
+      "play",
+      "skip song"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "operation",
+        "kind": "enum",
+        "instructions": "Which playback control?",
+        "criteria": {
+          "play_pause": "play or pause music, resume track",
+          "next": "next song, skip track",
+          "prev": "previous song, go back a track"
+        },
+        "default": "play_pause"
+      }
+    ],
+    "script": "\n            $w = New-Object -ComObject WScript.Shell\n            switch (\"{{operation}}\") {\n                \"play_pause\" { $w.SendKeys([char]179); return \"Toggled play/pause\" }\n                \"next\"       { $w.SendKeys([char]176); return \"Skipped to next track\" }\n                \"prev\"       { $w.SendKeys([char]177); return \"Returned to previous track\" }\n                default      { return \"Media key sent\" }\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "toggle_dark_mode",
+    "description": "Switch Windows system and app appearance between dark theme and light theme.",
+    "examples": [
+      "turn on dark mode",
+      "switch to light mode",
+      "toggle theme"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "mode",
+        "kind": "enum",
+        "instructions": "Which theme mode?",
+        "criteria": {
+          "dark": "turn on dark mode, make it dark",
+          "light": "turn on light mode, make it light",
+          "toggle": "switch or toggle theme"
+        },
+        "default": "toggle"
+      }
+    ],
+    "script": "\n            $path = \"HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\"\n            $current = (Get-ItemProperty -Path $path -Name \"AppsUseLightTheme\" -ErrorAction SilentlyContinue).AppsUseLightTheme\n            $target = if (\"{{mode}}\" -eq \"dark\") { 0 } elseif (\"{{mode}}\" -eq \"light\") { 1 } else { if ($current -eq 0) { 1 } else { 0 } }\n            Set-ItemProperty -Path $path -Name \"AppsUseLightTheme\" -Value $target\n            Set-ItemProperty -Path $path -Name \"SystemUsesLightTheme\" -Value $target\n            $name = if ($target -eq 0) { \"Dark\" } else { \"Light\" }\n            return \"Switched Windows to $name mode\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "app_focus_or_launch",
+    "description": "Open an application, or bring its window to the front if already open.",
+    "examples": [
+      "open chrome",
+      "switch to vs code",
+      "launch notepad"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "app_name",
+        "kind": "text",
+        "instructions": "Which application to open or focus?",
+        "criteria": {},
+        "default": "notepad"
+      }
+    ],
+    "script": "\n            $target = \"{{app_name}}\".Trim()\n            $proc = Get-Process | Where-Object { $_.ProcessName -like \"*$target*\" -or $_.MainWindowTitle -like \"*$target*\" } | Select-Object -First 1\n            if ($proc -and $proc.MainWindowHandle -ne 0) {\n                $ws = New-Object -ComObject WScript.Shell\n                $ws.AppActivate($proc.Id) | Out-Null\n                return \"Brought $($proc.ProcessName) to focus\"\n            } else {\n                Start-Process $target -ErrorAction SilentlyContinue\n                return \"Launched $target\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "window_action",
+    "description": "Manage the active window: minimize, maximize, snap left/right, show desktop.",
+    "examples": [
+      "minimize this window",
+      "maximize window",
+      "show desktop"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "action",
+        "kind": "enum",
+        "instructions": "Which window management action?",
+        "criteria": {
+          "minimize": "minimize current window",
+          "maximize": "maximize current window, full screen",
+          "snap_left": "snap window to left half",
+          "snap_right": "snap window to right half",
+          "desktop": "show desktop, minimize all windows",
+          "close": "close active window"
+        },
+        "default": "minimize"
+      }
+    ],
+    "script": "\n            $w = New-Object -ComObject WScript.Shell\n            switch (\"{{action}}\") {\n                \"minimize\"   { $w.SendKeys(\"% n\"); return \"Minimized window\" }\n                \"maximize\"   { $w.SendKeys(\"% x\"); return \"Maximized window\" }\n                \"desktop\"    { (New-Object -ComObject Shell.Application).ToggleDesktop(); return \"Toggled desktop\" }\n                \"close\"      { $w.SendKeys(\"%{F4}\"); return \"Closed window\" }\n                default      { return \"Window action completed\" }\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "organize_desktop",
+    "description": "Clean and organize loose files on Desktop into a neat dated folder.",
+    "examples": [
+      "clean up my desktop",
+      "organize desktop files",
+      "tidy up desktop"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $desktop = [Environment]::GetFolderPath('Desktop')\n            $folderName = \"Desktop Archive \" + (Get-Date -Format 'yyyy-MM-dd')\n            $target = Join-Path $desktop $folderName\n            if (-not (Test-Path $target)) { New-Item -ItemType Directory -Path $target | Out-Null }\n            $files = Get-ChildItem -Path $desktop -File | Where-Object { $_.Name -notlike \"*.lnk\" -and $_.Name -notlike \"Desktop Archive*\" }\n            $count = $files.Count\n            $files | Move-Item -Destination $target\n            return \"Organized $count files into $folderName\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "web_search",
+    "description": "Search the web using Google or navigate directly to a website.",
+    "examples": [
+      "search google for weather in Tokyo",
+      "open youtube.com",
+      "search for latest news"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "query",
+        "kind": "text",
+        "instructions": "What to search for or URL to navigate to?",
+        "criteria": {},
+        "default": "google.com"
+      }
+    ],
+    "script": "\n            $q = \"{{query}}\".Trim()\n            if ($q -match \"^https?://\") {\n                Start-Process $q\n                return \"Opened $q\"\n            } else {\n                $enc = [Uri]::EscapeDataString($q)\n                Start-Process \"https://www.google.com/search?q=$enc\"\n                return \"Searched web for '$q'\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "windows_settings",
+    "description": "Open specific Windows 10/11 Settings panes like sound, network, bluetooth, or display.",
+    "examples": [
+      "open sound settings",
+      "check wifi settings",
+      "open bluetooth settings"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "pane",
+        "kind": "enum",
+        "instructions": "Which settings pane?",
+        "criteria": {
+          "sound": "sound, audio, microphone settings",
+          "network": "wi-fi, internet, network status",
+          "bluetooth": "bluetooth and other devices",
+          "display": "screen resolution, monitor, display",
+          "batterysaver": "battery and power settings",
+          "appsfeatures": "installed apps and programs"
+        },
+        "default": "sound"
+      }
+    ],
+    "script": "\n            Start-Process \"ms-settings:{{pane}}\"\n            return \"Opened Windows {{pane}} settings\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "clipboard_inspect",
+    "description": "Get, show, or clear the current Windows clipboard contents.",
+    "examples": [
+      "what is in my clipboard",
+      "show clipboard",
+      "clear clipboard"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "action",
+        "kind": "enum",
+        "instructions": "Action on clipboard",
+        "criteria": {
+          "get": "show or read clipboard content",
+          "clear": "clear or empty clipboard"
+        },
+        "default": "get"
+      }
+    ],
+    "script": "\n            if (\"{{action}}\" -eq \"clear\") {\n                Set-Clipboard -Value \"\"\n                return \"Clipboard cleared\"\n            } else {\n                $c = Get-Clipboard\n                if ($c) { return \"Clipboard: $c\" } else { return \"Clipboard is empty\" }\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "get_wifi_password",
+    "description": "Retrieve the stored Wi-Fi password/security key for current or saved wireless networks.",
+    "examples": [
+      "show my wifi password",
+      "what is my wifi password",
+      "wifi security key"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "profile",
+        "kind": "text",
+        "instructions": "Wi-Fi network SSID or leave empty for current network",
+        "criteria": {},
+        "default": ""
+      }
+    ],
+    "script": "\n            $target = \"{{profile}}\".Trim()\n            if (-not $target) {\n                $cur = (netsh wlan show interfaces) | Select-String \"SSID\\s*:\\s*(.+)\" | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } | Select-Object -First 1\n                if ($cur) { $target = $cur }\n            }\n            if ($target) {\n                $xml = netsh wlan show profile name=\"$target\" key=clear 2>$null\n                $pass = $xml | Select-String \"Key Content\\s*:\\s*(.+)\" | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() } | Select-Object -First 1\n                if ($pass) { return \"Wi-Fi '$target' Password: $pass\" }\n                else { return \"No password required or not found for '$target'\" }\n            } else {\n                $profiles = (netsh wlan show profiles) | Select-String \"All User Profile\\s*:\\s*(.+)\" | ForEach-Object { $_.Matches[0].Groups[1].Value.Trim() }\n                return \"Known Wi-Fi networks: \" + ($profiles -join \", \")\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "battery_health",
+    "description": "Show battery charge percentage, power status, or generate a full battery health diagnostic report.",
+    "examples": [
+      "battery health",
+      "show battery level",
+      "generate battery report"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "action",
+        "kind": "enum",
+        "instructions": "Battery action",
+        "criteria": {
+          "status": "battery status, percentage, charge level",
+          "report": "detailed battery health report, degradation, cycles"
+        },
+        "default": "status"
+      }
+    ],
+    "script": "\n            if (\"{{action}}\" -eq \"report\") {\n                $reportPath = \"$env:TEMP\\battery-report.html\"\n                powercfg /batteryreport /output \"$reportPath\" | Out-Null\n                if (Test-Path $reportPath) {\n                    Start-Process \"$reportPath\"\n                    return \"Generated and opened full battery diagnostic report\"\n                }\n            }\n            $b = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue\n            if ($b) {\n                $status = switch ($b.BatteryStatus) { 1 {\"Discharging\"} 2 {\"On AC Power\"} 3 {\"Fully Charged\"} 4 {\"Low\"} 5 {\"Critical\"} 6 {\"Charging\"} default {\"Unknown\"} }\n                return \"Battery: $($b.EstimatedChargeRemaining)% ($status), Est. Runtime: $($b.EstimatedRunTime) mins\"\n            } else {\n                return \"No physical battery detected (Desktop PC or virtualized system)\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "system_spec_info",
+    "description": "Display system specifications: CPU usage, RAM memory, disk space, Windows version, and uptime.",
+    "examples": [
+      "system specs",
+      "show system info",
+      "how much ram do i have"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $os = Get-CimInstance Win32_OperatingSystem\n            $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1\n            $uptime = (Get-Date) - $os.LastBootUpTime\n            $days = $uptime.Days\n            $hours = $uptime.Hours\n            $mins = $uptime.Minutes\n            $totalRam = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)\n            $freeRam = [math]::Round($os.FreePhysicalMemory / 1MB, 1)\n            $usedRam = [math]::Round($totalRam - $freeRam, 1)\n            $c = Get-PSDrive C\n            $freeDisk = [math]::Round($c.Free / 1GB, 1)\n            $totalDisk = [math]::Round(($c.Used + $c.Free) / 1GB, 1)\n            return \"OS: $($os.Caption) (Build $($os.BuildNumber))`nCPU: $($cpu.Name.Trim())`nRAM: ${usedRam}GB / ${totalRam}GB used`nDisk C: ${freeDisk}GB free of ${totalDisk}GB`nUptime: ${days}d ${hours}h ${mins}m\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "clean_temp_files",
+    "description": "Safely delete temporary files and cache from Windows Temp directories to free up disk space.",
+    "examples": [
+      "clean temp files",
+      "clear temporary files",
+      "clean cache to free space"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $tempPaths = @($env:TEMP, \"$env:SystemRoot\\Temp\")\n            $freedCount = 0\n            foreach ($p in $tempPaths) {\n                if (Test-Path $p) {\n                    Get-ChildItem -Path $p -Recurse -Force -ErrorAction SilentlyContinue |\n                        Where-Object { -not $_.PSIsContainer } |\n                        ForEach-Object {\n                            try { Remove-Item $_.FullName -Force -ErrorAction Stop; $freedCount++ } catch {}\n                        }\n                }\n            }\n            return \"Cleaned up $freedCount temporary files from cache\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "kill_unresponsive_process",
+    "description": "Force terminate a frozen, hung, or specific application process.",
+    "examples": [
+      "kill unresponsive apps",
+      "force close app",
+      "terminate frozen process"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "target",
+        "kind": "text",
+        "instructions": "Process name to terminate",
+        "criteria": {},
+        "default": "hung"
+      }
+    ],
+    "script": "\n            $t = \"{{target}}\".Trim()\n            if ($t -eq \"hung\" -or $t -eq \"unresponsive\") {\n                $hung = Get-Process | Where-Object { $_.Responding -eq $false }\n                if ($hung) {\n                    $hung | Stop-Process -Force\n                    return \"Killed unresponsive processes: \" + ($hung.ProcessName -join \", \")\n                } else {\n                    return \"No unresponsive processes detected\"\n                }\n            } else {\n                $procs = Get-Process | Where-Object { $_.ProcessName -like \"*$t*\" }\n                if ($procs) {\n                    $procs | Stop-Process -Force\n                    return \"Terminated $($procs.Count) instance(s) of $t\"\n                } else {\n                    return \"No running process matched '$t'\"\n                }\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "network_status",
+    "description": "Check internet connectivity, ping latency, local IP address, and active network adapters.",
+    "examples": [
+      "check internet connection",
+      "network status",
+      "what is my ip"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike \"*Loopback*\" -and $_.IPAddress -notlike \"169.254*\" } | Select-Object -First 1).IPAddress\n            $ping = Test-Connection -ComputerName 1.1.1.1 -Count 1 -Quiet -ErrorAction SilentlyContinue\n            $status = if ($ping) { \"Online (Ping OK)\" } else { \"Offline / Unreachable\" }\n            return \"Internet: $status | Local IP: $ip\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "current_time",
+    "description": "Show the current system date, time, timezone, and day of week.",
+    "examples": [
+      "what time is it",
+      "current time",
+      "what is the date"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $now = Get-Date\n            $tz = [System.TimeZoneInfo]::Local.DisplayName\n            return \"Current Time: $($now.ToString('hh:mm:ss tt')) | Date: $($now.ToString('dddd, MMMM dd, yyyy')) | Timezone: $tz\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "find_files",
+    "description": "Search for files by name pattern on the user's common folders (Desktop, Documents, Downloads).",
+    "examples": [
+      "find files named report",
+      "search for .pdf files",
+      "find document named invoice"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "search_term",
+        "kind": "text",
+        "instructions": "File name or pattern to search for",
+        "criteria": {},
+        "default": "*"
+      }
+    ],
+    "script": "\n            $term = \"{{search_term}}\".Trim()\n            $folders = @(\n                [Environment]::GetFolderPath('Desktop'),\n                [Environment]::GetFolderPath('MyDocuments'),\n                (Join-Path $env:USERPROFILE 'Downloads'),\n                (Join-Path $env:USERPROFILE 'Pictures')\n            )\n            $results = @()\n            foreach ($dir in $folders) {\n                if (Test-Path $dir) {\n                    $results += Get-ChildItem -Path $dir -Recurse -Force -ErrorAction SilentlyContinue -Filter \"*$term*\" |\n                        Select-Object -First 15 | ForEach-Object {\n                            \"$($_.FullName)  ($([math]::Round($_.Length / 1KB, 1)) KB)\"\n                        }\n                }\n            }\n            if ($results.Count -gt 0) {\n                return \"Found $($results.Count) file(s) matching '$term':`n\" + ($results | Select-Object -First 20 | Out-String)\n            } else {\n                return \"No files found matching '$term' in Desktop, Documents, Downloads, or Pictures\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "open_folder",
+    "description": "Open a folder in File Explorer: a system folder (Downloads, Documents, Desktop, Pictures, Music, Videos, Home) or any named folder/absolute path (e.g. 'codee').",
+    "examples": [
+      "open downloads folder",
+      "open documents",
+      "open desktop"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "folder",
+        "kind": "text",
+        "instructions": "Which folder to open? System name, folder name, or full path.",
+        "criteria": {},
+        "default": "downloads"
+      }
+    ],
+    "script": "\n            $requested = \"{{folder}}\".Trim().Trim('\"').Trim(\"'\")\n            $folderMap = @{\n                \"downloads\"  = Join-Path $env:USERPROFILE \"Downloads\"\n                \"documents\"  = [Environment]::GetFolderPath('MyDocuments')\n                \"desktop\"    = [Environment]::GetFolderPath('Desktop')\n                \"pictures\"   = [Environment]::GetFolderPath('MyPictures')\n                \"music\"      = [Environment]::GetFolderPath('MyMusic')\n                \"videos\"     = [Environment]::GetFolderPath('MyVideos')\n                \"home\"       = $env:USERPROFILE\n                \"appdata\"    = $env:APPDATA\n                \"temp\"       = $env:TEMP\n                \"startup\"    = Join-Path $env:APPDATA \"Microsoft\\Windows\\Start Menu\\Programs\\Startup\"\n                \"recycle\"    = \"shell:RecycleBinFolder\"\n            }\n            $key = $requested.ToLower()\n            if ($folderMap.ContainsKey($key)) {\n                $target = $folderMap[$key]\n                if ($key -eq \"recycle\") { Start-Process explorer.exe -ArgumentList \"shell:RecycleBinFolder\"; return \"Opened recycle bin\" }\n                Start-Process explorer.exe -ArgumentList \"$target\"\n                return \"Opened $key folder\"\n            }\n            # Literal path (absolute, relative, or ~/user paths)\n            $candidate = $requested\n            if ($candidate.StartsWith(\"~\")) { $candidate = Join-Path $env:USERPROFILE $candidate.Substring(1).TrimStart('\\','/') }\n            if ((Test-Path $candidate -PathType Container)) {\n                $full = (Resolve-Path $candidate).Path\n                Start-Process explorer.exe -ArgumentList \"$full\"\n                return \"Opened folder $full\"\n            }\n            # Search common locations for a directory with this name:\n            # fixed local drive roots (two levels, e.g. D:\\Codee\\desktop_agent)\n            # + user folders (top level). Only Fixed drives are scanned:\n            # network/disconnected drives can stall enumeration for seconds.\n            $searchRoots = @()\n            foreach ($d in ([IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' -and $_.IsReady })) {\n                $searchRoots += $d.RootDirectory.FullName\n            }\n            $secondLevelRoots = @()\n            foreach ($root in $searchRoots) {\n                try {\n                    $secondLevelRoots += Get-ChildItem -Path $root -Directory -Force -ErrorAction SilentlyContinue |\n                        Select-Object -ExpandProperty FullName\n                } catch {}\n            }\n            $searchRoots += @(\n                [Environment]::GetFolderPath('Desktop'),\n                [Environment]::GetFolderPath('MyDocuments'),\n                (Join-Path $env:USERPROFILE 'Downloads'),\n                $env:USERPROFILE\n            )\n            $searchRoots += $secondLevelRoots\n            foreach ($root in ($searchRoots | Select-Object -Unique)) {\n                if (-not (Test-Path $root)) { continue }\n                try {\n                    $hit = Get-ChildItem -Path $root -Directory -Force -ErrorAction SilentlyContinue |\n                        Where-Object { $_.Name -ieq $requested } | Select-Object -First 1\n                    if ($hit) {\n                        Start-Process explorer.exe -ArgumentList $hit.FullName\n                        return \"Opened folder $($hit.FullName)\"\n                    }\n                } catch {}\n            }\n            return \"ERROR: Could not find a folder named '$requested'. Checked system folders, '$candidate', drive roots, Desktop, Documents, and Downloads.\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "volume_set_level",
+    "description": "Set the system master volume to a specific percentage (0-100).",
+    "examples": [
+      "set volume to 50%",
+      "volume 30",
+      "set volume to 80"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "level",
+        "kind": "text",
+        "instructions": "Volume percentage to set (0 to 100)",
+        "criteria": {},
+        "default": "50"
+      }
+    ],
+    "script": "\n            python -c \"from winbrow.windows import set_windows_volume; print(set_windows_volume('{{level}}'))\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "screen_brightness",
+    "description": "Adjust screen brightness up, down, or to a specific percentage level.",
+    "examples": [
+      "increase brightness",
+      "brightness up",
+      "dim screen"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "action",
+        "kind": "enum",
+        "instructions": "Brightness adjustment action",
+        "criteria": {
+          "up": "increase brightness, make brighter",
+          "down": "decrease brightness, make dimmer",
+          "max": "set brightness to maximum 100%",
+          "min": "set brightness to minimum",
+          "half": "set brightness to 50%"
+        },
+        "default": "up"
+      }
+    ],
+    "script": "\n            $actionMap = @{ \"up\" = 20; \"down\" = -20; \"max\" = 100; \"min\" = 10; \"half\" = 50 }\n            $action = \"{{action}}\"\n            try {\n                $current = (Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightness -ErrorAction Stop).CurrentBrightness\n                if ($action -eq \"max\") { $new = 100 }\n                elseif ($action -eq \"min\") { $new = 10 }\n                elseif ($action -eq \"half\") { $new = 50 }\n                elseif ($action -eq \"down\") { $new = [Math]::Max(5, $current - 20) }\n                else { $new = [Math]::Min(100, $current + 20) }\n                (Get-CimInstance -Namespace root/WMI -ClassName WmiMonitorBrightnessMethods).WmiSetBrightness(1, $new)\n                return \"Brightness changed: $current% -> $new%\"\n            } catch {\n                return \"Brightness control not available on this display (external monitors may not support WMI brightness)\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "screenshot_clipboard",
+    "description": "Capture a screenshot and copy it to the clipboard (ready to paste).",
+    "examples": [
+      "screenshot to clipboard",
+      "capture screen to clipboard",
+      "copy screen"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            Add-Type -AssemblyName System.Windows.Forms,System.Drawing\n            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\n            $bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)\n            $g = [System.Drawing.Graphics]::FromImage($bmp)\n            $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)\n            [System.Windows.Forms.Clipboard]::SetImage($bmp)\n            $g.Dispose(); $bmp.Dispose()\n            return \"Screenshot captured and copied to clipboard — paste anywhere with Ctrl+V\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "type_text",
+    "description": "Type or write text into the currently focused window/app via clipboard paste.",
+    "examples": [
+      "type Hello World",
+      "write my email is test@example.com",
+      "enter text meeting notes"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "text",
+        "kind": "text",
+        "instructions": "What text to type or write?",
+        "criteria": {},
+        "default": "Hello World"
+      }
+    ],
+    "script": "\n            $text = \"{{text}}\"\n            Add-Type -AssemblyName System.Windows.Forms\n            [System.Windows.Forms.Clipboard]::SetText($text)\n            $ws = New-Object -ComObject WScript.Shell\n            Start-Sleep -Milliseconds 200\n            $ws.SendKeys(\"^v\")\n            return \"Typed: $text\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "open_common_app",
+    "description": "Quickly open common Windows applications: Calculator, Paint, Snipping Tool, Terminal, Command Prompt, Notepad, WordPad, Control Panel, Task Manager, or Settings.",
+    "examples": [
+      "open calculator",
+      "open paint",
+      "open snipping tool"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "app",
+        "kind": "enum",
+        "instructions": "Which application to open?",
+        "criteria": {
+          "calculator": "open calculator, calc",
+          "paint": "open paint, mspaint, drawing app",
+          "snip": "open snipping tool, screen snip, screenshot tool",
+          "terminal": "open windows terminal, powershell terminal",
+          "cmd": "open command prompt, cmd",
+          "notepad": "open notepad, text editor",
+          "wordpad": "open wordpad, rich text editor",
+          "control": "open control panel",
+          "taskmgr": "open task manager, show processes",
+          "settings": "open windows settings",
+          "explorer": "open file explorer",
+          "magnifier": "open magnifier, zoom tool",
+          "charmap": "open character map, special characters",
+          "regedit": "open registry editor",
+          "msconfig": "open system configuration"
+        },
+        "default": "calculator"
+      }
+    ],
+    "script": "\n            $appMap = @{\n                \"calculator\" = \"calc\"\n                \"paint\"      = \"mspaint\"\n                \"snip\"       = \"SnippingTool\"\n                \"terminal\"   = \"wt\"\n                \"cmd\"        = \"cmd\"\n                \"notepad\"    = \"notepad\"\n                \"wordpad\"    = \"wordpad\"\n                \"control\"    = \"control\"\n                \"taskmgr\"    = \"taskmgr\"\n                \"settings\"   = \"ms-settings:\"\n                \"explorer\"   = \"explorer\"\n                \"magnifier\"  = \"magnify\"\n                \"charmap\"    = \"charmap\"\n                \"regedit\"    = \"regedit\"\n                \"msconfig\"   = \"msconfig\"\n            }\n            $exe = $appMap[\"{{app}}\"]\n            if ($exe) {\n                Start-Process $exe -ErrorAction SilentlyContinue\n                return \"Opened {{app}}\"\n            } else {\n                return \"Unknown application: {{app}}\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "system_uptime",
+    "description": "Show how long the computer has been running since last boot.",
+    "examples": [
+      "system uptime",
+      "how long has my pc been running",
+      "when did I boot"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $os = Get-CimInstance Win32_OperatingSystem\n            $uptime = (Get-Date) - $os.LastBootUpTime\n            $bootTime = $os.LastBootUpTime.ToString(\"dddd, MMMM dd yyyy 'at' hh:mm tt\")\n            return \"System Uptime: $($uptime.Days) days, $($uptime.Hours) hours, $($uptime.Minutes) minutes`nLast Boot: $bootTime\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "find_large_files",
+    "description": "Find the largest files on the system taking up disk space in user folders.",
+    "examples": [
+      "find large files",
+      "biggest files on disk",
+      "what is taking up space"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $folders = @(\n                [Environment]::GetFolderPath('Desktop'),\n                [Environment]::GetFolderPath('MyDocuments'),\n                (Join-Path $env:USERPROFILE 'Downloads'),\n                (Join-Path $env:USERPROFILE 'Videos'),\n                $env:TEMP\n            )\n            $allFiles = @()\n            foreach ($dir in $folders) {\n                if (Test-Path $dir) {\n                    $allFiles += Get-ChildItem -Path $dir -Recurse -File -ErrorAction SilentlyContinue | Select-Object FullName, Length\n                }\n            }\n            $top = $allFiles | Sort-Object Length -Descending | Select-Object -First 15 |\n                ForEach-Object { \"$([math]::Round($_.Length / 1MB, 1)) MB  -  $($_.FullName)\" }\n            if ($top) { return \"Largest files found:`n\" + ($top -join \"`n\") }\n            else { return \"No large files found\" }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "night_light",
+    "description": "Toggle Windows Night Light (blue light filter / warm screen) on or off for reduced eye strain.",
+    "examples": [
+      "turn on night light",
+      "enable blue light filter",
+      "warm screen"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "state",
+        "kind": "enum",
+        "instructions": "Turn night light on or off?",
+        "criteria": {
+          "on": "turn on night light, enable blue light filter, warm screen",
+          "off": "turn off night light, disable blue light filter, cool screen"
+        },
+        "default": "on"
+      }
+    ],
+    "script": "\n            Start-Process \"ms-settings:nightlight\"\n            Start-Sleep -Milliseconds 800\n            return \"Opened Night Light settings — toggle it {{state}} from the settings panel\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "show_running_apps",
+    "description": "List all currently running user applications with their window titles and memory usage.",
+    "examples": [
+      "show running apps",
+      "what apps are open",
+      "list running programs"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $procs = Get-Process | Where-Object { $_.MainWindowTitle -ne '' -and $_.ProcessName -notmatch '^(svchost|system|csrss|smss|lsass|dwm|conhost)$' } |\n                Sort-Object WorkingSet64 -Descending |\n                Select-Object -First 20 |\n                ForEach-Object { \"$($_.ProcessName) — $($_.MainWindowTitle.Substring(0, [Math]::Min(50, $_.MainWindowTitle.Length)))  [$([math]::Round($_.WorkingSet64/1MB,0)) MB]\" }\n            if ($procs) { return \"Running Applications:`n\" + ($procs -join \"`n\") }\n            else { return \"No visible applications running\" }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "quick_note",
+    "description": "Create a quick text note file on the Desktop and open it in Notepad.",
+    "examples": [
+      "create a note",
+      "make a quick note",
+      "new text file with meeting notes"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "content",
+        "kind": "text",
+        "instructions": "Content to write in the note",
+        "criteria": {},
+        "default": "Quick note created by WinBrow"
+      }
+    ],
+    "script": "\n            $timestamp = Get-Date -Format 'yyyy-MM-dd_HH-mm'\n            $path = Join-Path ([Environment]::GetFolderPath('Desktop')) \"Note_$timestamp.txt\"\n            \"{{content}}\" | Out-File -FilePath $path -Encoding utf8\n            Start-Process notepad $path\n            return \"Created note on Desktop: Note_$timestamp.txt\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "bluetooth_settings",
+    "description": "Open Windows Bluetooth settings to pair, unpair, or manage Bluetooth devices.",
+    "examples": [
+      "open bluetooth settings",
+      "bluetooth",
+      "pair bluetooth device"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            Start-Process \"ms-settings:bluetooth\"\n            return \"Opened Bluetooth settings\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "shutdown_timer",
+    "description": "Set a shutdown or restart timer, or cancel a pending shutdown.",
+    "examples": [
+      "shutdown in 1 hour",
+      "set shutdown timer",
+      "cancel shutdown"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "action",
+        "kind": "enum",
+        "instructions": "What timer action?",
+        "criteria": {
+          "shutdown_30": "shutdown in 30 minutes",
+          "shutdown_60": "shutdown in 1 hour",
+          "shutdown_120": "shutdown in 2 hours",
+          "restart_30": "restart in 30 minutes",
+          "cancel": "cancel scheduled shutdown or restart"
+        },
+        "default": "shutdown_60"
+      }
+    ],
+    "script": "\n            switch (\"{{action}}\") {\n                \"shutdown_30\"  { shutdown /s /t 1800 /c \"WinBrow: Shutting down in 30 minutes\"; return \"Shutdown scheduled in 30 minutes. Cancel with: shutdown /a\" }\n                \"shutdown_60\"  { shutdown /s /t 3600 /c \"WinBrow: Shutting down in 1 hour\"; return \"Shutdown scheduled in 1 hour. Cancel with: shutdown /a\" }\n                \"shutdown_120\" { shutdown /s /t 7200 /c \"WinBrow: Shutting down in 2 hours\"; return \"Shutdown scheduled in 2 hours. Cancel with: shutdown /a\" }\n                \"restart_30\"   { shutdown /r /t 1800 /c \"WinBrow: Restarting in 30 minutes\"; return \"Restart scheduled in 30 minutes. Cancel with: shutdown /a\" }\n                \"cancel\"       { shutdown /a 2>$null; return \"Cancelled any pending shutdown or restart\" }\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "open_settings_page",
+    "description": "Open a specific Windows Settings page directly: Privacy, Storage, Default Apps, Personalization, About, etc.",
+    "examples": [
+      "open storage settings",
+      "open about this pc",
+      "open default apps"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "page",
+        "kind": "enum",
+        "instructions": "Which settings page?",
+        "criteria": {
+          "privacy": "privacy and security settings",
+          "storage": "storage, disk usage breakdown",
+          "defaultapps": "default applications, file associations",
+          "personalization": "personalization, wallpaper, colors, themes",
+          "about": "about this PC, device specs, Windows version",
+          "accounts": "user accounts settings",
+          "notifications": "notification settings",
+          "multitasking": "multitasking, virtual desktops, snap",
+          "accessibility": "accessibility, ease of access",
+          "gaming": "gaming, game bar, captures",
+          "backup": "backup settings",
+          "recovery": "recovery, reset this PC",
+          "windowsupdate": "windows update, check for updates",
+          "mouse": "mouse settings, pointer speed",
+          "keyboard": "keyboard settings",
+          "printers": "printers and scanners",
+          "fonts": "installed fonts",
+          "clipboard": "clipboard settings, history",
+          "dateandtime": "date and time settings",
+          "regionlanguage": "region and language settings"
+        },
+        "default": "about"
+      }
+    ],
+    "script": "\n            Start-Process \"ms-settings:{{page}}\"\n            return \"Opened Windows {{page}} settings\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "countdown_timer",
+    "description": "Open the Windows Clock/Alarms app for setting timers, alarms, and stopwatch.",
+    "examples": [
+      "open timer",
+      "start stopwatch",
+      "set an alarm"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            Start-Process \"ms-clock:\"\n            return \"Opened Windows Clock app — use it for Timer, Alarm, and Stopwatch\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "lock_screen",
+    "description": "Lock the Windows screen immediately to secure the computer.",
+    "examples": [
+      "lock screen",
+      "lock my computer",
+      "lock pc"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class Win32Lock{[DllImport(\"user32.dll\")]public static extern bool LockWorkStation();}'\n            [Win32Lock]::LockWorkStation() | Out-Null\n            return \"Screen locked\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "public_ip",
+    "description": "Fetch and show the public internet IP address of this computer.",
+    "examples": [
+      "what is my public ip",
+      "show my ip address",
+      "get public ip"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            try {\n                $ip = (Invoke-WebRequest -Uri \"https://api.ipify.org\" -UseBasicParsing -TimeoutSec 5).Content\n                Add-Type -AssemblyName System.Windows.Forms\n                [System.Windows.Forms.Clipboard]::SetText($ip)\n                return \"Public IP: $ip (copied to clipboard)\"\n            } catch {\n                return \"Could not fetch public IP — check internet connection\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "always_on_top",
+    "description": "Toggle the current window to stay always on top of other windows (requires PowerToys or manual WinAPI).",
+    "examples": [
+      "pin this window",
+      "always on top",
+      "keep window on top"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $ws = New-Object -ComObject WScript.Shell\n            # PowerToys shortcut: Win+Ctrl+T for always-on-top\n            $ws.SendKeys(\"^#{t}\")\n            return \"Toggled always-on-top for current window (requires PowerToys 'Always on Top' feature)\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "clean_downloads",
+    "description": "Move old files (30+ days) from Downloads folder to a cleanup archive.",
+    "examples": [
+      "clean downloads",
+      "clean up downloads folder",
+      "organize downloads"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $downloads = Join-Path $env:USERPROFILE 'Downloads'\n            $archive = Join-Path $downloads \"Old_Downloads_$(Get-Date -Format 'yyyy-MM-dd')\"\n            $cutoff = (Get-Date).AddDays(-30)\n            $old = Get-ChildItem -Path $downloads -File -ErrorAction SilentlyContinue |\n                Where-Object { $_.LastWriteTime -lt $cutoff -and $_.Name -notlike \"Old_Downloads*\" }\n            if ($old.Count -gt 0) {\n                New-Item -ItemType Directory -Path $archive -Force | Out-Null\n                $old | Move-Item -Destination $archive\n                return \"Moved $($old.Count) file(s) older than 30 days to $archive\"\n            } else {\n                return \"No old files found in Downloads (everything is less than 30 days old)\"\n            }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "set_wallpaper",
+    "description": "Change the Windows desktop wallpaper/background to a given image file or a searched-for picture.",
+    "examples": [
+      "set wallpaper to sunset",
+      "change desktop background",
+      "change wallpaper to C:\\img.jpg"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "image",
+        "kind": "text",
+        "instructions": "Image file path or picture name to use as wallpaper",
+        "criteria": {},
+        "default": ""
+      }
+    ],
+    "script": "\n            $ref = \"{{image}}\".Trim()\n            if (-not $ref) {\n                return \"Tell me which image to use, e.g. 'set wallpaper to C:\\Pictures\\sunset.jpg' or 'set wallpaper to sunset'.\"\n            }\n            $candidate = $ref\n            if ($ref.StartsWith(\"~\")) { $candidate = Join-Path $env:USERPROFILE $ref.Substring(1).TrimStart('\\','/') }\n            if (-not (Test-Path $candidate -PathType Leaf)) {\n                $roots = @(\n                    [Environment]::GetFolderPath('MyPictures'),\n                    [Environment]::GetFolderPath('Desktop'),\n                    (Join-Path $env:USERPROFILE 'Downloads')\n                )\n                $found = $null\n                foreach ($root in $roots) {\n                    if (-not (Test-Path $root)) { continue }\n                    $found = Get-ChildItem -Path $root -File -Include *.jpg,*.jpeg,*.png,*.bmp -ErrorAction SilentlyContinue |\n                        Where-Object { $_.BaseName -like \"*$ref*\" } | Select-Object -First 1\n                    if ($found) { break }\n                }\n                if ($found) { $candidate = $found.FullName }\n                else { return \"ERROR: Could not find an image matching '$ref' in Pictures, Desktop, or Downloads. Provide a full image path.\" }\n            }\n            Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WPP{[DllImport(\"user32.dll\",CharSet=CharSet.Auto)]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'\n            [WPP]::SystemParametersInfo(20, 0, $candidate, 3) | Out-Null\n            return \"Desktop wallpaper set to $candidate\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "take_screenshot",
+    "description": "Capture the full screen and save it as a PNG file in Desktop, Downloads, Documents, or Pictures.",
+    "examples": [
+      "take a screenshot",
+      "screenshot to downloads",
+      "capture screen to desktop"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "location",
+        "kind": "text",
+        "instructions": "Folder to save the screenshot in: desktop, downloads, documents, or pictures",
+        "criteria": {},
+        "default": "desktop"
+      }
+    ],
+    "script": "\n            $loc = \"{{location}}\".Trim().ToLower()\n            $dest = [Environment]::GetFolderPath('Desktop')\n            if ($loc -match \"download\") { $dest = Join-Path $env:USERPROFILE \"Downloads\" }\n            elseif ($loc -match \"document\") { $dest = [Environment]::GetFolderPath('MyDocuments') }\n            elseif ($loc -match \"picture|photo|image\") { $dest = [Environment]::GetFolderPath('MyPictures') }\n            if (-not (Test-Path $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }\n            Add-Type -AssemblyName System.Windows.Forms,System.Drawing\n            $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds\n            $bmp = New-Object System.Drawing.Bitmap($screen.Width, $screen.Height)\n            $g = [System.Drawing.Graphics]::FromImage($bmp)\n            $g.CopyFromScreen($screen.Location, [System.Drawing.Point]::Empty, $screen.Size)\n            $path = Join-Path $dest (\"screenshot_\" + (Get-Date -Format 'yyyyMMdd_HHmmss') + \".png\")\n            $bmp.Save($path); $g.Dispose(); $bmp.Dispose()\n            return \"Screenshot saved to $path\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "close_folder_window",
+    "description": "Close File Explorer windows showing a specific folder (e.g. Downloads).",
+    "examples": [
+      "close the downloads folder window",
+      "close documents window",
+      "close desktop folder"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "folder",
+        "kind": "text",
+        "instructions": "Which folder's Explorer window to close?",
+        "criteria": {},
+        "default": "downloads"
+      }
+    ],
+    "script": "\n            $ref = \"{{folder}}\".Trim().Trim('\"').Trim(\"'\")\n            $folderMap = @{\n                \"downloads\" = Join-Path $env:USERPROFILE \"Downloads\"\n                \"documents\" = [Environment]::GetFolderPath('MyDocuments')\n                \"desktop\"   = [Environment]::GetFolderPath('Desktop')\n                \"pictures\"  = [Environment]::GetFolderPath('MyPictures')\n                \"music\"     = [Environment]::GetFolderPath('MyMusic')\n                \"videos\"    = [Environment]::GetFolderPath('MyVideos')\n                \"home\"      = $env:USERPROFILE\n            }\n            $target = $folderMap[$ref.ToLower()]\n            if (-not $target) {\n                if ($ref.StartsWith(\"~\")) { $target = Join-Path $env:USERPROFILE $ref.Substring(1).TrimStart('\\','/') }\n                else { $target = $ref }\n            }\n            try { $target = (Resolve-Path $target -ErrorAction Stop).Path } catch {}\n            $target = $target.TrimEnd('\\')\n            $shell = New-Object -ComObject Shell.Application\n            $closed = 0\n            foreach ($w in $shell.Windows()) {\n                try {\n                    $loc = $w.LocationURL\n                    if (-not $loc) { continue }\n                    $path = ([Uri]::UnescapeDataString(($loc -replace '^file:///','') -replace '/','\\')).TrimEnd('\\')\n                    if ($path -ieq $target) { $w.Quit(); $closed++ }\n                } catch {}\n            }\n            if ($closed -gt 0) { return \"Closed $closed Explorer window(s) showing $target\" }\n            else { return \"No open Explorer window found showing '$ref'.\" }\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "system_performance",
+    "description": "Show CPU and memory usage with the top resource-consuming processes.",
+    "examples": [
+      "show system performance",
+      "cpu usage",
+      "memory usage"
+    ],
+    "scope": null,
+    "args": [],
+    "script": "\n            $cpuLoad = (Get-CimInstance -ClassName Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average\n            $os = Get-CimInstance Win32_OperatingSystem\n            $ramUsed = [math]::Round(($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB, 1)\n            $ramTotal = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)\n            $top = Get-Process | Sort-Object -Property CPU -Descending | Select-Object -First 5 |\n                ForEach-Object { \"$($_.Name): CPU=$([math]::Round($_.CPU,1))s Mem=$([math]::Round($_.WorkingSet64/1MB,1))MB\" }\n            return \"CPU: $cpuLoad% | RAM: $ramUsed GB / $ramTotal GB`nTop Processes:`n\" + ($top -join \"`n\")\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "open_file",
+    "description": "Find a file by name in the common user folders and open it (default app, or in Chrome/Edge).",
+    "examples": [
+      "open images.png",
+      "open the report pdf from downloads",
+      "open that file"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "target",
+        "kind": "text",
+        "instructions": "File name or full path to open",
+        "criteria": {},
+        "default": ""
+      },
+      {
+        "name": "app",
+        "kind": "text",
+        "instructions": "App to open it with: chrome, edge, or empty for default",
+        "criteria": {},
+        "default": ""
+      }
+    ],
+    "script": "\n            $ref = \"{{target}}\".Trim().Trim('\"').Trim(\"'\")\n            $app = \"{{app}}\".Trim().ToLower()\n            if (-not $ref) {\n                return \"Tell me which file to open, e.g. 'open the file report.pdf'.\"\n            }\n            $path = $null\n            $candidate = $ref\n            if ($ref.StartsWith(\"~\")) { $candidate = Join-Path $env:USERPROFILE $ref.Substring(1).TrimStart('\\','/') }\n            if (Test-Path $candidate -PathType Leaf) { $path = (Resolve-Path $candidate).Path }\n            if (-not $path) {\n                $roots = @(\n                    [Environment]::GetFolderPath('Desktop'),\n                    [Environment]::GetFolderPath('MyDocuments'),\n                    (Join-Path $env:USERPROFILE 'Downloads'),\n                    [Environment]::GetFolderPath('MyPictures'),\n                    [Environment]::GetFolderPath('MyVideos'),\n                    [Environment]::GetFolderPath('MyMusic'),\n                    $env:USERPROFILE\n                )\n                $hits = @()\n                foreach ($root in ($roots | Select-Object -Unique)) {\n                    if (-not (Test-Path $root)) { continue }\n                    try {\n                        $hits += Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue -Depth 3 |\n                            Where-Object { $_.Name -ieq $ref -or $_.BaseName -ieq $ref }\n                    } catch {}\n                }\n                if ($hits.Count -eq 0) {\n                    return \"ERROR: Could not find a file named '$ref' in Desktop, Documents, Downloads, Pictures, Videos, or Music.\"\n                }\n                $best = $hits | Sort-Object LastWriteTime -Descending | Select-Object -First 1\n                $path = $best.FullName\n            }\n            if ($app -match \"chrome|edge|browser\") {\n                $exe = $null\n                foreach ($p in @(\n                    \"$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe\",\n                    \"$env:ProgramFiles(x86)\\Google\\Chrome\\Application\\chrome.exe\",\n                    \"$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe\",\n                    \"$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe\",\n                    \"$env:ProgramFiles(x86)\\Microsoft\\Edge\\Application\\msedge.exe\"\n                )) { if (Test-Path $p) { $exe = $p; break } }\n                if ($exe) {\n                    Start-Process $exe -ArgumentList \"$path\"\n                    return \"Opened $path in $([IO.Path]::GetFileNameWithoutExtension($exe))\"\n                }\n            }\n            Start-Process \"$path\"\n            $extra = \"\"\n            return \"Opened $path$extra\"\n            ",
+    "speak": "done"
+  }
+]

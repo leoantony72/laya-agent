@@ -22,6 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from winbrow.agent import WinBrowAgent
+from winbrow.windows import run_powershell
 
 # ---------------------------------------------------------------------------
 # Setup & Logging
@@ -53,6 +54,15 @@ runtime_settings = {
 
 # Active WebSocket connections (for broadcast)
 _ws_clients: list[WebSocket] = []
+
+
+@app.on_event("startup")
+async def _warmup() -> None:
+    """Pay the cold PowerShell spawn cost once at boot, not on the first command."""
+    try:
+        await run_powershell("Write-Output warm", timeout=60)
+    except Exception as e:
+        log.warning(f"PowerShell warm-up failed (non-fatal): {e}")
 
 
 # ---------------------------------------------------------------------------

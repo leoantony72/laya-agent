@@ -100,23 +100,23 @@ class BrowserController:
         return name or "chrome"
 
     async def ensure_browser_open(self) -> dict[str, Any]:
-        """Make sure a browser window is visible and focused."""
-        browser = await self.get_running_browser()
-        if browser:
-            script = f"""
-            $proc = Get-Process -Name "{browser}" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($proc -and $proc.MainWindowHandle -ne 0) {{
-                $ws = New-Object -ComObject WScript.Shell
-                $ws.AppActivate($proc.Id) | Out-Null
-                return "Focused $browser"
-            }} else {{
-                Start-Process "{browser}"
-                Start-Sleep -Milliseconds 1500
-                return "Launched $browser"
-            }}
-            """
-        else:
-            script = 'Start-Process "chrome"; Start-Sleep -Milliseconds 1500; return "Launched Chrome"'
+        """Make sure a browser window is visible and focused (single call)."""
+        script = """
+        $browser = $null
+        foreach ($b in @('chrome', 'msedge', 'firefox')) {
+            if (Get-Process -Name $b -ErrorAction SilentlyContinue) { $browser = $b; break }
+        }
+        if (-not $browser) { $browser = "chrome" }
+        $proc = Get-Process -Name $browser -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($proc -and $proc.MainWindowHandle -ne 0) {
+            $ws = New-Object -ComObject WScript.Shell
+            $ws.AppActivate($proc.Id) | Out-Null
+            return "Focused $browser"
+        } else {
+            Start-Process $browser
+            return "Launched $browser"
+        }
+        """
         return await run_powershell(script)
 
     # ── CDP Tab Operations ─────────────────────────────────────────────────
