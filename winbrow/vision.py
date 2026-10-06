@@ -29,9 +29,12 @@ class VisionFallback:
         self, 
         model_path: Optional[Path] = None,
         host: str = "127.0.0.1",
-        port: int = 8081,  # Different port from main LLM
+        port: int = 8081,
     ):
-        self.model_path = model_path or get_model_path("qwen_vl")
+        try:
+            self.model_path = model_path or get_model_path("qwen_vl")
+        except ValueError:
+            self.model_path = model_path  # Vision model not configured
         self.host = host
         self.port = port
         self.base_url = f"http://{host}:{port}"
@@ -40,6 +43,9 @@ class VisionFallback:
     
     async def start(self) -> None:
         """Start the llama.cpp server with Qwen2.5-VL model."""
+        if not self.model_path:
+            raise RuntimeError("Vision model not configured. Add 'qwen_vl' to MODEL_CONFIGS in model_manager.py to enable vision fallback.")
+        
         llama_server = ensure_llama_cpp()
         self.model_path = self.model_path or get_model_path("qwen_vl")
         

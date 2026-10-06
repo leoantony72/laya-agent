@@ -360,7 +360,7 @@ if __name__ == "__main__":
             "requires_clarification": False,
             "clarification_question": "",
             "reasoning": "User wants to open a PDF file"
-        })
+        }))
         
         result = await llm.extract_intent("open report.pdf in chrome")
         print(f"Intent: {result}")

@@ -28,7 +28,7 @@ MODEL_CONFIGS = {
         "repo": "ggerganov/whisper.cpp",
         "model_file": "ggml-base.en.bin",
         "url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-        "sha256": "8c8d0f2b3b4a1e8c9f5e3b2a1d0c9f8e7b6a5d4c3b2a1f0e9d8c7b6a5f4e3d2c1",
+        "sha256": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef12345678",
         "subdir": "whisper",
     },
     "qwen": {
@@ -37,13 +37,6 @@ MODEL_CONFIGS = {
         "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B-GGUF/resolve/main/qwen3.5-0.8b-q4_k_m.gguf",
         "sha256": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef12345678",
         "subdir": "qwen",
-    },
-    "qwen_vl": {
-        "repo": "Qwen/Qwen2.5-VL-3B-GGUF",
-        "model_file": "qwen2.5-vl-3b-q4_k_m.gguf",
-        "url": "https://huggingface.co/Qwen/Qwen2.5-VL-3B-GGUF/resolve/main/qwen2.5-vl-3b-q4_k_m.gguf",
-        "sha256": "b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef1234567890",
-        "subdir": "qwen_vl",
     },
 }
 

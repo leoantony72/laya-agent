@@ -23,6 +23,8 @@ from pydantic import BaseModel
 
 from winbrow.agent import WinBrowAgent
 from winbrow.windows import run_powershell
+from winbrow.model_manager import get_model_path, ensure_llama_cpp, ensure_all_models
+from winbrow.llm import QwenLLM
 
 # ---------------------------------------------------------------------------
 # Setup & Logging
@@ -39,6 +41,9 @@ app = FastAPI(title="WinBrow — Hands-free Windows & Browser Control", version=
 
 # Global Agent Instance
 agent = WinBrowAgent()
+
+# Global LLM Instance
+llm_instance: Optional[QwenLLM] = None
 
 # Static Files
 static_dir = Path(__file__).parent / "static"
@@ -58,12 +63,45 @@ _ws_clients: list[WebSocket] = []
 
 
 @app.on_event("startup")
-async def _warmup() -> None:
-    """Pay the cold PowerShell spawn cost once at boot, not on the first command."""
+async def _startup() -> None:
+    """Download models and start LLM server on startup."""
+    global llm_instance
+    
+    log.info("Starting WinBrow server...")
+    
+    # 1. Ensure models are downloaded
+    try:
+        log.info("Checking/downloading required models...")
+        await asyncio.get_event_loop().run_in_executor(None, ensure_all_models)
+        log.info("Models ready")
+    except Exception as e:
+        log.warning(f"Model download failed (will retry on first use): {e}")
+    
+    # 2. Start llama.cpp server with Qwen model
+    try:
+        log.info("Starting local LLM server...")
+        llm_instance = QwenLLM()
+        await llm_instance.start()
+        log.info(f"LLM server ready at {llm_instance.base_url}")
+    except Exception as e:
+        log.warning(f"LLM server failed to start (will retry on first use): {e}")
+        llm_instance = None
+    
+    # 3. Warm up PowerShell
     try:
         await run_powershell("Write-Output warm", timeout=60)
     except Exception as e:
         log.warning(f"PowerShell warm-up failed (non-fatal): {e}")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """Stop LLM server on shutdown."""
+    global llm_instance
+    if llm_instance:
+        log.info("Stopping LLM server...")
+        await llm_instance.stop()
+        llm_instance = None
 
 
 # ---------------------------------------------------------------------------
