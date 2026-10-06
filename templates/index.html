@@ -262,15 +262,20 @@
         <div class="field">
             <label>Provider</label>
             <select id="providerSelect" class="input">
-                <option value="auto">Auto (offline synthesizer, or OpenAI if a key is set)</option>
+                <option value="auto">Auto (offline synthesizer, or OpenAI/Gemini if a key is set)</option>
                 <option value="ollama">Ollama (localhost:11434)</option>
                 <option value="lmstudio">LM Studio (localhost:1234/v1)</option>
                 <option value="openai">OpenAI (gpt-4o-mini)</option>
+                <option value="gemini">Google Gemini (gemini-1.5-flash)</option>
             </select>
         </div>
         <div class="field">
             <label>API key</label>
-            <input type="password" id="apiKeyInput" class="input" placeholder="sk-..." />
+            <input type="password" id="apiKeyInput" class="input" placeholder="sk-... (OpenAI) or AIza... (Gemini)" />
+        </div>
+        <div class="field">
+            <label>Gemini Project ID (optional, for Vertex AI)</label>
+            <input type="text" id="projectIdInput" class="input" placeholder="projects/123456789012" />
         </div>
         <div class="field">
             <label>Custom endpoint</label>
@@ -446,6 +451,7 @@ document.getElementById('settingsBtn').addEventListener('click', async () => {
     const s = await resp.json();
     document.getElementById('providerSelect').value = s.provider || 'auto';
     document.getElementById('endpointInput').value = s.endpoint || '';
+    document.getElementById('projectIdInput').value = s.project_id || '';
     document.getElementById('settingsModal').classList.add('open');
 });
 
@@ -459,6 +465,7 @@ async function saveSettings() {
             provider: document.getElementById('providerSelect').value,
             api_key: document.getElementById('apiKeyInput').value.trim(),
             endpoint: document.getElementById('endpointInput').value.trim(),
+            project_id: document.getElementById('projectIdInput').value.trim(),
         }),
     });
     closeSettings();

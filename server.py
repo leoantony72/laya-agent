@@ -50,6 +50,7 @@ runtime_settings = {
     "provider": "auto",
     "api_key": "",
     "endpoint": "http://localhost:11434/api/generate",
+    "project_id": "",
 }
 
 # Active WebSocket connections (for broadcast)
@@ -74,12 +75,14 @@ class ExecuteRequest(BaseModel):
     provider: Optional[str] = None
     api_key: Optional[str] = None
     endpoint: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class SettingsRequest(BaseModel):
     provider: str = "auto"
     api_key: str = ""
     endpoint: str = ""
+    project_id: str = ""
 
 
 class BrowserRequest(BaseModel):
@@ -117,12 +120,14 @@ async def execute_command(req: ExecuteRequest):
     provider = req.provider or runtime_settings["provider"]
     api_key = req.api_key or runtime_settings["api_key"]
     endpoint = req.endpoint or runtime_settings["endpoint"]
+    project_id = req.project_id or runtime_settings["project_id"]
 
     result = await agent.execute(
         cmd,
         api_key=api_key if api_key else None,
         provider=provider,
         custom_endpoint=endpoint if endpoint else None,
+        project_id=project_id if project_id else None,
     )
 
     # Broadcast to all WebSocket clients
@@ -191,10 +196,12 @@ async def save_settings(req: SettingsRequest):
     runtime_settings["provider"] = req.provider
     runtime_settings["api_key"] = req.api_key
     runtime_settings["endpoint"] = req.endpoint
+    runtime_settings["project_id"] = req.project_id
     return JSONResponse({"status": "saved", "settings": {
         "provider": req.provider,
         "has_api_key": bool(req.api_key),
         "endpoint": req.endpoint,
+        "project_id": req.project_id,
     }})
 
 
@@ -204,6 +211,7 @@ async def get_settings():
         "provider": runtime_settings["provider"],
         "has_api_key": bool(runtime_settings["api_key"]),
         "endpoint": runtime_settings["endpoint"],
+        "project_id": runtime_settings["project_id"],
     })
 
 
@@ -310,6 +318,7 @@ async def websocket_endpoint(ws: WebSocket):
                         api_key=runtime_settings.get("api_key") or None,
                         provider=runtime_settings.get("provider", "auto"),
                         custom_endpoint=runtime_settings.get("endpoint") or None,
+                        project_id=runtime_settings.get("project_id") or None,
                     )
                     await ws.send_json({"type": "result", "data": res})
 

@@ -66,8 +66,9 @@ class ScriptGenerator:
         utterance: str,
         ctx: WindowsContext,
         api_key: Optional[str] = None,
-        provider: str = "auto",  # "auto" | "ollama" | "lmstudio" | "openai"
+        provider: str = "auto",  # "auto" | "ollama" | "lmstudio" | "openai" | "gemini"
         custom_endpoint: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Generate a new tool using LLM, validate, execute, and persist.
@@ -75,7 +76,7 @@ class ScriptGenerator:
         log.info(f"Generating new tool for: '{utterance}'")
 
         # 1. Generate tool JSON via LLM
-        tool_data = await self._call_llm(utterance, ctx, api_key, provider, custom_endpoint)
+        tool_data = await self._call_llm(utterance, ctx, api_key, provider, custom_endpoint, project_id)
 
         if not tool_data.get("feasible", True):
             return {
@@ -160,13 +161,22 @@ class ScriptGenerator:
         api_key: Optional[str],
         provider: str,
         custom_endpoint: Optional[str],
+        project_id: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Call LLM provider (Ollama, LM Studio, OpenAI, or smart synthesizer fallback)."""
+        """Call LLM provider (Ollama, LM Studio, OpenAI, Gemini, or smart synthesizer fallback)."""
         prompt = (
             f"User request: '{utterance}'\n"
             f"Focused app: '{ctx.active_app}', Window title: '{ctx.active_title}'\n"
             f"Running apps: {', '.join(ctx.running_apps[:10])}\n"
         )
+
+        # Check for Gemini
+        gemini_key = api_key or os.environ.get("GEMINI_API_KEY")
+        if gemini_key and (provider == "gemini" or provider == "auto"):
+            try:
+                return await self._call_gemini(gemini_key, prompt, custom_endpoint, project_id)
+            except Exception as e:
+                log.warning(f"Gemini call failed: {e}")
 
         # Try local Ollama / LM Studio if available or requested
         endpoint = custom_endpoint
@@ -204,6 +214,71 @@ class ScriptGenerator:
 
         # Built-in intelligent PowerShell template synthesizer for complex offline tasks
         return self._synthesize_tool(utterance, ctx)
+
+    async def _call_gemini(self, api_key: str, prompt: str, custom_endpoint: Optional[str] = None, project_id: Optional[str] = None) -> dict[str, Any]:
+        """Call Google Gemini API (supports both Gemini API and Vertex AI)."""
+        # Use custom endpoint if provided
+        if custom_endpoint:
+            url = custom_endpoint
+            # Add API key as query parameter if not already present
+            if "key=" not in url and "?" not in url:
+                url = f"{url}?key={api_key}"
+            elif "key=" not in url:
+                url = f"{url}&key={api_key}"
+        elif project_id:
+            # Vertex AI endpoint format
+            # project_id should be like "projects/123456789012" or "projects/123456789012/locations/us-central1"
+            base = project_id.rstrip("/")
+            if "/locations/" not in base:
+                base = f"{base}/locations/us-central1"
+            url = f"https://{base}/publishers/google/models/gemini-1.5-flash:generateContent?key={api_key}"
+        else:
+            # Default to Gemini API (generativelanguage.googleapis.com)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": SYSTEM_PROMPT},
+                        {"text": prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 2048,
+            },
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        loop = asyncio.get_event_loop()
+        try:
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: urllib.request.urlopen(req, timeout=10)),
+                timeout=12,
+            )
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(f"Gemini request timed out") from e
+        
+        res_data = json.loads(resp.read().decode("utf-8"))
+        
+        # Extract text from Gemini response format
+        try:
+            content = res_data["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError) as e:
+            log.warning(f"Unexpected Gemini response format: {res_data}")
+            raise RuntimeError(f"Invalid Gemini response: {e}")
+
+        # Extract JSON
+        clean_json = re.search(r"\{.*\}", content, re.DOTALL)
+        if clean_json:
+            return json.loads(clean_json.group(0))
+        return json.loads(content)
 
     async def _call_openai_compatible(self, url: str, key: str, model: str, prompt: str) -> dict[str, Any]:
         payload = {

@@ -214,6 +214,7 @@ class WinBrowAgent:
         api_key: Optional[str] = None,
         provider: str = "auto",
         custom_endpoint: Optional[str] = None,
+        project_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """
         Process user command end-to-end:
@@ -308,6 +309,7 @@ class WinBrowAgent:
                     api_key=api_key,
                     provider=provider,
                     custom_endpoint=custom_endpoint,
+                    project_id=project_id,
                 )
                 result["execution"] = {
                     "type": "generated_tool",
