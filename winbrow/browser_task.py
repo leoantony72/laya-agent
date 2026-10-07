@@ -119,6 +119,18 @@ class BrowserController:
         """
         return await run_powershell(script)
 
+    async def ensure_browser_with_cdp(self, url: str = "") -> dict[str, Any]:
+        """
+        Ensure Chrome/Edge is running with CDP (remote debugging port 9222).
+        If not running with CDP, launch a new instance with --remote-debugging-port=9222.
+        """
+        # First check if CDP is already available
+        if _cdp_available():
+            return {"success": True, "method": "cdp_already_running", "message": "CDP already available on port 9222"}
+        
+        # Launch Chrome/Edge with CDP
+        return await self.launch_with_cdp(url)
+
     # ── CDP Tab Operations ─────────────────────────────────────────────────
 
     async def list_tabs(self) -> dict[str, Any]:
@@ -595,3 +607,20 @@ class BrowserController:
         code = "document.readyState"
         result = await self.execute_js(code)
         return {"success": True, "ready_state": result.get("value", "unknown")}
+
+    async def run_ultrafast_task(self, goal: str, max_steps: int = 5) -> dict[str, Any]:
+        """
+        Execute an Ultrafast multi-step browser task using Laya typed decisions.
+        """
+        from .ultrafast import LayaUltrafastEngine
+        engine = LayaUltrafastEngine(self)
+        res = await engine.run_task(goal=goal, max_steps=max_steps)
+        return {
+            "success": res.success,
+            "goal": res.goal,
+            "final_answer": res.final_answer,
+            "steps": res.steps,
+            "total_elapsed_ms": res.total_elapsed_ms,
+            "method": res.method,
+        }
+

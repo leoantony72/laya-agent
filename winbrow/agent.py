@@ -26,7 +26,7 @@ from .generator import ScriptGenerator
 from .last_opened import ContextMemory
 from .registry import Tool, ToolRegistry
 from .resolvers import resolve_file, resolve_folder
-from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter
+from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter, _strip_conversational_prefix, autocorrect_utterance, _tokens, _fuzzy_in, _SEARCH_VERBS, _WEB_LOCS, _LOCAL_FIND, _LAUNCH_APPS, _COMMON_APPS
 from .windows import WindowsContext, get_current_windows_context, run_powershell, set_windows_volume
 
 log = logging.getLogger("winbrow.agent")
@@ -38,13 +38,16 @@ BROWSER_KEYWORDS = [
     "new tab", "close tab", "reload", "scroll down", "scroll up", "bookmark",
     "devtools", "inspect element", "javascript", "screenshot browser",
     "read page", "click on", "fill form", "find on page", "browser history",
+    "ultrafast", "laya-ultrafast", "automate browser", "browser task", "multi-step browser",
+    "search", "find results", "in the web", "on the web", "web search", "look up",
 ]
 
 
 def _is_browser_intent(utterance: str) -> bool:
-    lower = utterance.lower()
+    cleaned = _strip_conversational_prefix(utterance)
+    lower = cleaned.lower()
     for kw in BROWSER_KEYWORDS:
-        if " " in kw or "://" in kw:
+        if " " in kw or "://" in kw or "-" in kw:
             # Multi-word phrases / URLs: substring match is safe.
             if kw in lower:
                 return True
@@ -53,6 +56,76 @@ def _is_browser_intent(utterance: str) -> bool:
             # match "tables", "reload" must not match "reloaded", etc.
             if re.search(r"\b" + re.escape(kw) + r"s?\b", lower):
                 return True
+    return False
+
+
+def _is_known_task(utterance: str) -> bool:
+    """
+    Check if utterance looks like a known task (search, open, volume, etc.)
+    that should be handled by built-in tools, not the generator.
+    This prevents the generator from being called for common tasks that
+    the heuristic router should have caught.
+    """
+    cleaned = _strip_conversational_prefix(utterance)
+    lower = cleaned.lower()
+    tokens = _tokens(lower)
+    
+    # Search verbs + web locations (same logic as router)
+    search_verbs = frozenset({"search", "google", "browse", "lookup", "look up", "find"})
+    web_locations = frozenset({"web", "online", "internet", "google", "browser", "chrome", "edge", "firefox", "bing"})
+    has_search_verb = _fuzzy_in(tokens, search_verbs) or "look up" in lower or "look for" in lower
+    has_web_location = _fuzzy_in(tokens, web_locations) or "in the web" in lower or "on the web" in lower or "in web" in lower or "on web" in lower
+    starts_with_search = any(lower.startswith(p) for p in ("search ", "search for ", "google ", "look up ", "look for ", "find ", "browse ", "browse for "))
+    
+    if (has_search_verb and has_web_location) or starts_with_search:
+        return True
+    
+    # Open/launch/focus/switch + app
+    launch_prefixes = ["open ", "launch ", "switch to ", "focus ", "bring up ", "start "]
+    for prefix in launch_prefixes:
+        if lower.startswith(prefix):
+            return True
+    
+    # Volume control
+    if any(w in lower for w in ["volume", "volueme", "voluem", "voume", "vol ", "vol.", "mute", "unmute", "audio", "sound"]):
+        return True
+    
+    # Lock screen
+    if "lock" in lower and any(w in lower for w in ["screen", "computer", "pc", "workstation"]):
+        return True
+    
+    # Window actions
+    if any(w in lower for w in ["minimize", "maximize", "snap left", "snap right", "show desktop", "close window"]):
+        return True
+    
+    # Settings
+    if "settings" in lower or "open settings" in lower:
+        return True
+    
+    # Screenshot
+    if "screenshot" in lower or "screen capture" in lower or "capture screen" in lower:
+        return True
+    
+    # Time/date
+    if any(p in lower for p in ["what time", "current time", "what is the date", "what date"]):
+        return True
+    
+    # Battery
+    if "battery" in lower and ("health" in lower or "status" in lower or "level" in lower or "report" in lower):
+        return True
+    
+    # Dark/light mode
+    if "dark mode" in lower or "light mode" in lower or "toggle theme" in lower or "switch theme" in lower:
+        return True
+    
+    # Media playback
+    if any(w in lower for w in ["play", "pause", "next song", "previous song", "skip track", "media"]):
+        return True
+    
+    # Direct URL
+    if re.search(r"(https?://\S+|[\w\-]+\.(com|org|net|io|dev|ai|gov|edu|co|me|app)[\S]*)", cleaned, re.IGNORECASE):
+        return True
+    
     return False
 
 
@@ -101,6 +174,42 @@ class WinBrowAgent:
         Returns an execution result dict.
         """
         lower = utterance.lower()
+
+        # For CDP-requiring operations, ensure browser is running with CDP first
+        cdp_operations = [
+            "new tab", "open tab", "open new tab",
+            "close tab", "close this tab",
+            "reload", "refresh",
+            "go back", "navigate back",
+            "go forward", "navigate forward",
+            "scroll", "find on page", "list tabs", "show tabs", "how many tabs",
+            "read page", "page content", "what does the page say",
+            "current url", "what url", "what page",
+            "screenshot", "bookmark", "history", "downloads",
+            "devtools", "inspect element", "click on", "fill form",
+            "switch tab",
+        ]
+        
+        needs_cdp = any(op in lower for op in cdp_operations)
+        if needs_cdp:
+            cdp_result = await self.browser.ensure_browser_with_cdp()
+            if not cdp_result.get("success"):
+                return {"type": "browser", "tool": "ensure_cdp", "success": False, 
+                        "output": f"Failed to start browser with CDP: {cdp_result.get('output', 'Unknown error')}"}
+
+        # Ultrafast multi-step browser task execution
+        if any(p in lower for p in ["ultrafast", "laya-ultrafast", "automate browser", "browser task", "fill form", "multi-step browser"]):
+            out = await self.browser.run_ultrafast_task(utterance)
+            return {
+                "type": "browser",
+                "tool": "laya_ultrafast_browser",
+                "success": out.get("success", True),
+                "output": out.get("final_answer") or str(out.get("steps", [])),
+                "steps": out.get("steps", []),
+                "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+                "method": out.get("method", "laya_ultrafast"),
+            }
+
 
         # Open new tab
         if any(p in lower for p in ["new tab", "open tab", "open new tab"]):
@@ -231,13 +340,14 @@ class WinBrowAgent:
         ctx = await loop.run_in_executor(None, self.get_context)
 
         # Fast-path browser intent detection (before Laya routing overhead)
-        utterance_lower = utterance.lower()
+        cleaned_utterance = _strip_conversational_prefix(utterance)
+        utterance_lower = cleaned_utterance.lower()
         browser_fast = _is_browser_intent(utterance)
 
         # -- Handle direct search queries that go through web_search tool --
         # Keep these in the tool routing path rather than browser fast-path
         is_search = any(utterance_lower.startswith(p) for p in [
-            "search ", "google ", "look up ", "find ", "search for "
+            "search ", "google ", "look up ", "find ", "search for ", "find results "
         ]) and not any(kw in utterance_lower for kw in [
             "tab", "reload", "scroll", "screenshot", "find on page", "incognito"
         ])
@@ -296,8 +406,23 @@ class WinBrowAgent:
             result["route"]["kind"] = "browser"
 
         elif route.kind == NEW_ACTION:
+            # If this looks like a known task (search, open, volume, etc.) that should
+            # have been caught by heuristic routing, don't call the generator.
+            # The generator is for novel PowerShell tasks, not common built-in actions.
+            if _is_known_task(utterance):
+                result["execution"] = {
+                    "type": "error",
+                    "success": False,
+                    "output": (
+                        f"I understand you want to {utterance.lower()}, but I couldn't "
+                        f"match it to a built-in tool. This might be a routing issue. "
+                        f"Try rephrasing (e.g. 'search for phones on google' or 'open chrome')."
+                    ),
+                    "elapsed_ms": 0,
+                }
+                result["route"]["tier"] = "heuristic-miss"
             # Try browser dispatch first if heuristic suggests it
-            if browser_fast and not is_search:
+            elif browser_fast and not is_search:
                 browser_out = await self._dispatch_browser(utterance)
                 result["execution"] = browser_out
                 result["route"]["kind"] = "browser"

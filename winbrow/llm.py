@@ -38,7 +38,6 @@ class QwenLLM:
         self.port = port
         self.n_ctx = n_ctx
         self.n_threads = n_threads
-        self.base_url = f"http://{host}:{port}"
         self.server_process: Optional[subprocess.Popen] = None
         self._server_ready = False
         
@@ -48,10 +47,12 @@ class QwenLLM:
             return
         
         llama_server = ensure_llama_cpp()
+        if not llama_server or not llama_server.exists():
+            raise RuntimeError("llama-server binary unavailable. Running in System 1 Laya routing mode.")
         self.model_path = self.model_path or get_model_path("qwen")
         
         cmd = [
-            str(self.llama_server),
+            str(llama_server),
             "-m", str(self.model_path),
             "--host", "127.0.0.1",
             "--port", str(self.port),

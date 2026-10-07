@@ -16,6 +16,13 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
+# Set Windows proactor event loop policy early for subprocess support
+if sys.platform == "win32":
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    except Exception:
+        pass
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -309,6 +316,9 @@ async def browser_action(req: BrowserRequest):
         result = await b.zoom("out")
     elif action == "zoom_reset":
         result = await b.zoom("reset")
+    elif action in ("ultrafast", "laya_ultrafast"):
+        goal = req.query or req.text or "search page"
+        result = await b.run_ultrafast_task(goal)
     else:
         return JSONResponse({"error": f"Unknown browser action: {action}"}, status_code=400)
 

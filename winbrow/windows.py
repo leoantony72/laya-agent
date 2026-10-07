@@ -365,9 +365,13 @@ async def run_powershell(script: str, timeout: int = 30) -> dict[str, Any]:
             ("Persistent PowerShell unavailable", "Persistent host error")
         ):
             return res
-        log.warning("Persistent host down; using one-shot PowerShell fallback.")
+        stderr = res.get("stderr", "")
+        if stderr:
+            log.warning(f"Persistent host down ({stderr[:100]}); using one-shot PowerShell fallback.")
+        else:
+            log.warning("Persistent host down; using one-shot PowerShell fallback.")
     except Exception as e:
-        log.warning(f"Persistent host import/call failed ({e}); using one-shot fallback.")
+        log.warning(f"Persistent host import/call failed ({repr(e)}); using one-shot fallback.")
     return await _run_powershell_once(script, timeout)
 
 

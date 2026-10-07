@@ -32,9 +32,9 @@ MODEL_CONFIGS = {
         "subdir": "whisper",
     },
     "qwen": {
-        "repo": "Qwen/Qwen3.5-0.8B-GGUF",
-        "model_file": "qwen3.5-0.8b-q4_k_m.gguf",
-        "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B-GGUF/resolve/main/qwen3.5-0.8b-q4_k_m.gguf",
+        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "model_file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "url": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf",
         "sha256": "a1b2c3d4e5f6789012345678901234567890abcdef1234567890abcdef12345678",
         "subdir": "qwen",
     },
@@ -95,63 +95,45 @@ def _verify_checksum(filepath: Path, expected_sha256: str) -> bool:
 
 
 def _download_with_progress(url: str, dest: Path) -> None:
-    """Download a file with progress bar."""
+    """Download a file with progress bar using proper User-Agent header."""
     log.info(f"Downloading from {url} to {dest}")
-    
-    def progress_hook(block_num, block_size, total_size):
-        if total_size > 0:
-            percent = min(100, (block_num * block_size * 100) // total_size)
-            sys.stdout.write(f"\rDownloading: {percent}%")
-            sys.stdout.flush()
+    req = urllib.request.Request(url, headers={"User-Agent": "WinBrow/2.0 (Windows NT 10.0; Win64; x64)"})
     
     try:
-        urllib.request.urlretrieve(url, str(dest), progress_hook)
+        with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out_file:
+            total_size = int(resp.headers.get("content-length", 0))
+            downloaded = 0
+            block_size = 16384
+            while True:
+                buffer = resp.read(block_size)
+                if not buffer:
+                    break
+                downloaded += len(buffer)
+                out_file.write(buffer)
+                if total_size > 0:
+                    percent = min(100, (downloaded * 100) // total_size)
+                    sys.stdout.write(f"\rDownloading: {percent}%")
+                    sys.stdout.flush()
         print()  # New line after progress
     except Exception as e:
         log.error(f"Download failed: {e}")
+        if dest.exists():
+            dest.unlink(missing_ok=True)
         raise
 
 
-def ensure_llama_cpp() -> Path:
+def ensure_llama_cpp() -> Optional[Path]:
     """Ensure llama.cpp server binary is available."""
     if LLAMA_SERVER_BIN.exists():
         return LLAMA_SERVER_BIN
     
-    log.info("Downloading llama.cpp server binary...")
-    
-    if platform.system() == "Windows":
-        # Download pre-built Windows binary
-        url = "https://github.com/ggml-org/llama.cpp/releases/latest/download/llama-server-win64.zip"
-        zip_path = LLAMA_CPP_DIR / "llama-server.zip"
-        
-        _download_with_progress(url, zip_path)
-        
-        import zipfile
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            zf.extractall(LLAMA_CPP_DIR)
-        zip_path.unlink(missing_ok=True)
-    else:
-        # Linux/macOS - build from source or download
-        log.info("Building llama.cpp from source...")
-        subprocess.run(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp.git", str(LLAMA_CPP_DIR)], check=True)
-        subprocess.run(["cmake", "-B", "build", "-DLLAMA_CURL=ON", "-DLLAMA_SERVER=ON"], cwd=LLAMA_CPP_DIR, check=True)
-        subprocess.run(["cmake", "--build", "build", "--config", "Release", "-j", "4"], cwd=LLAMA_CPP_DIR, check=True)
-        
-        # Find the binary
-        for name in ["llama-server", "llama-server.exe"]:
-            bin_path = LLAMA_CPP_DIR / "build" / "bin" / name
-            if bin_path.exists():
-                shutil.copy(bin_path, LLAMA_SERVER_BIN)
-                break
-    
-    if not LLAMA_SERVER_BIN.exists():
-        raise RuntimeError("Failed to obtain llama-server binary")
-    
-    # Make executable on Unix
-    if platform.system() != "Windows":
-        LLAMA_SERVER_BIN.chmod(0o755)
-    
-    return LLAMA_SERVER_BIN
+    # Check if llama-server is available in system PATH
+    path_bin = shutil.which("llama-server") or shutil.which("llama-server.exe")
+    if path_bin:
+        return Path(path_bin)
+
+    log.info("llama-server binary not found locally. Server will use System 1 Laya decision router.")
+    return None
 
 
 def ensure_all_models() -> dict[str, Path]:
@@ -159,8 +141,14 @@ def ensure_all_models() -> dict[str, Path]:
     log.info("Ensuring all models are available...")
     paths = {}
     for model_name in MODEL_CONFIGS:
-        paths[model_name] = get_model_path(model_name)
-    ensure_llama_cpp()
+        try:
+            paths[model_name] = get_model_path(model_name)
+        except Exception as e:
+            log.warning(f"Could not download model '{model_name}': {e}")
+    try:
+        ensure_llama_cpp()
+    except Exception as e:
+        log.warning(f"Could not prepare llama-server binary: {e}")
     return paths
 
 

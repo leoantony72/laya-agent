@@ -155,7 +155,7 @@
         "default": "google.com"
       }
     ],
-    "script": "\n            $q = \"{{query}}\".Trim()\n            if ($q -match \"^https?://\") {\n                Start-Process $q\n                return \"Opened $q\"\n            } else {\n                $enc = [Uri]::EscapeDataString($q)\n                Start-Process \"https://www.google.com/search?q=$enc\"\n                return \"Searched web for '$q'\"\n            }\n            ",
+    "script": "\n            python -c \"\nimport webbrowser, urllib.parse, sys\nq = r'{{query}}'.strip()\nif q.startswith(('http://', 'https://')):\n    url = q\nelse:\n    url = 'https://www.google.com/search?q=' + urllib.parse.quote_plus(q)\nwebbrowser.open(url)\nprint('Opened: ' + url)\n\"\n            ",
     "speak": "done"
   },
   {
@@ -486,7 +486,7 @@
         "default": "calculator"
       }
     ],
-    "script": "\n            $appMap = @{\n                \"calculator\" = \"calc\"\n                \"paint\"      = \"mspaint\"\n                \"snip\"       = \"SnippingTool\"\n                \"terminal\"   = \"wt\"\n                \"cmd\"        = \"cmd\"\n                \"notepad\"    = \"notepad\"\n                \"wordpad\"    = \"wordpad\"\n                \"control\"    = \"control\"\n                \"taskmgr\"    = \"taskmgr\"\n                \"settings\"   = \"ms-settings:\"\n                \"explorer\"   = \"explorer\"\n                \"magnifier\"  = \"magnify\"\n                \"charmap\"    = \"charmap\"\n                \"regedit\"    = \"regedit\"\n                \"msconfig\"   = \"msconfig\"\n            }\n            $exe = $appMap[\"{{app}}\"]\n            if ($exe) {\n                Start-Process $exe -ErrorAction SilentlyContinue\n                return \"Opened {{app}}\"\n            } else {\n                return \"Unknown application: {{app}}\"\n            }\n            ",
+    "script": "\n            python -c \"\nimport subprocess, sys\napp_map = {\n    'calculator': 'calc',\n    'paint': 'mspaint',\n    'snip': 'SnippingTool',\n    'terminal': 'wt',\n    'cmd': 'cmd',\n    'notepad': 'notepad',\n    'wordpad': 'wordpad',\n    'control': 'control',\n    'taskmgr': 'taskmgr',\n    'settings': 'ms-settings:',\n    'explorer': 'explorer',\n    'magnifier': 'magnify',\n    'charmap': 'charmap',\n    'regedit': 'regedit',\n    'msconfig': 'msconfig'\n}\nexe = app_map.get(r'{{app}}')\nif exe:\n    try:\n        subprocess.Popen(exe, shell=True)\n        print('Opened ' + r'{{app}}')\n    except Exception as e:\n        print('Failed to open ' + r'{{app}}' + ': ' + str(e))\nelse:\n    print('Unknown application: ' + r'{{app}}')\n\"\n            ",
     "speak": "done"
   },
   {
@@ -822,6 +822,27 @@
       }
     ],
     "script": "\n            $ref = \"{{target}}\".Trim().Trim('\"').Trim(\"'\")\n            $app = \"{{app}}\".Trim().ToLower()\n            if (-not $ref) {\n                return \"Tell me which file to open, e.g. 'open the file report.pdf'.\"\n            }\n            $path = $null\n            $candidate = $ref\n            if ($ref.StartsWith(\"~\")) { $candidate = Join-Path $env:USERPROFILE $ref.Substring(1).TrimStart('\\','/') }\n            if (Test-Path $candidate -PathType Leaf) { $path = (Resolve-Path $candidate).Path }\n            if (-not $path) {\n                $roots = @(\n                    [Environment]::GetFolderPath('Desktop'),\n                    [Environment]::GetFolderPath('MyDocuments'),\n                    (Join-Path $env:USERPROFILE 'Downloads'),\n                    [Environment]::GetFolderPath('MyPictures'),\n                    [Environment]::GetFolderPath('MyVideos'),\n                    [Environment]::GetFolderPath('MyMusic'),\n                    $env:USERPROFILE\n                )\n                $hits = @()\n                foreach ($root in ($roots | Select-Object -Unique)) {\n                    if (-not (Test-Path $root)) { continue }\n                    try {\n                        $hits += Get-ChildItem -Path $root -Recurse -File -ErrorAction SilentlyContinue -Depth 3 |\n                            Where-Object { $_.Name -ieq $ref -or $_.BaseName -ieq $ref }\n                    } catch {}\n                }\n                if ($hits.Count -eq 0) {\n                    return \"ERROR: Could not find a file named '$ref' in Desktop, Documents, Downloads, Pictures, Videos, or Music.\"\n                }\n                $best = $hits | Sort-Object LastWriteTime -Descending | Select-Object -First 1\n                $path = $best.FullName\n            }\n            if ($app -match \"chrome|edge|browser\") {\n                $exe = $null\n                foreach ($p in @(\n                    \"$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe\",\n                    \"$env:ProgramFiles(x86)\\Google\\Chrome\\Application\\chrome.exe\",\n                    \"$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe\",\n                    \"$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe\",\n                    \"$env:ProgramFiles(x86)\\Microsoft\\Edge\\Application\\msedge.exe\"\n                )) { if (Test-Path $p) { $exe = $p; break } }\n                if ($exe) {\n                    Start-Process $exe -ArgumentList \"$path\"\n                    return \"Opened $path in $([IO.Path]::GetFileNameWithoutExtension($exe))\"\n                }\n            }\n            Start-Process \"$path\"\n            $extra = \"\"\n            return \"Opened $path$extra\"\n            ",
+    "speak": "done"
+  },
+  {
+    "name": "laya_ultrafast_browser",
+    "description": "Execute open-weight, local-first ultrafast browser tasks using typed decision actions (click, type, scroll, submit, extract).",
+    "examples": [
+      "ultrafast browser task search for RTX 4090",
+      "laya-ultrafast fill out form with test user",
+      "automate browser goal extract product details"
+    ],
+    "scope": null,
+    "args": [
+      {
+        "name": "goal",
+        "kind": "text",
+        "instructions": "High-level browser automation task goal",
+        "criteria": {},
+        "default": "search page"
+      }
+    ],
+    "script": "\n            python -c \"import asyncio; from winbrow.agent import WinBrowAgent; agent = WinBrowAgent(); print(asyncio.run(agent.browser.run_ultrafast_task('{{goal}}')))\"\n            ",
     "speak": "done"
   }
 ]
