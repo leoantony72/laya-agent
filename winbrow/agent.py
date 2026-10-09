@@ -40,6 +40,28 @@ BROWSER_KEYWORDS = [
     "read page", "click on", "fill form", "find on page", "browser history",
     "ultrafast", "laya-ultrafast", "automate browser", "browser task", "multi-step browser",
     "search", "find results", "in the web", "on the web", "web search", "look up",
+    # Interactive / multi-step tasks
+    "book", "booking", "flight", "flights", "hotel", "buy", "purchase", "order",
+    "sign in", "login", "log in", "sign up", "register", "subscribe",
+    "check out", "checkout", "add to cart", "shop", "shopping",
+    "fill", "submit", "download from", "open website", "go to",
+    "show me", "find me", "get me", "look for", "browse to",
+    "amazon", "youtube", "twitter", "instagram", "linkedin", "github",
+    "google flights", "booking.com", "airbnb", "expedia",
+]
+
+
+# Task patterns that indicate multi-step interactive work (not just a URL open)
+_INTERACTIVE_PATTERNS = [
+    "book", "booking", "buy", "purchase", "order", "add to cart",
+    "sign in", "login", "log in", "sign up", "register",
+    "check out", "checkout", "subscribe",
+    "flight", "hotel", "airbnb", "expedia",
+    "fill form", "fill out", "submit form",
+    "find details", "show details", "get details",
+    "search on", "search for", "look for", "find on",
+    "open and", "go to and", "navigate to and",
+    "download from", "watch on", "play on",
 ]
 
 
@@ -47,7 +69,7 @@ def _is_browser_intent(utterance: str) -> bool:
     cleaned = _strip_conversational_prefix(utterance)
     lower = cleaned.lower()
     for kw in BROWSER_KEYWORDS:
-        if " " in kw or "://" in kw or "-" in kw:
+        if " " in kw or "://" in kw or "-" in kw or "." in kw:
             # Multi-word phrases / URLs: substring match is safe.
             if kw in lower:
                 return True
@@ -57,6 +79,13 @@ def _is_browser_intent(utterance: str) -> bool:
             if re.search(r"\b" + re.escape(kw) + r"s?\b", lower):
                 return True
     return False
+
+
+def _is_interactive_task(utterance: str) -> bool:
+    """Return True when the utterance needs multi-step browser interaction
+    (type, click, form fill) rather than a plain URL open."""
+    lower = utterance.lower()
+    return any(pat in lower for pat in _INTERACTIVE_PATTERNS)
 
 
 def _is_known_task(utterance: str) -> bool:
@@ -198,7 +227,28 @@ class WinBrowAgent:
                         "output": f"Failed to start browser with CDP: {cdp_result.get('output', 'Unknown error')}"}
 
         # Ultrafast multi-step browser task execution
-        if any(p in lower for p in ["ultrafast", "laya-ultrafast", "automate browser", "browser task", "fill form", "multi-step browser"]):
+        # Triggers for: flights, booking, shopping, form fill, interactive search, etc.
+        _ULTRAFAST_TRIGGERS = [
+            "ultrafast", "laya-ultrafast", "automate browser", "browser task",
+            "fill form", "multi-step browser",
+            # Travel / booking
+            "flight", "flights", "book flight", "book a flight", "booking",
+            "hotel", "book hotel", "airbnb", "expedia", "kayak",
+            # Shopping
+            "buy", "purchase", "order", "add to cart", "checkout", "check out",
+            "shop", "shopping",
+            # Auth
+            "sign in", "login", "log in", "sign up", "register", "subscribe",
+            # Site-targeted search ("search for X on amazon" → navigate + type + click)
+            "search on", "find on", "look for", "search for",
+            # Get/show details from a live site
+            "find details", "show me", "get me", "find me",
+            # Watch / play on a site
+            "watch on", "play on", "open and",
+            # Download
+            "download from",
+        ]
+        if any(p in lower for p in _ULTRAFAST_TRIGGERS):
             out = await self.browser.run_ultrafast_task(utterance)
             return {
                 "type": "browser",
@@ -343,14 +393,17 @@ class WinBrowAgent:
         cleaned_utterance = _strip_conversational_prefix(utterance)
         utterance_lower = cleaned_utterance.lower()
         browser_fast = _is_browser_intent(utterance)
+        is_interactive = _is_interactive_task(utterance)
 
         # -- Handle direct search queries that go through web_search tool --
         # Keep these in the tool routing path rather than browser fast-path
+        # UNLESS the search is interactive (e.g. "search for X on amazon" needs
+        # navigate+type+click, not just a Google URL open).
         is_search = any(utterance_lower.startswith(p) for p in [
             "search ", "google ", "look up ", "find ", "search for ", "find results "
         ]) and not any(kw in utterance_lower for kw in [
             "tab", "reload", "scroll", "screenshot", "find on page", "incognito"
-        ])
+        ]) and not is_interactive  # interactive tasks should NOT be treated as simple search
 
         # 1. Laya Routing (context memory lets "that file" resolve)
         route: Route = await self.router.route(utterance, ctx, memory=self.memory)

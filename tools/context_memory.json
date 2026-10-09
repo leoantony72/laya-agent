@@ -1,6 +1,6 @@
 {
-  "last_file": "C:\\Users\\USER\\Downloads\\images.jpg",
-  "last_folder": "C:\\Users\\USER\\Documents",
+  "last_file": "C:\\Users\\sayuj\\Downloads\\sayuj\\sayuj\\output\\sayuj_report.pdf",
+  "last_folder": "C:\\Users\\sayuj\\Downloads",
   "last_app": null,
   "history": [
     {
@@ -26,6 +26,30 @@
       "kind": "folder",
       "path": "C:\\Users\\USER\\Documents",
       "label": "documents"
+    },
+    {
+      "ts": 1791525318.6331253,
+      "kind": "folder",
+      "path": "C:\\Users\\sayuj\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1791527077.706624,
+      "kind": "folder",
+      "path": "C:\\Users\\sayuj\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1791527110.2054224,
+      "kind": "file",
+      "path": "C:\\Users\\sayuj\\Downloads\\sayuj\\sayuj\\output\\sayuj_report.pdf",
+      "label": "sayuj_report.pdf"
+    },
+    {
+      "ts": 1791527153.8794088,
+      "kind": "file",
+      "path": "C:\\Users\\sayuj\\Downloads\\sayuj\\sayuj\\output\\sayuj_report.pdf",
+      "label": "sayuj_report.pdf"
     }
   ]
 }

@@ -148,6 +148,20 @@ class LayaWorker:
                 )
             await asyncio.sleep(0.05)
 
+
+_worker_singleton: Optional[LayaWorker] = None
+_worker_lock = threading.Lock()
+
+
+def get_laya_worker() -> LayaWorker:
+    """Return the shared warm LayaWorker singleton."""
+    global _worker_singleton
+    with _worker_lock:
+        if _worker_singleton is None:
+            _worker_singleton = LayaWorker()
+            _worker_singleton.start()
+        return _worker_singleton
+
 # Leading conversational fluff (voice assistants love "can you ...") that
 # must be stripped before trigger matching and argument extraction.
 _CONVERSATIONAL_PREFIXES = [
@@ -449,8 +463,7 @@ class WinBrowRouter:
         # Read env dynamically (not the import-time constant) so tests and
         # host config can override LAYA_TIMEOUT_S per process start.
         self.timeout = timeout if timeout is not None else _laya_timeout_default()
-        self._worker = LayaWorker()
-        self._worker.start()
+        self._worker = get_laya_worker()
 
     @property
     def _loaded(self) -> bool:

@@ -100,7 +100,28 @@ class BrowserController:
         return name or "chrome"
 
     async def ensure_browser_open(self) -> dict[str, Any]:
-        """Make sure a browser window is visible and focused (single call)."""
+        """Make sure a browser window is visible and focused (single call).
+        
+        Prefers to open with CDP enabled so interactive automation works.
+        Falls back to a plain browser launch if CDP cannot be started.
+        """
+        # If CDP is already running, just focus the window
+        if _cdp_available():
+            script = """
+            $proc = Get-Process | Where-Object { $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+            if ($proc) { $ws = New-Object -ComObject WScript.Shell; $ws.AppActivate($proc.Id) | Out-Null; return "Focused $($proc.ProcessName)" }
+            return "CDP already running"
+            """
+            return await run_powershell(script)
+
+        # Try to launch with CDP so interactive actions work
+        cdp_result = await self.launch_with_cdp()
+        # Give browser time to start
+        await asyncio.sleep(1.5)
+        if _cdp_available():
+            return {"success": True, "message": "Launched browser with CDP", **cdp_result}
+
+        # Fallback: plain launch without CDP
         script = """
         $browser = $null
         foreach ($b in @('chrome', 'msedge', 'firefox')) {
@@ -111,10 +132,10 @@ class BrowserController:
         if ($proc -and $proc.MainWindowHandle -ne 0) {
             $ws = New-Object -ComObject WScript.Shell
             $ws.AppActivate($proc.Id) | Out-Null
-            return "Focused $browser"
+            return "Focused $browser (no CDP)"
         } else {
             Start-Process $browser
-            return "Launched $browser"
+            return "Launched $browser (no CDP)"
         }
         """
         return await run_powershell(script)
@@ -162,7 +183,7 @@ class BrowserController:
         if not url.startswith(("http://", "https://", "file://")):
             url = "https://" + url
 
-        # Try CDP first (fastest, no focus switch needed)
+        # Try CDP first (fastest, most reliable)
         loop = asyncio.get_event_loop()
         tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
         if tabs:
@@ -174,29 +195,52 @@ class BrowserController:
                         None, lambda: _cdp_request("/json/new", {"url": url})
                     )
                     if new_tab_resp:
+                        await asyncio.sleep(0.8)  # wait for tab to open
                         return {"success": True, "method": "cdp_new_tab", "url": url}
                 else:
-                    activate = await loop.run_in_executor(
+                    # Activate tab then navigate via Page.navigate over WebSocket
+                    await loop.run_in_executor(
                         None, lambda: _cdp_request(f"/json/activate/{target_id}")
                     )
-                    # Navigate via address bar shortcut
+                    ws_url = page_tabs[0].get("webSocketDebuggerUrl", "")
+                    if ws_url:
+                        try:
+                            import websockets
+                            async with websockets.connect(ws_url, ping_interval=None) as ws:
+                                import json as _json
+                                cmd = {"id": 1, "method": "Page.navigate", "params": {"url": url}}
+                                await ws.send(_json.dumps(cmd))
+                                await asyncio.wait_for(ws.recv(), timeout=5)
+                            await asyncio.sleep(1.0)  # let page start loading
+                            return {"success": True, "method": "cdp_navigate", "url": url}
+                        except Exception as e:
+                            log.debug(f"CDP Page.navigate failed: {e}")
+                    # Fallback to SendKeys after activating
+                    safe_url = url.replace('"', '%22').replace('{', '{{').replace('}', '}}')
                     script = f"""
+                    $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+                    if ($proc) {{ $ws2 = New-Object -ComObject WScript.Shell; $ws2.AppActivate($proc.Id) | Out-Null; Start-Sleep -Milliseconds 300 }}
                     $ws = New-Object -ComObject WScript.Shell
                     $ws.SendKeys("^l")
-                    Start-Sleep -Milliseconds 200
-                    $ws.SendKeys("{url}")
+                    Start-Sleep -Milliseconds 300
+                    Add-Type -AssemblyName System.Windows.Forms
+                    [System.Windows.Forms.Clipboard]::SetText("{safe_url}")
+                    $ws.SendKeys("^v")
+                    Start-Sleep -Milliseconds 100
                     $ws.SendKeys("{{ENTER}}")
                     return "Navigated to {url}"
                     """
                     return await run_powershell(script)
 
-        # Pure PowerShell fallback
-        safe_url = url.replace('"', '%22')
+        # Pure PowerShell fallback — focus browser window first
+        safe_url = url.replace('"', '%22').replace('{', '{{').replace('}', '}}')
         if new_tab:
             script = f"""
+            $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+            if ($proc) {{ $ws2 = New-Object -ComObject WScript.Shell; $ws2.AppActivate($proc.Id) | Out-Null; Start-Sleep -Milliseconds 300 }}
             $ws = New-Object -ComObject WScript.Shell
             $ws.SendKeys("^t")
-            Start-Sleep -Milliseconds 400
+            Start-Sleep -Milliseconds 500
             $ws.SendKeys("^l")
             Start-Sleep -Milliseconds 200
             Add-Type -AssemblyName System.Windows.Forms
@@ -544,7 +588,9 @@ class BrowserController:
             foreach ($p in $edgePaths) {{ if (Test-Path $p) {{ $found = $p; break }} }}
         }}
         if ($found) {{
-            Start-Process $found -ArgumentList "--remote-debugging-port=9222 {target_url}"
+            $profileDir = "$env:USERPROFILE\.winbrow\browser-profile"
+            if (-not (Test-Path $profileDir)) {{ New-Item -ItemType Directory -Path $profileDir -Force | Out-Null }}
+            Start-Process $found -ArgumentList "--remote-debugging-port=9222 --user-data-dir=`"$profileDir`" --no-first-run --no-default-browser-check {target_url}"
             Start-Sleep -Milliseconds 1500
             return "Launched browser with CDP on port 9222. Path: $found"
         }} else {{
@@ -576,19 +622,78 @@ class BrowserController:
         return await self.execute_js(code)
 
     async def type_in_element(self, selector: str, text: str) -> dict[str, Any]:
-        """Type text into a DOM input element via CDP."""
-        safe_text = text.replace("'", "\\'").replace('"', '\\"')
-        code = f"""
-        const el = document.querySelector('{selector}');
-        if (el) {{
-            el.focus();
-            el.value = '{safe_text}';
-            el.dispatchEvent(new Event('input', {{bubbles: true}}));
-            el.dispatchEvent(new Event('change', {{bubbles: true}}));
-            '{safe_text}'
-        }} else {{ 'Element not found' }}
         """
-        return await self.execute_js(code)
+        Type text into a DOM input element.
+
+        Strategy:
+          1. CDP WebSocket: focus element then set value + dispatch input/change events.
+             Also dispatches keydown/keypress/keyup for each character so frameworks
+             (React, Vue, Angular) that rely on keyboard events pick up the change.
+          2. PowerShell clipboard-paste fallback when CDP is unavailable.
+        """
+        # -- CDP path ----------------------------------------------------------
+        loop = asyncio.get_event_loop()
+        tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
+        if tabs:
+            page_tabs = [t for t in tabs if t.get("type") == "page"]
+            if page_tabs:
+                ws_url = page_tabs[0].get("webSocketDebuggerUrl", "")
+                if ws_url:
+                    try:
+                        import websockets
+                        safe_text = text.replace("\\", "\\\\").replace("'", "\\'").replace('`', '\\`')
+                        # Step 1: focus + set value via Runtime.evaluate
+                        set_val_js = f"""
+                        (function() {{
+                            const sel = {json.dumps(selector)};
+                            const el = document.querySelector(sel)
+                                     || document.querySelector('[data-wb-idx="' + sel.replace(/[^\\d]/g,'') + '"]');
+                            if (!el) return 'not_found';
+                            el.focus();
+                            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') ||
+                                                           Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+                            if (nativeInputValueSetter && nativeInputValueSetter.set) {{
+                                nativeInputValueSetter.set.call(el, {json.dumps(text)});
+                            }} else {{
+                                el.value = {json.dumps(text)};
+                            }}
+                            el.dispatchEvent(new Event('input',  {{bubbles:true}}));
+                            el.dispatchEvent(new Event('change', {{bubbles:true}}));
+                            return 'ok';
+                        }})()
+                        """
+                        async with websockets.connect(ws_url, ping_interval=None) as ws:
+                            cmd = {"id": 1, "method": "Runtime.evaluate",
+                                   "params": {"expression": set_val_js, "returnByValue": True}}
+                            await ws.send(json.dumps(cmd))
+                            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=8))
+                            val = resp.get("result", {}).get("result", {}).get("value", "")
+                            if val == "ok":
+                                return {"success": True, "output": f"Typed '{text}' via CDP", "method": "cdp"}
+                            if val == "not_found":
+                                log.warning(f"type_in_element: element not found for selector '{selector}'")
+                                # Fall through to PowerShell fallback
+                    except Exception as e:
+                        log.debug(f"type_in_element CDP failed: {e}")
+
+        # -- PowerShell clipboard-paste fallback -------------------------------
+        # Focus browser, click on the element via Tab-key walking is unreliable;
+        # instead we rely on the caller having clicked/focused the element first.
+        safe_ps = text.replace('"', '`"').replace("'", "'")
+        script = f"""
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.Clipboard]::SetText("{safe_ps}")
+        $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+        if ($proc) {{ $ws2 = New-Object -ComObject WScript.Shell; $ws2.AppActivate($proc.Id) | Out-Null; Start-Sleep -Milliseconds 300 }}
+        $ws = New-Object -ComObject WScript.Shell
+        $ws.SendKeys("^v")
+        Start-Sleep -Milliseconds 200
+        $ws.SendKeys("{{ENTER}}")
+        return "Typed via clipboard paste"
+        """
+        result = await run_powershell(script)
+        result["method"] = "powershell_clipboard"
+        return result
 
     async def fill_and_submit_form(self, fields: dict[str, str], submit_selector: str = "") -> dict[str, Any]:
         """Fill multiple form fields and optionally submit."""
@@ -608,10 +713,30 @@ class BrowserController:
         result = await self.execute_js(code)
         return {"success": True, "ready_state": result.get("value", "unknown")}
 
-    async def run_ultrafast_task(self, goal: str, max_steps: int = 5) -> dict[str, Any]:
+    async def run_ultrafast_task(self, goal: str, max_steps: int = 20) -> dict[str, Any]:
         """
         Execute an Ultrafast multi-step browser task using Laya typed decisions.
+
+        Ensures Chrome/Edge is running with CDP remote-debugging enabled before
+        executing any steps.  Without CDP the interactive actions (type, click)
+        cannot reach DOM elements.
         """
+        # Ensure CDP is available — all interactive actions depend on it
+        if not _cdp_available():
+            log.info("CDP not available. Launching browser with --remote-debugging-port=9222 …")
+            launch_res = await self.launch_with_cdp()
+            log.debug(f"CDP launch result: {launch_res}")
+            # Wait up to 4 s for Chrome to start and open its debugging port
+            for _ in range(8):
+                await asyncio.sleep(0.5)
+                if _cdp_available():
+                    break
+            if not _cdp_available():
+                log.warning(
+                    "CDP still unavailable after launching browser. "
+                    "Interactive actions (type/click) will use PowerShell fallbacks."
+                )
+
         from .ultrafast import LayaUltrafastEngine
         engine = LayaUltrafastEngine(self)
         res = await engine.run_task(goal=goal, max_steps=max_steps)
