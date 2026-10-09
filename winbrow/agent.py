@@ -438,6 +438,18 @@ class WinBrowAgent:
                     "output": out_msg,
                     "elapsed_ms": 1.0,
                 }
+            elif route.tool.name == "laya_ultrafast_browser":
+                goal = route.args.get("goal") or utterance
+                out = await self.browser.run_ultrafast_task(goal)
+                result["execution"] = {
+                    "type": "browser",
+                    "tool": "laya_ultrafast_browser",
+                    "success": out.get("success", True),
+                    "output": out.get("final_answer") or str(out.get("steps", [])),
+                    "steps": out.get("steps", []),
+                    "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+                    "method": out.get("method", "laya_ultrafast"),
+                }
             else:
                 # Render script with arguments
                 rendered = route.tool.render_script(route.args)

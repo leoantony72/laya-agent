@@ -23,10 +23,11 @@ def _observe_uia(max_nodes: int, max_depth: int) -> int:
         return -1
 
     try:
-        top = auto.GetForegroundControl().GetTopLevelControl()
+        fg = auto.GetForegroundControl()
+        top = fg.GetTopLevelControl() if fg else auto.GetRootControl()
     except Exception as e:
         print(f"Could not read foreground window: {e}")
-        return 1
+        return 0
 
     try:
         print(f"window: {top.Name!r}  app: {top.ProcessName}  hwnd: {top.NativeWindowHandle}")

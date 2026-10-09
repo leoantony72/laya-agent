@@ -19,6 +19,7 @@ import json
 import logging
 import re
 import time
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -437,10 +438,10 @@ class LayaUltrafastEngine:
                     value=f"Opened {title or url}",
                 )
 
-        # 1. Flight Search & Multi-Input Flow (e.g. "flights from JFK to LAX")
+        # 1. Flight Search & Multi-Input Flow (e.g. "flights from New York to London")
         is_flight_goal = any(kw in goal_lower for kw in ["flight", "flights", "fly", "airline", "booking"])
-        if is_flight_goal:
-            # Check for unfilled origin or destination inputs
+        if is_flight_goal or "google.com/travel/flights" in url:
+            # Check for unfilled origin or destination inputs first
             for el in elements:
                 el_desc = f"{el.label} {el.placeholder} {el.text}".lower()
                 already_typed = any(s.action == "type" and s.target_index == el.index for s in previous_steps)
@@ -466,12 +467,12 @@ class LayaUltrafastEngine:
                             reason=f"Enter destination '{val}' into {el.to_summary()}",
                         )
 
-            # Search / Explore Button
+            # Check if there is an unclicked search button
             search_btns = [
                 e for e in elements
                 if e.tag_name in ("button", "input") and any(k in f"{e.text} {e.label} {e.value}".lower() for k in ["search", "explore", "find flights", "done"])
             ]
-            if search_btns and any(s.action == "type" for s in previous_steps):
+            if search_btns and any(s.action == "type" for s in previous_steps) and not any(s.action == "click" for s in previous_steps):
                 return UltrafastStep(
                     step_number=step_num,
                     action="click",
@@ -480,11 +481,28 @@ class LayaUltrafastEngine:
                     reason=f"Click flight search button {search_btns[0].to_summary()}",
                 )
 
-        # 2. General Search Bar Detection
-        search_keywords = ["search", "find", "look up", "query"]
+            # If inputs are filled / search clicked / or results loaded: extract flight options
+            has_extracted = any(s.action == "extract" for s in previous_steps)
+            if not has_extracted:
+                return UltrafastStep(
+                    step_number=step_num,
+                    action="extract",
+                    reason="Extract flight itineraries, airlines, and price options",
+                )
+            else:
+                return UltrafastStep(
+                    step_number=step_num,
+                    action="finish",
+                    reason="Flight details extracted successfully",
+                    value=previous_steps[-1].value or "Flight search completed",
+                )
+
+        # 2. General Search Bar & Results Exploration (e.g. "search for RTX 4090 on amazon" or "search for chicken curry")
+        search_keywords = ["search", "find", "look up", "query", "recipe", "details"]
         is_search_goal = any(kw in goal_lower for kw in search_keywords)
 
         if is_search_goal:
+            # Check for unfilled search input box first
             query_text = goal
             m = re.search(r"search\s+(?:for\s+)?(.+?)(?:\s+on\s+.*|\s+in\s+.*|$)", goal, re.IGNORECASE)
             if m:
@@ -494,7 +512,6 @@ class LayaUltrafastEngine:
                 e for e in elements
                 if e.tag_name in ("input", "textarea") or e.role in ("searchbox", "textbox", "combobox")
             ]
-
             search_inputs = [
                 e for e in input_elements
                 if "search" in e.placeholder.lower()
@@ -502,8 +519,7 @@ class LayaUltrafastEngine:
                 or "search" in e.role.lower()
                 or e.element_type in ("search", "text")
             ]
-
-            target_el = search_inputs[0] if search_inputs else (input_elements[0] if input_elements else None)
+            target_el = search_inputs[0] if search_inputs else (input_elements[0] if input_elements and "google.com/search" not in url else None)
 
             if target_el:
                 already_typed = any(s.action == "type" and s.target_index == target_el.index for s in previous_steps)
@@ -516,32 +532,27 @@ class LayaUltrafastEngine:
                         value=query_text,
                         reason=f"Type search query into {target_el.to_summary()}",
                     )
-                else:
-                    submit_btns = [
-                        e for e in elements
-                        if e.tag_name in ("button", "input") and (
-                            e.element_type == "submit"
-                            or "search" in e.text.lower()
-                            or "go" in e.text.lower()
-                            or "submit" in e.text.lower()
-                        )
-                    ]
-                    if submit_btns:
-                        return UltrafastStep(
-                            step_number=step_num,
-                            action="click",
-                            target_index=submit_btns[0].index,
-                            selector=submit_btns[0].selector,
-                            reason=f"Click search submit button {submit_btns[0].to_summary()}",
-                        )
-                    else:
-                        return UltrafastStep(
-                            step_number=step_num,
-                            action="submit",
-                            target_index=target_el.index,
-                            selector=target_el.selector,
-                            reason="Submit search form",
-                        )
+
+            if "google.com/search" in url:
+                # On Google Search results page: click into top website if not clicked yet
+                has_clicked = any(s.action == "click" for s in previous_steps)
+                if not has_clicked:
+                    return UltrafastStep(
+                        step_number=step_num,
+                        action="click",
+                        selector="#rso a h3",
+                        reason="Open top organic search result website to view full recipe/details",
+                    )
+
+        # If we clicked into a website from search or user wants details: extract content
+        has_extracted = any(s.action == "extract" for s in previous_steps)
+        if (len(previous_steps) >= 1 and not has_extracted and "google.com/search" not in url) or any(kw in goal_lower for kw in ["extract", "read", "get price", "what is", "content", "recipe"]):
+            if not has_extracted:
+                return UltrafastStep(
+                    step_number=step_num,
+                    action="extract",
+                    reason="Extract content, instructions, and details from the page",
+                )
 
         # 3. Form Field Filling
         if any(kw in goal_lower for kw in ["fill", "enter", "type"]):
@@ -574,15 +585,7 @@ class LayaUltrafastEngine:
                         reason=f"Click element matching '{target_phrase}'",
                     )
 
-        # 5. Extract Goal
-        if any(kw in goal_lower for kw in ["extract", "read", "get price", "what is", "content"]):
-            return UltrafastStep(
-                step_number=step_num,
-                action="extract",
-                reason="Extract page visible content for goal analysis",
-            )
-
-        # 6. Default Fallback
+        # 5. Default Fallback
         if previous_steps:
             return UltrafastStep(
                 step_number=step_num,
@@ -694,9 +697,84 @@ class LayaUltrafastEngine:
             return {"success": True, "output": "Waited 1.2s", "elapsed_ms": duration}
 
         elif act == "extract":
-            res = await self.browser.read_page_text()
+            # Smart context-aware DOM extraction
+            extract_js = """
+            (() => {
+                const url = window.location.href;
+                const title = document.title;
+
+                // 1. Google Flights
+                if (url.includes('google.com/travel/flights')) {
+                    const cards = Array.from(document.querySelectorAll('li, [role="listitem"], .pIavfa'))
+                        .map(e => (e.getAttribute('aria-label') || e.innerText || '').trim())
+                        .filter(t => t.length > 20 && (t.includes('₹') || t.includes('$') || t.includes('€') || t.includes('stop') || t.includes('hr') || t.includes('Find flights')))
+                        .slice(0, 6);
+                    if (cards.length > 0) {
+                        return { type: 'flights', title: title, data: cards };
+                    }
+                }
+
+                // 2. Google Search
+                if (url.includes('google.com/search')) {
+                    const featured = document.querySelector('[data-attrid="wa:/description"], [data-attrid*="recipe"], .kp-blk, .hgKElc');
+                    const firstLink = document.querySelector('#rso a h3');
+                    const snippets = Array.from(document.querySelectorAll('#rso .VwiC3b, #rso span'))
+                        .map(e => e.innerText.trim())
+                        .filter(t => t.length > 30)
+                        .slice(0, 4);
+                    return {
+                        type: 'search',
+                        title: title,
+                        featured: featured ? featured.innerText.trim() : null,
+                        top_result: firstLink ? firstLink.innerText.trim() : null,
+                        snippets: snippets
+                    };
+                }
+
+                // 3. Content Webpage (Recipe, Article, Product)
+                const headings = Array.from(document.querySelectorAll('h1, h2, h3'))
+                    .map(e => e.innerText.trim())
+                    .filter(t => t.length > 3 && t.length < 80)
+                    .slice(0, 5);
+                const paras = Array.from(document.querySelectorAll('article, main, .recipe, .recipe-body, p, li'))
+                    .map(e => e.innerText.trim())
+                    .filter(t => t.length > 35 && !t.includes('cookie') && !t.includes('subscribe'))
+                    .slice(0, 10);
+                return {
+                    type: 'content',
+                    title: title,
+                    headings: headings,
+                    content: paras.join('\\n\\n').slice(0, 1200)
+                };
+            })()
+            """
+            res = await self.browser.execute_js(extract_js)
+            val = res.get("value") or {}
+            out_str = ""
+            if isinstance(val, dict):
+                v_type = val.get("type")
+                if v_type == "flights":
+                    items = val.get("data", [])
+                    out_str = f"Found Flights on {val.get('title', 'Google Flights')}:\n" + "\n---\n".join(items)
+                elif v_type == "search":
+                    feat = val.get("featured")
+                    top = val.get("top_result")
+                    snips = val.get("snippets", [])
+                    if feat:
+                        out_str = f"Summary: {feat}\n\nTop Result: {top}"
+                    else:
+                        out_str = f"Top Result: {top}\n" + "\n".join(snips)
+                elif v_type == "content":
+                    h = ", ".join(val.get("headings", [])[:3])
+                    c = val.get("content", "")
+                    out_str = f"{val.get('title', '')}\n{h}\n\n{c}"
+            if not out_str:
+                page_text_res = await self.browser.read_page_text()
+                out_str = page_text_res.get("text", "")[:800]
+
             duration = round((time.perf_counter() - t0) * 1000, 1)
-            return {"success": res.get("success", False), "output": res.get("text", "")[:300], "elapsed_ms": duration}
+            step.value = out_str
+            return {"success": True, "output": out_str, "elapsed_ms": duration}
 
         elif act == "finish":
             duration = round((time.perf_counter() - t0) * 1000, 1)
@@ -715,6 +793,8 @@ class LayaUltrafastEngine:
 
         # Detect the best starting URL from the goal and navigate there first
         goal_lower = goal.lower()
+        cleaned_query = re.sub(r"^(?:search|find|book|look up|open|go to|show me|get me)\s+(?:for\s+)?", "", goal, flags=re.IGNORECASE).strip()
+
         _SITE_MAP = [
             # Travel (check google flights before generic flight so it wins)
             (["google flights", "google flight"], "https://www.google.com/travel/flights"),
@@ -741,13 +821,29 @@ class LayaUltrafastEngine:
         current_url_str = current_url_info.get("url", "")
 
         target_url: Optional[str] = None
-        for keywords, site_url in _SITE_MAP:
-            if any(kw in goal_lower for kw in keywords):
-                # Don't navigate if already on the right site
-                site_domain = site_url.replace("https://www.", "").replace("https://", "").split("/")[0]
-                if site_domain not in current_url_str:
-                    target_url = site_url
-                break  # first match wins
+        # Flight search with query pre-filled
+        if any(kw in goal_lower for kw in ["flight", "flights", "fly ", "airline", "book flight"]):
+            target_url = "https://www.google.com/travel/flights?q=" + urllib.parse.quote_plus(goal)
+        # Amazon search
+        elif "amazon" in goal_lower:
+            m = re.search(r"(?:on amazon|amazon for)\s*(.*)", goal_lower)
+            q = m.group(1).strip() if m and m.group(1).strip() else cleaned_query
+            target_url = "https://www.amazon.com/s?k=" + urllib.parse.quote_plus(q)
+        # YouTube search
+        elif "youtube" in goal_lower:
+            m = re.search(r"(?:on youtube|youtube for)\s*(.*)", goal_lower)
+            q = m.group(1).strip() if m and m.group(1).strip() else cleaned_query
+            target_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+        else:
+            for keywords, site_url in _SITE_MAP:
+                if any(kw in goal_lower for kw in keywords):
+                    site_domain = site_url.replace("https://www.", "").replace("https://", "").split("/")[0]
+                    if site_domain not in current_url_str:
+                        target_url = site_url
+                    break
+            # General Search Fallback
+            if not target_url and any(kw in goal_lower for kw in ["search", "find", "look up", "recipe", "curry", "weather", "news", "price", "how to"]):
+                target_url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(cleaned_query or goal)
 
         if target_url:
             log.info(f"Ultrafast: navigating to {target_url} for goal: {goal!r}")
@@ -813,7 +909,9 @@ class LayaUltrafastEngine:
 
             if decision.action == "extract" and exec_res.get("output"):
                 final_answer = exec_res.get("output")
-                if len(steps_history) >= 2:
+                if len(steps_history) >= 1 and ("flight" in goal_lower or "google.com/travel/flights" in url):
+                    break
+                elif len(steps_history) >= 2:
                     break
 
             # Short sleep to allow DOM updates / AJAX transitions

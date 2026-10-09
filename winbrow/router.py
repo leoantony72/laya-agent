@@ -491,31 +491,22 @@ class WinBrowRouter:
         if corrected.lower() != stripped.lower():
             log.info(f"Normalized '{text}' → '{corrected}'")
 
-        # 1. Comprehensive heuristic routing (typo-repaired, fuzzy matching).
-        # This runs FIRST and handles the majority of common commands.
-        heuristic_route = self._heuristic_route(corrected, tools, t0, ctx, memory=memory)
-        if heuristic_route.kind != NEW_ACTION and heuristic_route.confidence >= 0.8:
-            return heuristic_route
-
-        # 2. Laya on remaining cases (small tool-only question).
-        # Only runs if heuristics didn't confidently match.
+        # 1. Laya on tools
         try:
             questions = self._build_questions(corrected, tools, ctx)
             result = await self._worker.apredict(corrected, questions, self.timeout)
             routed = self._route_from_answers(result, corrected, t0)
-            if routed.kind != NEW_ACTION:
+            if routed.kind != NEW_ACTION and routed.confidence >= 0.6:
                 return routed
-            # If Laya says NEW_ACTION but heuristics had a match, prefer heuristics
-            if routed.kind == NEW_ACTION and heuristic_route.kind != NEW_ACTION:
-                return heuristic_route
         except asyncio.TimeoutError:
             log.warning(f"Laya routing timed out after {self.timeout}s; using heuristic fallback.")
-            if heuristic_route.kind != NEW_ACTION:
-                return heuristic_route
         except Exception as e:
             log.warning(f"Laya routing failed ({e}); using heuristic fallback.")
-            if heuristic_route.kind != NEW_ACTION:
-                return heuristic_route
+
+        # 2. Comprehensive heuristic routing (exact-intent + typo-repaired fuzzy matching).
+        heuristic_route = self._heuristic_route(corrected, tools, t0, ctx, memory=memory)
+        if heuristic_route.kind != NEW_ACTION:
+            return heuristic_route
 
         # 3. Opt-in constrained local LLM for paraphrases.
         try:
@@ -799,6 +790,28 @@ class WinBrowRouter:
                 if t:
                     return Route(kind="tool", tool=t, args={"folder": hit}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
 
+        # --- ULTRAFAST BROWSER TASKS (flights, booking, shopping, form fill, deep search & extract) ---
+        _ULTRAFAST_KEYWORDS = [
+            "flight", "flights", "book flight", "book a flight", "booking",
+            "hotel", "book hotel", "airbnb", "expedia", "kayak",
+            "buy", "purchase", "order", "add to cart", "checkout", "check out",
+            "fill form", "fill out", "login to", "sign in to",
+            "ultrafast", "laya-ultrafast", "automate browser",
+            "find details", "show details", "recipe", "extract details",
+            "search on", "find on", "search for",
+        ]
+        is_flight_task = any(k in lower for k in ["flight", "flights", "fly to", "fly from", "airline", "book a flight", "book flight"])
+        is_booking_task = any(k in lower for k in ["book ", "booking", "hotel", "airbnb", "expedia"])
+        is_interactive_search = (
+            any(k in lower for k in ["search on", "find on", "recipe", "show details", "find details", "buy ", "order "])
+            or lower.startswith("search for ")
+            or (any(lower.startswith(p) for p in ("search ", "find ", "look up ")) and any(k in lower for k in ["detail", "price", "how to", "recipe", "flight", "ticket", "book", "japan", "curry"]))
+        )
+        if is_flight_task or is_booking_task or is_interactive_search or any(k in lower for k in _ULTRAFAST_KEYWORDS):
+            t = self.registry.get("laya_ultrafast_browser")
+            if t:
+                return Route(kind="tool", tool=t, args={"goal": cleaned}, confidence=0.96, latency_ms=elapsed_ms, tier="heuristic")
+
         # --- WEB SEARCH (fuzzy: verbs + locations, edit distance 1-2 on tokens) ---
         # Verbs: search, google, look up, find, browse
         # Locations: web, online, internet, google, browser, chrome, edge, firefox, bing
@@ -840,10 +853,11 @@ class WinBrowRouter:
                         t = self.registry.get("open_common_app")
                         if t:
                             return Route(kind="tool", tool=t, args={"app": app_exe}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
-                # Fallback: try app_focus_or_launch with the raw remainder
-                t = self.registry.get("app_focus_or_launch")
-                if t:
-                    return Route(kind="tool", tool=t, args={"app_name": remainder}, confidence=0.75, latency_ms=elapsed_ms, tier="heuristic")
+                # Fallback: only if remainder looks like an app (no dot/extension and valid name)
+                if "." not in remainder and len(remainder) <= 30 and not any(ch in remainder for ch in r'\/:*?"<>|'):
+                    t = self.registry.get("app_focus_or_launch")
+                    if t:
+                        return Route(kind="tool", tool=t, args={"app_name": remainder}, confidence=0.75, latency_ms=elapsed_ms, tier="heuristic")
 
         # --- WINDOW ACTIONS ---
         if any(w in lower for w in ["minimize", "maximize", "snap left", "snap right", "show desktop", "close window"]):
