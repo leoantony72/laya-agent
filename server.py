@@ -175,7 +175,8 @@ async def execute_command(req: ExecuteRequest):
         project_id=project_id if project_id else None,
     )
 
-    # Broadcast to all WebSocket clients
+    # Broadcast to all WebSocket clients (send both types for compatibility)
+    await _broadcast({"type": "result", "data": result})
     await _broadcast({"type": "execution", "data": result})
 
     return JSONResponse(result)

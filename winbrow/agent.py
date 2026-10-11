@@ -405,6 +405,39 @@ class WinBrowAgent:
             "tab", "reload", "scroll", "screenshot", "find on page", "incognito"
         ]) and not is_interactive  # interactive tasks should NOT be treated as simple search
 
+        # ── ROUTE ALL WEB & BROWSER TASKS DIRECTLY TO LAYA-ULTRAFAST ──
+        # Any browser intent or search query (even basic search) is driven by laya-ultrafast.
+        if browser_fast or is_search:
+            out = await self.browser.run_ultrafast_task(utterance)
+            total_ms = round((time.perf_counter() - t0) * 1000, 1)
+            result = {
+                "utterance": utterance,
+                "route": {
+                    "kind": "tool",
+                    "tool_name": "laya_ultrafast_browser",
+                    "args": {"goal": utterance},
+                    "confidence": 0.98,
+                    "latency_ms": 0,
+                    "probabilities": {},
+                    "tier": "laya_ultrafast",
+                },
+                "context": ctx.to_dict(),
+                "execution": {
+                    "type": "browser",
+                    "tool": "laya_ultrafast_browser",
+                    "success": out.get("success", True),
+                    "output": out.get("final_answer") or str(out.get("steps", [])),
+                    "steps": out.get("steps", []),
+                    "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+                    "method": out.get("method", "laya_ultrafast"),
+                },
+                "total_elapsed_ms": total_ms,
+            }
+            self.history.append(result)
+            if len(self.history) > 100:
+                self.history = self.history[-100:]
+            return result
+
         # 1. Laya Routing (context memory lets "that file" resolve)
         route: Route = await self.router.route(utterance, ctx, memory=self.memory)
         log.info(f"Routed '{utterance}' → {route.kind} (tool: {route.tool.name if route.tool else None}, conf: {route.confidence:.2f})")
@@ -438,8 +471,8 @@ class WinBrowAgent:
                     "output": out_msg,
                     "elapsed_ms": 1.0,
                 }
-            elif route.tool.name == "laya_ultrafast_browser":
-                goal = route.args.get("goal") or utterance
+            elif route.tool.name in ("laya_ultrafast_browser", "web_search"):
+                goal = route.args.get("goal") or route.args.get("query") or utterance
                 out = await self.browser.run_ultrafast_task(goal)
                 result["execution"] = {
                     "type": "browser",
@@ -464,10 +497,17 @@ class WinBrowAgent:
                     "elapsed_ms": exec_out.get("elapsed_ms", 0),
                 }
 
-        elif browser_fast and not is_search and route.kind != "tool":
-            # Browser fast-path
-            browser_out = await self._dispatch_browser(utterance)
-            result["execution"] = browser_out
+        elif browser_fast and route.kind != "tool":
+            out = await self.browser.run_ultrafast_task(utterance)
+            result["execution"] = {
+                "type": "browser",
+                "tool": "laya_ultrafast_browser",
+                "success": out.get("success", True),
+                "output": out.get("final_answer") or str(out.get("steps", [])),
+                "steps": out.get("steps", []),
+                "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+                "method": out.get("method", "laya_ultrafast"),
+            }
             result["route"]["kind"] = "browser"
 
         elif route.kind == NEW_ACTION:

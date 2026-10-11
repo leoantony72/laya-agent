@@ -43,7 +43,7 @@ _CDP_PORT = 9222  # launch Chrome/Edge with --remote-debugging-port=9222
 
 def _cdp_request(path: str, data: Optional[dict] = None) -> Any:
     """Synchronous HTTP request to the local CDP endpoint."""
-    url = f"http://localhost:{_CDP_PORT}{path}"
+    url = f"http://127.0.0.1:{_CDP_PORT}{path}"
     try:
         if data is not None:
             req = urllib.request.Request(
@@ -61,6 +61,61 @@ def _cdp_request(path: str, data: Optional[dict] = None) -> Any:
 
 def _cdp_available() -> bool:
     return _cdp_request("/json/version") is not None
+
+
+# Sites addressable by bare name for plain "open <site>" goals.
+_PLAIN_NAV_SITES = {
+    "youtube": "www.youtube.com",
+    "google": "www.google.com",
+    "github": "www.github.com",
+    "amazon": "www.amazon.com",
+    "instagram": "www.instagram.com",
+    "reddit": "www.reddit.com",
+    "twitter": "www.twitter.com",
+    "x": "x.com",
+    "linkedin": "www.linkedin.com",
+    "facebook": "www.facebook.com",
+    "netflix": "www.netflix.com",
+    "spotify": "open.spotify.com",
+    "maps": "maps.google.com",
+    "gmail": "mail.google.com",
+    "drive": "drive.google.com",
+    "wikipedia": "en.wikipedia.org",
+    "whatsapp": "web.whatsapp.com",
+}
+_PLAIN_NAV_STOPWORDS = (
+    "search", "find", "play", "watch", "video", "look up", "query",
+    "book", "flight", "recipe", "download", "buy", "order",
+)
+
+
+def _plain_nav_url(goal: str) -> Optional[str]:
+    """Return a URL when the goal is just 'open/go to <site>' (no interaction).
+
+    Those simple goals open a tab in the user's OWN browser window instead of
+    spawning a separate controlled window.
+    """
+    g = (goal or "").strip().lower()
+    m = re.match(
+        r"^(?:please\s+)?(?:open|go to|visit|navigate to|browse|take me to)\s+"
+        r"(?:the\s+|my\s+|up\s+)?(.+?)\s*(?:please|thanks)?[.!?]?$",
+        g,
+    )
+    if not m:
+        return None
+    rest = m.group(1).strip()
+    if any(kw in rest for kw in _PLAIN_NAV_STOPWORDS):
+        return None
+    url_match = re.search(
+        r"(https?://\S+|[\w\-]+\.(?:com|org|net|io|dev|ai|gov|edu|co|me|app)(?:/\S*)?)",
+        rest,
+    )
+    if url_match:
+        matched = url_match.group(1).rstrip(".,")
+        return matched if matched.startswith("http") else f"https://{matched}"
+    if rest in _PLAIN_NAV_SITES:
+        return "https://" + _PLAIN_NAV_SITES[rest]
+    return None
 
 
 async def _cdp_send(session_id: str, method: str, params: dict = None) -> dict:
@@ -82,13 +137,14 @@ class BrowserController:
     def __init__(self, preferred_browser: str = "auto"):
         # "auto" picks whichever is running; can override to "chrome" or "edge"
         self.preferred_browser = preferred_browser
+        self._current_tab_id: Optional[str] = None
 
     # ── Detection ──────────────────────────────────────────────────────────
 
     async def get_running_browser(self) -> str:
         """Return name of whichever browser is currently running."""
         script = """
-        $browsers = @('chrome', 'msedge', 'firefox')
+        $browsers = @('brave', 'chrome', 'msedge', 'firefox')
         foreach ($b in $browsers) {
             if (Get-Process -Name $b -ErrorAction SilentlyContinue) {
                 Write-Output $b; break
@@ -100,31 +156,30 @@ class BrowserController:
         return name or "chrome"
 
     async def ensure_browser_open(self) -> dict[str, Any]:
-        """Make sure a browser window is visible and focused (single call).
-        
-        Prefers to open with CDP enabled so interactive automation works.
-        Falls back to a plain browser launch if CDP cannot be started.
-        """
-        # If CDP is already running, just focus the window
+        """Make sure a browser window is visible and focused."""
+        # If CDP is already running, avoid launching new windows or slow powershell activation
         if _cdp_available():
-            script = """
-            $proc = Get-Process | Where-Object { $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-            if ($proc) { $ws = New-Object -ComObject WScript.Shell; $ws.AppActivate($proc.Id) | Out-Null; return "Focused $($proc.ProcessName)" }
-            return "CDP already running"
-            """
-            return await run_powershell(script)
+            return {"success": True, "message": "CDP running"}
 
         # Try to launch with CDP so interactive actions work
         cdp_result = await self.launch_with_cdp()
         # Give browser time to start
-        await asyncio.sleep(1.5)
+        for _ in range(6):
+            await asyncio.sleep(0.4)
+            if _cdp_available():
+                break
         if _cdp_available():
             return {"success": True, "message": "Launched browser with CDP", **cdp_result}
 
         # Fallback: plain launch without CDP
         script = """
+        $known = @{
+            'chrome' = "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe"
+            'msedge' = "${env:ProgramFiles(x86)}\\Microsoft\\Edge\\Application\\msedge.exe"
+            'brave'  = "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+        }
         $browser = $null
-        foreach ($b in @('chrome', 'msedge', 'firefox')) {
+        foreach ($b in @('brave', 'chrome', 'msedge', 'firefox')) {
             if (Get-Process -Name $b -ErrorAction SilentlyContinue) { $browser = $b; break }
         }
         if (-not $browser) { $browser = "chrome" }
@@ -134,7 +189,14 @@ class BrowserController:
             $ws.AppActivate($proc.Id) | Out-Null
             return "Focused $browser (no CDP)"
         } else {
-            Start-Process $browser
+            $exe = $known[$browser]
+            if (-not $exe -or -not (Test-Path $exe)) {
+                $exe = (Get-Command $browser -ErrorAction SilentlyContinue).Source
+            }
+            if (-not $exe) {
+                return "ERROR: Could not find executable for '$browser' (refusing to open default browser)"
+            }
+            Start-Process $exe
             return "Launched $browser (no CDP)"
         }
         """
@@ -161,7 +223,7 @@ class BrowserController:
         if tabs is None:
             # Fallback: use PowerShell to query window titles
             script = """
-            $procs = Get-Process | Where-Object { $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowTitle -ne '' }
+            $procs = Get-Process | Where-Object { $_.ProcessName -in @('brave','chrome','msedge','firefox') -and $_.MainWindowTitle -ne '' }
             $procs | ForEach-Object { Write-Output "[$($_.ProcessName)] $($_.MainWindowTitle)" }
             """
             out = await run_powershell(script)
@@ -183,26 +245,44 @@ class BrowserController:
         if not url.startswith(("http://", "https://", "file://")):
             url = "https://" + url
 
-        # Try CDP first (fastest, most reliable)
+        # Ensure browser with CDP is running
+        if not _cdp_available():
+            await self.ensure_browser_open()
+
+        # Try CDP first (fastest, most reliable, no extra windows)
         loop = asyncio.get_event_loop()
         tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
-        if tabs:
+        if tabs is not None:
             page_tabs = [t for t in tabs if t.get("type") == "page"]
-            if page_tabs:
-                target_id = page_tabs[0]["id"]
-                if new_tab:
-                    new_tab_resp = await loop.run_in_executor(
-                        None, lambda: _cdp_request("/json/new", {"url": url})
-                    )
-                    if new_tab_resp:
-                        await asyncio.sleep(0.8)  # wait for tab to open
-                        return {"success": True, "method": "cdp_new_tab", "url": url}
-                else:
-                    # Activate tab then navigate via Page.navigate over WebSocket
+            non_internal = [t for t in page_tabs if not t.get("url", "").startswith("chrome://")]
+
+            if new_tab:
+                # Open a new tab cleanly via CDP HTTP endpoint
+                new_tab_resp = await loop.run_in_executor(
+                    None, lambda: _cdp_request(f"/json/new?{urllib.parse.quote(url, safe=':/?&=%')}")
+                )
+                if new_tab_resp and isinstance(new_tab_resp, dict) and "id" in new_tab_resp:
+                    self._current_tab_id = new_tab_resp["id"]
+                    await asyncio.sleep(0.5)
+                    return {"success": True, "method": "cdp_new_tab", "url": url}
+            else:
+                target = None
+                if getattr(self, "_current_tab_id", None):
+                    for t in page_tabs:
+                        if t.get("id") == self._current_tab_id:
+                            target = t
+                            break
+                if not target:
+                    target = non_internal[0] if non_internal else (page_tabs[0] if page_tabs else None)
+
+                if target:
+                    target_id = target["id"]
+                    self._current_tab_id = target_id
+                    # Activate tab
                     await loop.run_in_executor(
                         None, lambda: _cdp_request(f"/json/activate/{target_id}")
                     )
-                    ws_url = page_tabs[0].get("webSocketDebuggerUrl", "")
+                    ws_url = target.get("webSocketDebuggerUrl", "").replace("localhost", "127.0.0.1")
                     if ws_url:
                         try:
                             import websockets
@@ -211,46 +291,52 @@ class BrowserController:
                                 cmd = {"id": 1, "method": "Page.navigate", "params": {"url": url}}
                                 await ws.send(_json.dumps(cmd))
                                 await asyncio.wait_for(ws.recv(), timeout=5)
-                            await asyncio.sleep(1.0)  # let page start loading
+                            await asyncio.sleep(0.5)
                             return {"success": True, "method": "cdp_navigate", "url": url}
                         except Exception as e:
                             log.debug(f"CDP Page.navigate failed: {e}")
-                    # Fallback to SendKeys after activating
-                    safe_url = url.replace('"', '%22').replace('{', '{{').replace('}', '}}')
-                    script = f"""
-                    $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-                    if ($proc) {{ $ws2 = New-Object -ComObject WScript.Shell; $ws2.AppActivate($proc.Id) | Out-Null; Start-Sleep -Milliseconds 300 }}
-                    $ws = New-Object -ComObject WScript.Shell
-                    $ws.SendKeys("^l")
-                    Start-Sleep -Milliseconds 300
-                    Add-Type -AssemblyName System.Windows.Forms
-                    [System.Windows.Forms.Clipboard]::SetText("{safe_url}")
-                    $ws.SendKeys("^v")
-                    Start-Sleep -Milliseconds 100
-                    $ws.SendKeys("{{ENTER}}")
-                    return "Navigated to {url}"
-                    """
-                    return await run_powershell(script)
+                else:
+                    # No page tab existed; open one cleanly via CDP
+                    new_tab_resp = await loop.run_in_executor(
+                        None, lambda: _cdp_request(f"/json/new?{urllib.parse.quote(url, safe=':/?&=%')}")
+                    )
+                    if new_tab_resp and isinstance(new_tab_resp, dict) and "id" in new_tab_resp:
+                        self._current_tab_id = new_tab_resp["id"]
+                        await asyncio.sleep(0.5)
+                        return {"success": True, "method": "cdp_new_tab", "url": url}
 
-        # Pure PowerShell fallback — focus browser window first
+        # Fallback only when CDP completely unavailable
         safe_url = url.replace('"', '%22').replace('{', '{{').replace('}', '}}')
-        if new_tab:
-            script = f"""
-            $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
-            if ($proc) {{ $ws2 = New-Object -ComObject WScript.Shell; $ws2.AppActivate($proc.Id) | Out-Null; Start-Sleep -Milliseconds 300 }}
+        script = f"""
+        $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('brave','chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+        if ($proc) {{
             $ws = New-Object -ComObject WScript.Shell
-            $ws.SendKeys("^t")
-            Start-Sleep -Milliseconds 500
+            $ws.AppActivate($proc.Id) | Out-Null
+            Start-Sleep -Milliseconds 200
             $ws.SendKeys("^l")
             Start-Sleep -Milliseconds 200
             Add-Type -AssemblyName System.Windows.Forms
             [System.Windows.Forms.Clipboard]::SetText("{safe_url}")
             $ws.SendKeys("^v")
+            Start-Sleep -Milliseconds 50
             $ws.SendKeys("{{ENTER}}")
-            return "Opened new tab and navigated to {url}"
-            """
-        else:
-            script = f'Start-Process "{safe_url}"; return "Opened {url}"'
+            return "Navigated to {url}"
+        }} else {{
+            $exe = $null
+            foreach ($p in @(
+                "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe",
+                "${{env:ProgramFiles(x86)}}\\Google\\Chrome\\Application\\chrome.exe",
+                "$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe",
+                "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe",
+                "$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe"
+            )) {{ if (Test-Path $p) {{ $exe = $p; break }} }}
+            if (-not $exe) {{
+                return "ERROR: No browser window available and no Chrome/Edge executable found"
+            }}
+            Start-Process $exe -ArgumentList "{safe_url}"
+            return "Opened {url}"
+        }}
+        """
         return await run_powershell(script)
 
     async def open_url(self, url: str, new_window: bool = False) -> dict[str, Any]:
@@ -350,11 +436,21 @@ class BrowserController:
         tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
         if tabs:
             page_tabs = [t for t in tabs if t.get("type") == "page"]
-            if page_tabs:
+            target = None
+            if getattr(self, "_current_tab_id", None):
+                for t in page_tabs:
+                    if t.get("id") == self._current_tab_id:
+                        target = t
+                        break
+            if not target:
+                non_internal = [t for t in page_tabs if not t.get("url", "").startswith("chrome://")]
+                target = non_internal[0] if non_internal else (page_tabs[0] if page_tabs else None)
+            if target:
+                self._current_tab_id = target.get("id")
                 return {
                     "success": True,
-                    "url": page_tabs[0].get("url", ""),
-                    "title": page_tabs[0].get("title", ""),
+                    "url": target.get("url", ""),
+                    "title": target.get("title", ""),
                     "method": "cdp",
                 }
         # Fallback: focus address bar and read via clipboard
@@ -438,7 +534,19 @@ class BrowserController:
         page_tabs = [t for t in tabs if t.get("type") == "page"]
         if not page_tabs:
             return {"success": False, "error": "No page tabs found"}
-        ws_url = page_tabs[0].get("webSocketDebuggerUrl", "")
+        target = None
+        if getattr(self, "_current_tab_id", None):
+            for t in page_tabs:
+                if t.get("id") == self._current_tab_id:
+                    target = t
+                    break
+        if not target:
+            non_internal = [t for t in page_tabs if not t.get("url", "").startswith("chrome://")]
+            target = non_internal[0] if non_internal else page_tabs[0]
+            self._current_tab_id = target.get("id")
+        ws_url = target.get("webSocketDebuggerUrl", "").replace("localhost", "127.0.0.1")
+        if not ws_url:
+            return {"success": False, "error": "No webSocketDebuggerUrl available for target tab"}
         try:
             import websockets
             async with websockets.connect(ws_url, ping_interval=None) as ws:
@@ -449,6 +557,122 @@ class BrowserController:
                 return {"success": True, "value": result.get("value"), "type": result.get("type")}
         except ImportError:
             return {"success": False, "error": "websockets package not installed. Run: pip install websockets"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def click_at(self, x: int, y: int) -> dict[str, Any]:
+        """Trusted mouse click at viewport coordinates via the CDP Input domain."""
+        loop = asyncio.get_event_loop()
+        tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
+        if not tabs:
+            return {"success": False, "error": "CDP not available"}
+        page_tabs = [t for t in tabs if t.get("type") == "page"]
+        target = None
+        if getattr(self, "_current_tab_id", None):
+            for t in page_tabs:
+                if t.get("id") == self._current_tab_id:
+                    target = t
+                    break
+        if not target and page_tabs:
+            target = page_tabs[0]
+        if not target:
+            return {"success": False, "error": "No page tab found"}
+        ws_url = target.get("webSocketDebuggerUrl", "").replace("localhost", "127.0.0.1")
+        if not ws_url:
+            return {"success": False, "error": "No webSocketDebuggerUrl available"}
+        events = [
+            {"type": "mouseMoved", "x": int(x), "y": int(y), "button": "none", "buttons": 0},
+            {"type": "mousePressed", "x": int(x), "y": int(y), "button": "left", "buttons": 1, "clickCount": 1},
+            {"type": "mouseReleased", "x": int(x), "y": int(y), "button": "left", "buttons": 0, "clickCount": 1},
+        ]
+        try:
+            import websockets
+            async with websockets.connect(ws_url, ping_interval=None) as ws:
+                # The tab must be active or Chromium may swallow the input.
+                await ws.send(json.dumps({"id": 0, "method": "Page.bringToFront"}))
+                try:
+                    await asyncio.wait_for(ws.recv(), timeout=3)
+                except Exception:
+                    pass
+                for i, ev in enumerate(events):
+                    await ws.send(json.dumps({"id": i + 1, "method": "Input.dispatchMouseEvent", "params": ev}))
+                    try:
+                        await asyncio.wait_for(ws.recv(), timeout=3)
+                    except Exception:
+                        # Brave occasionally omits a reply for mouseMoved.
+                        pass
+            return {"success": True, "x": int(x), "y": int(y)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def send_browser_key(self, key: str) -> dict[str, Any]:
+        """Send a trusted key event to the current tab via the CDP Input domain.
+
+        Unlike JS dispatchEvent, CDP input counts as a real user gesture, so it
+        can start media playback that autoplay policy would otherwise block.
+        """
+        if not key:
+            return {"success": False, "error": "No key given"}
+        loop = asyncio.get_event_loop()
+        tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
+        if not tabs:
+            return {"success": False, "error": "CDP not available"}
+        page_tabs = [t for t in tabs if t.get("type") == "page"]
+        target = None
+        if getattr(self, "_current_tab_id", None):
+            for t in page_tabs:
+                if t.get("id") == self._current_tab_id:
+                    target = t
+                    break
+        if not target and page_tabs:
+            target = page_tabs[0]
+        if not target:
+            return {"success": False, "error": "No page tab found"}
+        ws_url = target.get("webSocketDebuggerUrl", "").replace("localhost", "127.0.0.1")
+        if not ws_url:
+            return {"success": False, "error": "No webSocketDebuggerUrl available"}
+        vk = ord(key[0].upper())
+        events = [
+            {"type": "rawKeyDown", "windowsVirtualKeyCode": vk, "key": key, "code": f"Key{key[0].upper()}"},
+            {"type": "char", "text": key},
+            {"type": "keyUp", "windowsVirtualKeyCode": vk, "key": key, "code": f"Key{key[0].upper()}"},
+        ]
+        try:
+            import websockets
+            async with websockets.connect(ws_url, ping_interval=None) as ws:
+                for i, ev in enumerate(events):
+                    await ws.send(json.dumps({"id": i + 1, "method": "Input.dispatchKeyEvent", "params": ev}))
+                    await asyncio.wait_for(ws.recv(), timeout=5)
+            return {"success": True, "key": key}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def bring_to_front(self) -> dict[str, Any]:
+        """Focus the current tab's window via CDP (used before sending real keys)."""
+        loop = asyncio.get_event_loop()
+        tabs = await loop.run_in_executor(None, lambda: _cdp_request("/json/list"))
+        if not tabs:
+            return {"success": False, "error": "CDP not available"}
+        page_tabs = [t for t in tabs if t.get("type") == "page"]
+        target = None
+        if getattr(self, "_current_tab_id", None):
+            for t in page_tabs:
+                if t.get("id") == self._current_tab_id:
+                    target = t
+                    break
+        if not target and page_tabs:
+            target = page_tabs[0]
+        if not target:
+            return {"success": False, "error": "No page tab found"}
+        ws_url = target.get("webSocketDebuggerUrl", "").replace("localhost", "127.0.0.1")
+        if not ws_url:
+            return {"success": False, "error": "No webSocketDebuggerUrl available"}
+        try:
+            import websockets
+            async with websockets.connect(ws_url, ping_interval=None) as ws:
+                await ws.send(json.dumps({"id": 1, "method": "Page.bringToFront"}))
+                await asyncio.wait_for(ws.recv(), timeout=5)
+            return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -568,49 +792,113 @@ class BrowserController:
 
     async def launch_with_cdp(self, url: str = "") -> dict[str, Any]:
         """
-        Launch Chrome/Edge with CDP remote debugging enabled.
-        This enables advanced automation (JS execution, screenshots, tab control).
+        Launch a controllable browser (Brave > Chrome > Edge) with CDP enabled.
+
+        Uses a dedicated profile directory: Chromium 136+ ignores
+        --remote-debugging-port on the normal profile, so the user's own
+        windows can never be attached to — this opens a separate controlled
+        window instead, preferring the browser the user already runs.
         """
-        target_url = f'"{url}"' if url else '""'
+        target = f'"{url}"' if url else ''
         script = f"""
-        $chromePaths = @(
-            "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe",
-            "$env:ProgramFiles(x86)\\Google\\Chrome\\Application\\chrome.exe",
-            "$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe"
-        )
-        $edgePaths = @(
-            "$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe",
-            "$env:ProgramFiles(x86)\\Microsoft\\Edge\\Application\\msedge.exe"
-        )
+        $paths = @{{
+            'brave' = @(
+                "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+                "${{env:ProgramFiles(x86)}}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+                "$env:LOCALAPPDATA\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+            )
+            'chrome' = @(
+                "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe",
+                "${{env:ProgramFiles(x86)}}\\Google\\Chrome\\Application\\chrome.exe",
+                "$env:LOCALAPPDATA\\Google\\Chrome\\Application\\chrome.exe"
+            )
+            'msedge' = @(
+                "$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe",
+                "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe"
+            )
+        }}
+        $order = @('brave', 'chrome', 'msedge')
+        # Prefer whichever browser the user already has open.
+        foreach ($b in $order) {{
+            if (Get-Process -Name $b -ErrorAction SilentlyContinue) {{ $order = @($b) + @($order | Where-Object {{ $_ -ne $b }}); break }}
+        }}
         $found = $null
-        foreach ($p in $chromePaths) {{ if (Test-Path $p) {{ $found = $p; break }} }}
-        if (-not $found) {{
-            foreach ($p in $edgePaths) {{ if (Test-Path $p) {{ $found = $p; break }} }}
+        $foundName = $null
+        foreach ($b in $order) {{
+            foreach ($p in $paths[$b]) {{ if (Test-Path $p) {{ $found = $p; $foundName = $b; break }} }}
+            if ($found) {{ break }}
         }}
         if ($found) {{
-            $profileDir = "$env:USERPROFILE\.winbrow\browser-profile"
+            $profileDir = Join-Path $env:LOCALAPPDATA ("WinBrow\\cdp_profile_" + $foundName)
             if (-not (Test-Path $profileDir)) {{ New-Item -ItemType Directory -Path $profileDir -Force | Out-Null }}
-            Start-Process $found -ArgumentList "--remote-debugging-port=9222 --user-data-dir=`"$profileDir`" --no-first-run --no-default-browser-check {target_url}"
+            $argList = "--remote-debugging-port=9222 --user-data-dir=`"$profileDir`" --no-first-run --no-default-browser-check"
+            $dest = "{target}"
+            if ($dest) {{ $argList += " $dest" }}
+            Start-Process $found -ArgumentList $argList
             Start-Sleep -Milliseconds 1500
-            return "Launched browser with CDP on port 9222. Path: $found"
+            return "Launched $foundName with CDP on port 9222 (separate controlled window). Path: $found"
         }} else {{
-            return "ERROR: Could not find Chrome or Edge executable"
+            return "ERROR: Could not find Brave, Chrome, or Edge executable"
         }}
         """
         return await run_powershell(script)
 
+    async def open_in_user_browser(self, url: str) -> dict[str, Any]:
+        """Open a URL as a new tab in the user's OWN browser window (no CDP)."""
+        safe = url.replace('"', "")
+        script = f"""
+        $exe = $null
+        foreach ($b in @('brave', 'chrome', 'msedge')) {{
+            $p = Get-Process -Name $b -ErrorAction SilentlyContinue |
+                 Where-Object {{ $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+            if ($p) {{ $exe = $p.Path; break }}
+        }}
+        if (-not $exe) {{
+            foreach ($p in @(
+                "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+                "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe",
+                "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe",
+                "$env:ProgramFiles\\Microsoft\\Edge\\Application\\msedge.exe"
+            )) {{ if (Test-Path $p) {{ $exe = $p; break }} }}
+        }}
+        if (-not $exe) {{ return "ERROR: No browser found" }}
+        Start-Process $exe -ArgumentList "{safe}"
+        return "Opened {safe} in your browser"
+        """
+        return await run_powershell(script)
+
     async def read_page_text(self) -> dict[str, Any]:
-        """Read the visible text content of the current page via CDP."""
+        """Read the visible text content of the current page via CDP, extracting search cards if on Google."""
         code = """
-        Array.from(document.querySelectorAll('h1,h2,h3,p,li,td,th,span,a'))
-          .map(e => e.innerText.trim())
-          .filter(t => t.length > 10)
-          .slice(0, 50)
-          .join('\\n')
+        (() => {
+          const isGoogle = window.location.hostname.includes('google');
+          if (isGoogle) {
+            const cards = [];
+            const resultBlocks = document.querySelectorAll('#rso .g, #rso div[data-hveid]');
+            for (const b of resultBlocks) {
+              const h3 = b.querySelector('h3');
+              if (h3) {
+                const title = (h3.innerText || '').trim();
+                const snippetEl = b.querySelector('div[style*="-webkit-line-clamp"], .VwiC3b, span[style*="line-height"]');
+                const snippet = snippetEl ? (snippetEl.innerText || '').trim() : '';
+                if (title) {
+                  cards.push(snippet ? `${title}: ${snippet}` : title);
+                }
+              }
+              if (cards.length >= 6) break;
+            }
+            if (cards.length > 0) return cards.join('\\n\\n');
+          }
+          return Array.from(document.querySelectorAll('h1,h2,h3,p,li,td,th,span,a'))
+            .map(e => (e.innerText || '').trim())
+            .filter(t => t.length > 15)
+            .slice(0, 40)
+            .join('\\n');
+        })()
         """
         result = await self.execute_js(code)
         if result.get("success"):
-            return {"success": True, "text": result.get("value", ""), "method": "cdp"}
+            return {"success": True, "text": result.get("value", "") or "", "method": "cdp"}
         return {"success": False, "error": result.get("error", "CDP unavailable")}
 
     async def click_element(self, selector: str) -> dict[str, Any]:
@@ -683,7 +971,7 @@ class BrowserController:
         script = f"""
         Add-Type -AssemblyName System.Windows.Forms
         [System.Windows.Forms.Clipboard]::SetText("{safe_ps}")
-        $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
+        $proc = Get-Process | Where-Object {{ $_.ProcessName -in @('brave','chrome','msedge','firefox') -and $_.MainWindowHandle -ne 0 }} | Select-Object -First 1
         if ($proc) {{ $ws2 = New-Object -ComObject WScript.Shell; $ws2.AppActivate($proc.Id) | Out-Null; Start-Sleep -Milliseconds 300 }}
         $ws = New-Object -ComObject WScript.Shell
         $ws.SendKeys("^v")
@@ -717,13 +1005,29 @@ class BrowserController:
         """
         Execute an Ultrafast multi-step browser task using Laya typed decisions.
 
-        Ensures Chrome/Edge is running with CDP remote-debugging enabled before
-        executing any steps.  Without CDP the interactive actions (type, click)
-        cannot reach DOM elements.
+        Simple "open/go to <site>" goals are handed to the user's own browser
+        window (new tab, no CDP). Interactive tasks get a separate controlled
+        window (Brave > Chrome > Edge) with CDP remote debugging enabled.
         """
+        # Plain navigation: open a tab in the user's own browser window.
+        nav_url = _plain_nav_url(goal)
+        if nav_url:
+            out = await self.open_in_user_browser(nav_url)
+            msg = (out.get("stdout") or out.get("stderr") or "").strip()
+            ok = out.get("success", False) and not msg.startswith("ERROR")
+            log.info(f"Plain navigation goal -> user's browser: {nav_url} ({msg})")
+            return {
+                "success": ok,
+                "goal": goal,
+                "final_answer": msg or f"Opened {nav_url} in your browser",
+                "steps": [{"step": 1, "action": "open_in_user_browser", "reason": msg, "url": nav_url}],
+                "total_elapsed_ms": out.get("elapsed_ms", 0.0),
+                "method": "user_browser",
+            }
+
         # Ensure CDP is available — all interactive actions depend on it
         if not _cdp_available():
-            log.info("CDP not available. Launching browser with --remote-debugging-port=9222 …")
+            log.info("CDP not available. Launching controlled browser with --remote-debugging-port=9222 …")
             launch_res = await self.launch_with_cdp()
             log.debug(f"CDP launch result: {launch_res}")
             # Wait up to 4 s for Chrome to start and open its debugging port

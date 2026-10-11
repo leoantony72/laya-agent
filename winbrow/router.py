@@ -41,6 +41,38 @@ _SYSTEM_FOLDERS = frozenset({
     "videos", "home", "appdata", "temp", "startup", "recycle",
 })
 
+# A bare "open folder" (no target named) after verb stripping.
+_BARE_FOLDER_WORDS = frozenset({
+    "", "folder", "folders", "directory", "directories",
+    "explorer", "file explorer", "windows explorer", "this pc", "my computer",
+    "that", "this", "it",
+})
+
+# Verb phrases stripped before resolving a folder target, longest first.
+_OPEN_FOLDER_VERBS = (
+    "open the folder", "open folder", "open the", "open",
+    "go to the folder", "go to folder", "go to",
+    "show the folder", "show folder", "show",
+    "launch the folder", "launch folder", "launch",
+)
+
+_MENTION_FOLDER_RE = re.compile(
+    r"\b(folder|folders|directory|directories|explorer|file manager)\b"
+)
+
+
+def _mentions_folder(text: str) -> bool:
+    return bool(_MENTION_FOLDER_RE.search(text))
+
+
+def _default_open_folder(memory=None) -> str:
+    """Target for a bare 'open folder': last opened folder, else Downloads."""
+    last = getattr(memory, "last_folder", None) if memory is not None else None
+    if last and os.path.isdir(last):
+        return last
+    return "downloads"
+
+
 
 def _laya_timeout_default() -> float:
     """Laya per-request budget in seconds; override with LAYA_TIMEOUT_S."""
@@ -270,6 +302,18 @@ def _closest_word(word: str, vocab: set[str] | frozenset[str]) -> Optional[str]:
     return best if best is not None and best_d <= budget else None
 
 
+def _resolves_on_disk(token: str) -> bool:
+    """True when the token already names a real folder or file."""
+    if not token or len(token) > 120:
+        return False
+    try:
+        if os.path.isdir(token) or os.path.isfile(token):
+            return True
+        return _folder_exists_on_disk(token) is not None
+    except Exception:
+        return False
+
+
 def autocorrect_utterance(text: str, extra: Optional[list[str]] = None) -> str:
     """Repair STT/typo tokens against command vocabulary. Never touches paths."""
     vocab = set(_COMMAND_VOCAB)
@@ -286,7 +330,12 @@ def autocorrect_utterance(text: str, extra: Optional[list[str]] = None) -> str:
             continue
         hit = _closest_word(stripped, vocab)
         if hit:
-            out.append(hit)
+            # Never "repair" a token that already names a real folder/file:
+            # "codee" must not become a running app name like "mode".
+            if hit == stripped or not _resolves_on_disk(stripped):
+                out.append(hit)
+            else:
+                out.append(part)
             continue
         if len(stripped) >= 8:
             merged = None
@@ -305,7 +354,6 @@ def autocorrect_utterance(text: str, extra: Optional[list[str]] = None) -> str:
 
 def _tokens(lower: str) -> list[str]:
     return [t for t in re.split(r"\W+", lower) if t]
-
 
 def _fuzzy_in(tokens: list[str], vocab: set[str] | frozenset[str]) -> bool:
     for t in tokens:
@@ -390,10 +438,14 @@ def _folder_exists_on_disk(name: str) -> Optional[str]:
     the first exact (case-insensitive) match, else None.
     """
     n = name.strip().strip('"').strip("'")
-    if not n or len(n) > 60 or re.search(r'[<>:"|?*]', n):
+    if not n:
         return None
+    # A real path (absolute or relative) wins outright: it may contain ':'
+    # and be longer than a folder *name*, so validate it before name rules.
     if os.path.isdir(n):
         return os.path.abspath(n)
+    if len(n) > 60 or re.search(r'[<>:"|?*]', n):
+        return None
     roots: list[str] = []
     try:
         home = os.path.expanduser("~")
@@ -495,7 +547,7 @@ class WinBrowRouter:
         try:
             questions = self._build_questions(corrected, tools, ctx)
             result = await self._worker.apredict(corrected, questions, self.timeout)
-            routed = self._route_from_answers(result, corrected, t0)
+            routed = self._route_from_answers(result, corrected, t0, memory=memory)
             if routed.kind != NEW_ACTION and routed.confidence >= 0.6:
                 return routed
         except asyncio.TimeoutError:
@@ -566,7 +618,7 @@ class WinBrowRouter:
             }
         }
 
-    def _route_from_answers(self, result: dict[str, Any], text: str, t0: float) -> Route:
+    def _route_from_answers(self, result: dict[str, Any], text: str, t0: float, memory=None) -> Route:
         """Validate the model's answer and turn it into a Route.
 
         Code only validates: unknown tool names become NEW_ACTION, and text
@@ -608,7 +660,7 @@ class WinBrowRouter:
                 if val:
                     args[arg.name] = val
             else:
-                args[arg.name] = self._extract_text_arg(text, matched_tool.name, arg.name)
+                args[arg.name] = self._extract_text_arg(text, matched_tool.name, arg.name, memory=memory)
 
         return Route(
             kind="tool",
@@ -620,7 +672,7 @@ class WinBrowRouter:
             tier="laya",
         )
 
-    def _extract_text_arg(self, utterance: str, tool_name: str, arg_name: str) -> str:
+    def _extract_text_arg(self, utterance: str, tool_name: str, arg_name: str, memory=None) -> str:
         text = _strip_conversational_prefix(utterance.strip())
         lower = text.lower()
         if tool_name == "web_search":
@@ -642,18 +694,37 @@ class WinBrowRouter:
                 return str(max(0, min(100, int(m.group(1)))))
             return text
         elif tool_name == "open_folder":
-            for prefix in ["open folder ", "open the folder ", "open ", "open the ", "go to folder ", "go to ", "show folder ", "show "]:
-                if lower.startswith(prefix):
-                    clean = text[len(prefix):].strip().strip('"').strip("'").strip()
-                    clean = re.sub(r"\s+(please|thanks|thank\s+you)\s*$", "", clean, flags=re.IGNORECASE).strip()
-                    if clean.lower().endswith(" folder"):
-                        clean = clean[:-7].strip().strip('"').strip("'").strip()
-                    if clean.lower().startswith("my "):
-                        clean = clean[3:].strip()
-                    if clean.lower().startswith("the "):
-                        clean = clean[4:].strip()
-                    return clean
-            return text
+            # Longest verb first so "open the folder" is not chopped to "the".
+            work = re.sub(r"\s+(please|thanks|thank\s+you|for me)\s*$", "", lower).strip()
+            matched = any(work.startswith(p) for p in _OPEN_FOLDER_VERBS)
+            if matched:
+                for prefix in _OPEN_FOLDER_VERBS:
+                    if work.startswith(prefix):
+                        work = work[len(prefix):].strip()
+                        break
+                work = work.strip().strip('"').strip("'").strip()
+                for tail in (" folder", " directory", " explorer", " dir"):
+                    if work.endswith(tail):
+                        work = work[: -len(tail)].strip()
+                        break
+                work = re.sub(r"^(the|my|a|an|this|that)\s+", "", work).strip()
+                work = work.strip().strip('"').strip("'").strip()
+            else:
+                work = lower
+                # "that folder" / "this directory" — resolve the reference word.
+                for tail in (" folder", " directory", " explorer"):
+                    if work.endswith(tail):
+                        ref = work[: -len(tail)].strip()
+                        if ref in ("that", "this", "it", "the", "my"):
+                            work = ref
+                        break
+            if work in _BARE_FOLDER_WORDS:
+                # "open folder" with no target: last opened folder, else Downloads.
+                # Without the word folder/directory this is not a folder request.
+                if _mentions_folder(lower):
+                    return _default_open_folder(memory)
+                return ""
+            return work
         elif tool_name == "open_file":
             # Fill the text args the model cannot supply itself: strip the
             # command verb, an "in <app>" qualifier (returned as `app`), and
@@ -762,7 +833,7 @@ class WinBrowRouter:
             return Route(kind="tool", tool=t, args={}, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
 
         # --- OPEN FOLDER (real directories only) ---
-        folder_arg = self._extract_text_arg(text, "open_folder", "folder")
+        folder_arg = self._extract_text_arg(text, "open_folder", "folder", memory=memory)
         if folder_arg:
             if folder_arg.lower() in _SYSTEM_FOLDERS or _folder_exists_on_disk(folder_arg):
                 t = self.registry.get("open_folder")
@@ -829,6 +900,9 @@ class WinBrowRouter:
         
         # Exclude local file searches
         if is_web_search and not any(t in _LOCAL_FIND for t in tokens):
+            t = self.registry.get("laya_ultrafast_browser")
+            if t:
+                return Route(kind="tool", tool=t, args={"goal": cleaned}, confidence=0.96, latency_ms=elapsed_ms, tier="heuristic")
             query = web_search_query(cleaned)
             if query:
                 t = self.registry.get("web_search")
@@ -1015,7 +1089,7 @@ class WinBrowRouter:
 
         # Open folder — ONLY when the name resolves to a real directory.
         # No "open anything" fallback: unresolved names go to NEW_ACTION.
-        folder_arg = self._extract_text_arg(text, "open_folder", "folder")
+        folder_arg = self._extract_text_arg(text, "open_folder", "folder", memory=memory)
         if folder_arg:
             if folder_arg.lower() in _SYSTEM_FOLDERS or _folder_exists_on_disk(folder_arg):
                 t = self.registry.get("open_folder")

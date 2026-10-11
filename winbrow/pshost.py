@@ -46,6 +46,9 @@ class PersistentPS:
         self._lock = asyncio.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._pid: Optional[int] = None
+        # Loops that cannot run subprocesses (Windows SelectorEventLoop).
+        # Cached so we do not retry — and re-log — on every command.
+        self._no_subprocess_loop: Optional[asyncio.AbstractEventLoop] = None
         atexit.register(self._kill_at_exit)
 
     def _kill_at_exit(self) -> None:
@@ -101,6 +104,19 @@ class PersistentPS:
             
             log.info(f"Persistent PowerShell host started (PID: {self._pid})")
             return True
+        except NotImplementedError as e:
+            # Windows SelectorEventLoop: asyncio subprocesses are unsupported.
+            # Permanent for this loop — remember it instead of retrying.
+            try:
+                self._no_subprocess_loop = asyncio.get_running_loop()
+            except Exception:
+                self._no_subprocess_loop = None
+            log.info(
+                "Event loop does not support subprocesses; persistent PowerShell "
+                "disabled (one-shot execution will be used)."
+            )
+            await self._teardown()
+            return False
         except Exception as e:
             import traceback
             log.warning(f"Persistent PowerShell failed to start: {type(e).__name__}: {e}")
@@ -160,6 +176,15 @@ class PersistentPS:
         if loop is not None and not (hasattr(loop, 'create_subprocess_exec') or hasattr(loop, 'subprocess_exec')):
             log.debug("Current event loop doesn't support subprocesses, using one-shot fallback")
             loop = None
+
+        if loop is not None and loop is self._no_subprocess_loop:
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "Persistent PowerShell unavailable (event loop doesn't support subprocesses)",
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
         
         if loop is not None and self._loop is not None and self._loop is not loop:
             try:

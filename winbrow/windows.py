@@ -23,6 +23,11 @@ import psutil
 
 log = logging.getLogger("winbrow.windows")
 
+# One-shot fallback is a steady state on loops without subprocess support
+# (uvicorn --reload runs a SelectorEventLoop on Windows), so log it once
+# instead of on every command.
+_ps_fallback_logged = False
+
 
 @dataclass
 class WindowsContext:
@@ -366,17 +371,26 @@ async def run_powershell(script: str, timeout: int = 30) -> dict[str, Any]:
         ):
             return res
         stderr = res.get("stderr", "")
-        if stderr:
-            log.warning(f"Persistent host down ({stderr[:100]}); using one-shot PowerShell fallback.")
+        global _ps_fallback_logged
+        if not _ps_fallback_logged:
+            _ps_fallback_logged = True
+            detail = stderr[:100] if stderr else "no detail"
+            log.warning(f"Persistent host down ({detail}); using one-shot PowerShell fallback.")
         else:
-            log.warning("Persistent host down; using one-shot PowerShell fallback.")
+            log.debug(f"Persistent host down ({stderr[:100]}); using one-shot PowerShell fallback.")
     except Exception as e:
         log.warning(f"Persistent host import/call failed ({repr(e)}); using one-shot fallback.")
     return await _run_powershell_once(script, timeout)
 
 
 async def _run_powershell_once(script: str, timeout: int = 30) -> dict[str, Any]:
-    """One-shot powershell.exe spawn (fallback path and cold-start warm-up)."""
+    """One-shot powershell.exe spawn (fallback path and cold-start warm-up).
+
+    First tries asyncio subprocess; if the event loop does not support
+    subprocesses (``NotImplementedError`` on some uvicorn/Windows combos),
+    falls back to synchronous ``subprocess.run`` wrapped in an executor so
+    the event loop is never blocked.
+    """
     t0 = time.perf_counter()
     # Add utf-8 output encoding prefix for clean text capture
     wrapped_script = (
@@ -408,6 +422,11 @@ async def _run_powershell_once(script: str, timeout: int = 30) -> dict[str, Any]
             "stderr": err_str,
             "elapsed_ms": elapsed_ms,
         }
+    except NotImplementedError:
+        # Event loop does not support async subprocesses (e.g. uvicorn on
+        # Windows with SelectorEventLoop).  Fall back to synchronous spawn.
+        log.info("Async subprocess not supported; using sync fallback.")
+        return await _run_powershell_sync(wrapped_script, timeout, t0)
     except asyncio.TimeoutError:
         return {
             "success": False,
@@ -417,13 +436,54 @@ async def _run_powershell_once(script: str, timeout: int = 30) -> dict[str, Any]
             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
         }
     except Exception as e:
-        return {
-            "success": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": str(e),
-            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-        }
+        log.warning(f"Async subprocess failed ({e}); trying sync fallback.")
+        return await _run_powershell_sync(wrapped_script, timeout, t0)
+
+
+async def _run_powershell_sync(
+    wrapped_script: str, timeout: int, t0: float
+) -> dict[str, Any]:
+    """Synchronous subprocess.run in an executor — works on any event loop."""
+    def _sync() -> dict[str, Any]:
+        try:
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", wrapped_script,
+                ],
+                capture_output=True,
+                timeout=timeout,
+            )
+            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+            return {
+                "success": result.returncode == 0,
+                "returncode": result.returncode,
+                "stdout": result.stdout.decode("utf-8", errors="replace").strip(),
+                "stderr": result.stderr.decode("utf-8", errors="replace").strip(),
+                "elapsed_ms": elapsed_ms,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"PowerShell command timed out after {timeout} seconds",
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"{type(e).__name__}: {e}",
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _sync)
 
 
 # ---------------------------------------------------------------------------
@@ -474,13 +534,31 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
     """Activate window if running, or launch executable."""
     script = f"""
     $name = "{app_name}"
-    $proc = Get-Process | Where-Object {{ $_.ProcessName -like "*$name*" -or $_.MainWindowTitle -like "*$name*" }} | Select-Object -First 1
+    # Match by process name; only match window titles for non-browser apps so
+    # "youtube" doesn't grab a Brave/Chrome window that happens to show YouTube.
+    $browsers = @('chrome', 'msedge', 'brave', 'firefox', 'iexplore', 'opera')
+    $proc = Get-Process | Where-Object {{
+        ($_.ProcessName -like "*$name*") -or
+        ($_.MainWindowTitle -like "*$name*" -and $browsers -notcontains $_.ProcessName.ToLower())
+    }} | Select-Object -First 1
     if ($proc -and $proc.MainWindowHandle -ne 0) {{
         $wshell = New-Object -ComObject WScript.Shell
         $wshell.AppActivate($proc.Id) | Out-Null
         return "Activated $($proc.ProcessName)"
     }} else {{
-        Start-Process $name -ErrorAction Stop
+        $known = @{{
+            'chrome' = "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe"
+            'edge'   = "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe"
+            'brave'  = "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+        }}
+        $exe = $known[$name.ToLower()]
+        if (-not $exe -or -not (Test-Path $exe)) {{
+            $exe = (Get-Command $name -ErrorAction SilentlyContinue).Source
+        }}
+        if (-not $exe) {{
+            return "ERROR: Could not find an application named '$name'"
+        }}
+        Start-Process $exe -ErrorAction Stop
         return "Launched $name"
     }}
     """

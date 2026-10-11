@@ -25,6 +25,34 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger("winbrow.ultrafast")
 
+# Play/watch-style goals: the engine must click into a video, not just search.
+_PLAY_INTENT_KW = ("play", "watch", "video", "song", "music", "listen")
+_YT_WATCH_RE = re.compile(r"youtube\.com/watch|youtu\.be/", re.IGNORECASE)
+# Stable selectors for the first video result on a YouTube results page.
+# (Double quotes inside: the click executor interpolates selectors into
+# single-quoted JS strings.)
+_YT_VIDEO_SELECTOR = (
+    "ytd-video-renderer a#video-title, "
+    "ytd-rich-item-renderer a#video-title, "
+    "a[href^=\"/watch?v=\"]"
+)
+
+
+def _clean_video_query(goal: str) -> str:
+    """Strip play/watch filler from a goal to get the video search query."""
+    q = goal.lower()
+    q = re.sub(
+        r"^(?:please\s+)?(?:play|watch|show|find|search|stream|listen to)\s+"
+        r"(?:me\s+)?(?:a\s+|an\s+|some\s+|the\s+|for\s+)?",
+        "", q,
+    )
+    q = re.sub(r"\b(?:on|from)\s+youtube\b", " ", q)
+    q = re.sub(r"\byoutube\b", " ", q)
+    q = re.sub(r"\b(?:video|videos|clip|clips)\s+(?:about|on|for|of)\b", " ", q)
+    q = re.sub(r"\b(?:about|entitled|called)\b", " ", q)
+    q = re.sub(r"\s*\b(?:video|videos|song|songs)\b\s*$", "", q)
+    return re.sub(r"\s+", " ", q).strip() or goal
+
 # ────────────────────────────────────────────────────────────────────────────
 # Data Models
 # ────────────────────────────────────────────────────────────────────────────
@@ -534,15 +562,20 @@ class LayaUltrafastEngine:
                     )
 
             if "google.com/search" in url:
-                # On Google Search results page: click into top website if not clicked yet
-                has_clicked = any(s.action == "click" for s in previous_steps)
-                if not has_clicked:
+                # On Google Search results page: extract answers/results and finish immediately
+                has_extracted = any(s.action == "extract" for s in previous_steps)
+                if not has_extracted:
                     return UltrafastStep(
                         step_number=step_num,
-                        action="click",
-                        selector="#rso a h3",
-                        reason="Open top organic search result website to view full recipe/details",
+                        action="extract",
+                        reason="Extract search results and overview from Google Search",
                     )
+                return UltrafastStep(
+                    step_number=step_num,
+                    action="finish",
+                    reason="Completed search extraction",
+                    value=previous_steps[-1].value or f"Searched for: {goal}",
+                )
 
         # If we clicked into a website from search or user wants details: extract content
         has_extracted = any(s.action == "extract" for s in previous_steps)
@@ -638,15 +671,19 @@ class LayaUltrafastEngine:
             if step.selector or step.target_index:
                 # Click element with scrollIntoView and synthetic dispatch
                 sel = step.selector or f'[data-wb-idx="{step.target_index}"]'
+                sel_js = sel.replace("\\", "\\\\").replace("'", "\\'")
                 res = await self.browser.execute_js(f"""
                 (() => {{
-                    const el = document.querySelector('{sel}')
+                    const el = document.querySelector('{sel_js}')
                             || document.querySelector('[data-wb-idx="{step.target_index}"]');
                     if (el) {{
+                        const link = el.closest('a');
+                        if (link && link.target === '_blank') {{
+                            link.removeAttribute('target');
+                        }}
                         el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
                         el.focus();
                         el.click();
-                        el.dispatchEvent(new MouseEvent('click', {{ bubbles: true, cancelable: true }}));
                         return true;
                     }}
                     return false;
@@ -655,8 +692,14 @@ class LayaUltrafastEngine:
                 # Wait for page/DOM updates after click (AJAX, navigation, dropdown open)
                 await asyncio.sleep(0.8)
                 duration = round((time.perf_counter() - t0) * 1000, 1)
-                clicked = res.get("value", False) or res.get("success", False)
-                return {"success": bool(clicked), "output": f"Clicked {sel}", "elapsed_ms": duration}
+                clicked = bool(res.get("value", False))
+                after = await self.browser.get_current_url()
+                return {
+                    "success": clicked,
+                    "output": f"Clicked {sel}",
+                    "url": after.get("url", ""),
+                    "elapsed_ms": duration,
+                }
 
         elif act == "submit":
             sel = step.selector or f'[data-wb-idx="{step.target_index}"]'
@@ -783,6 +826,181 @@ class LayaUltrafastEngine:
         duration = round((time.perf_counter() - t0) * 1000, 1)
         return {"success": True, "output": "Step executed", "elapsed_ms": duration}
 
+    async def _youtube_play_step(
+        self,
+        goal_lower: str,
+        url: str,
+        title: str,
+        elements: List[InteractiveElement],
+        previous_steps: List[UltrafastStep],
+    ) -> Optional[UltrafastStep]:
+        """Deterministic handling for play/watch goals on YouTube.
+
+        Clicks the first video result on the results page and finishes once the
+        watch page is open, so the engine no longer stops at the search results.
+        """
+        if "youtube.com" not in (url or "") and "youtu.be" not in (url or ""):
+            return None
+        if not any(kw in goal_lower for kw in _PLAY_INTENT_KW):
+            return None
+
+        step_num = len(previous_steps) + 1
+        clicked_ok = any(
+            s.action == "click" and "/watch" in (s.value or "")
+            for s in previous_steps
+        )
+
+        if _YT_WATCH_RE.search(url or ""):
+            if not clicked_ok and not any(s.action == "click" for s in previous_steps):
+                return UltrafastStep(
+                    step_number=step_num,
+                    action="wait",
+                    reason="Already on a video watch page; letting it play",
+                )
+            return UltrafastStep(
+                step_number=step_num,
+                action="finish",
+                reason="Video watch page opened",
+                value=f"Now playing on YouTube: {title or url}",
+            )
+
+        if clicked_ok:
+            return UltrafastStep(
+                step_number=step_num,
+                action="wait",
+                reason="Clicked a video result; waiting for the player to load",
+            )
+
+        n_click_attempts = sum(1 for s in previous_steps if s.action == "click")
+        if n_click_attempts >= 4:
+            return None
+        n_waits = sum(1 for s in previous_steps if s.action == "wait")
+        if n_waits >= 20:
+            return None
+
+        last = previous_steps[-1] if previous_steps else None
+        if last is not None and last.action == "click":
+            # Click just failed to navigate: back off a beat, then click again.
+            return UltrafastStep(
+                step_number=step_num,
+                action="wait",
+                reason="Video click did not navigate; waiting before retry",
+            )
+
+        # Only click once the results DOM actually contains a video link —
+        # the shell/header renders first and would make blind clicks miss.
+        probe = await self.browser.execute_js(
+            "!!document.querySelector(" + json.dumps(_YT_VIDEO_SELECTOR) + ")"
+        )
+        if not probe.get("value"):
+            return UltrafastStep(
+                step_number=step_num,
+                action="wait",
+                reason="Waiting for video results to render",
+            )
+        return UltrafastStep(
+            step_number=step_num,
+            action="click",
+            selector=_YT_VIDEO_SELECTOR,
+            reason="Click first video result to play it",
+        )
+
+    async def _ensure_video_playing(self) -> None:
+        """Make sure the YouTube player is actually playing, with sound.
+
+        Watch pages often load scrolled away from the player, and synthetic JS
+        clicks are not user gestures, so autoplay can be blocked. Scroll the
+        player into view, click it with a trusted CDP mouse event, then
+        play()/unmute via JS.
+        """
+        try:
+            # Wait for the player to be interactive (duration known, data buffered).
+            info: Any = None
+            for _ in range(12):
+                res = await self.browser.execute_js(
+                    """
+                    (() => {
+                        const v = document.querySelector('video');
+                        if (!v) return { exists: false };
+                        const r = v.getBoundingClientRect();
+                        return {
+                            exists: true,
+                            ready: v.readyState >= 2 && isFinite(v.duration) && v.duration > 0,
+                            paused: !!v.paused,
+                            muted: !!v.muted,
+                            x: Math.round(r.x + r.width / 2),
+                            y: Math.round(r.y + r.height / 2),
+                        };
+                    })()
+                    """
+                )
+                info = res.get("value")
+                if isinstance(info, dict) and info.get("exists") and info.get("ready"):
+                    break
+                await asyncio.sleep(0.5)
+            if not isinstance(info, dict) or not info.get("exists"):
+                return
+
+            if not info.get("paused"):
+                if info.get("muted"):
+                    await self.browser.execute_js(
+                        "(() => { const v = document.querySelector('video');"
+                        " if (v) v.muted = false; return true; })()"
+                    )
+                return
+
+            # Player is often above the viewport on load — bring it into view,
+            # then toggle play with a trusted mouse click (not JS el.click(),
+            # which is not a user gesture and cannot start sound playback).
+            # NOTE: click coordinates must come from the player container —
+            # YouTube's <video> is CSS-offset inside it and its own rect lies.
+            await self.browser.execute_js("window.scrollTo(0, 0); true")
+            await asyncio.sleep(0.4)
+            res = await self.browser.execute_js(
+                """
+                (() => {
+                    const p = document.querySelector('#movie_player, .html5-video-player');
+                    const v = document.querySelector('video');
+                    const el = p || v;
+                    if (!el) return null;
+                    const r = el.getBoundingClientRect();
+                    if (r.width <= 0 || r.bottom <= 0 || r.top >= window.innerHeight) return null;
+                    const cy = Math.max(10, Math.min(window.innerHeight - 10, r.top + r.height / 2));
+                    const cx = Math.max(10, Math.min(window.innerWidth - 10, r.left + r.width / 2));
+                    return { x: Math.round(cx), y: Math.round(cy) };
+                })()
+                """
+            )
+            pos = res.get("value") or {}
+            if pos.get("x") is None:
+                return
+
+            paused_now = True
+            for _attempt in range(2):
+                await self.browser.click_at(pos["x"], pos.get("y", 360))
+                # The player needs a beat to process the click — poll, don't
+                # race it with extra keys (a second toggle would pause again).
+                for _ in range(6):
+                    await asyncio.sleep(0.5)
+                    check = await self.browser.execute_js(
+                        "(() => { const v = document.querySelector('video');"
+                        " return v ? !!v.paused : null; })()"
+                    )
+                    paused_now = check.get("value") is True
+                    if not paused_now:
+                        break
+                if not paused_now:
+                    break
+            if paused_now:
+                return
+            # Playing — unmute so the user can actually hear it.
+            await self.browser.execute_js(
+                "(() => { const v = document.querySelector('video');"
+                " if (v) v.muted = false; return true; })()"
+            )
+        except Exception as e:
+            log.debug(f"ensure_video_playing failed: {e}")
+
     async def run_task(self, goal: str, max_steps: int = 20) -> UltrafastResult:
         """
         Run multi-step Ultrafast Browser Task (Jev-Ultrafast / Laya-Ultrafast architecture).
@@ -829,10 +1047,9 @@ class LayaUltrafastEngine:
             m = re.search(r"(?:on amazon|amazon for)\s*(.*)", goal_lower)
             q = m.group(1).strip() if m and m.group(1).strip() else cleaned_query
             target_url = "https://www.amazon.com/s?k=" + urllib.parse.quote_plus(q)
-        # YouTube search
+        # YouTube search (play/watch goals get a cleaned query + later click a video)
         elif "youtube" in goal_lower:
-            m = re.search(r"(?:on youtube|youtube for)\s*(.*)", goal_lower)
-            q = m.group(1).strip() if m and m.group(1).strip() else cleaned_query
+            q = _clean_video_query(goal)
             target_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
         else:
             for keywords, site_url in _SITE_MAP:
@@ -841,18 +1058,46 @@ class LayaUltrafastEngine:
                     if site_domain not in current_url_str:
                         target_url = site_url
                     break
-            # General Search Fallback
-            if not target_url and any(kw in goal_lower for kw in ["search", "find", "look up", "recipe", "curry", "weather", "news", "price", "how to"]):
+            # Direct URL check
+            url_match = re.search(r"(https?://\S+|[\w\-]+\.(com|org|net|io|dev|ai|gov|edu|co|me|app)[\S]*)", goal, re.IGNORECASE)
+            if url_match and not target_url:
+                matched_u = url_match.group(0)
+                target_url = matched_u if matched_u.startswith("http") else f"https://{matched_u}"
+            # General Web Search Fallback
+            elif not target_url:
                 target_url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(cleaned_query or goal)
 
         if target_url:
             log.info(f"Ultrafast: navigating to {target_url} for goal: {goal!r}")
             await self.browser.navigate_to(target_url)
-            await asyncio.sleep(2.0)  # wait for page to fully load
+            await asyncio.sleep(0.8)  # brief wait for initial page render
 
         steps_history: List[UltrafastStep] = []
         step_traces: List[Dict[str, Any]] = []
         final_answer = ""
+
+        # Early termination: if we just navigated to a search results page,
+        # extract content and return immediately — no multi-step loop needed.
+        if target_url and "google.com/search" in (target_url or ""):
+            await asyncio.sleep(0.5)  # let results render
+            page_text = await self.browser.read_page_text()
+            text = page_text.get("text", "")
+            title_info = await self.browser.get_current_url()
+            page_title = title_info.get("title", "")
+            snippet = (text[:500] + "...") if len(text) > 500 else text
+            total_elapsed = round((time.perf_counter() - t0) * 1000, 1)
+            return UltrafastResult(
+                goal=goal,
+                success=True,
+                final_answer=f"{page_title}\n{snippet}" if snippet else f"Searched for: {goal}",
+                steps=[{"step": 1, "action": "navigate", "reason": f"Direct search: {target_url}", "elapsed_ms": total_elapsed}],
+                total_elapsed_ms=total_elapsed,
+                method="laya_ultrafast",
+            )
+
+        # Cap max_steps for simple search goals (they should finish in 2-3 steps)
+        if any(kw in goal_lower for kw in ["search", "find", "look up", "weather", "news"]):
+            max_steps = min(max_steps, 5)
 
         # Loop protection: track target element interactions
         consecutive_same_actions = 0
@@ -865,10 +1110,12 @@ class LayaUltrafastEngine:
             title = harvest.get("title", "")
             elements = harvest.get("elements", [])
 
-            # Step 2: Make decision (Try Laya first, fallback to heuristic)
-            decision = await self.decide_with_laya(goal, url, title, elements, steps_history)
+            # Step 2: Make decision (YouTube play goals first, then Laya, then heuristic)
+            decision = await self._youtube_play_step(goal_lower, url, title, elements, steps_history)
             if decision is None:
-                decision = self.make_typed_decision(goal, url, title, elements, steps_history)
+                decision = await self.decide_with_laya(goal, url, title, elements, steps_history)
+                if decision is None:
+                    decision = self.make_typed_decision(goal, url, title, elements, steps_history)
 
             # Loop detection
             current_signature = (decision.action, decision.target_index)
@@ -891,6 +1138,8 @@ class LayaUltrafastEngine:
             exec_res = await self.execute_step(decision)
 
             decision.duration_ms = exec_res.get("elapsed_ms", 0.0)
+            if decision.action == "click" and exec_res.get("url"):
+                decision.value = exec_res["url"]
             steps_history.append(decision)
 
             step_traces.append({
@@ -899,12 +1148,27 @@ class LayaUltrafastEngine:
                 "target_index": decision.target_index,
                 "reason": decision.reason,
                 "output": exec_res.get("output", ""),
+                "success": exec_res.get("success"),
+                "url": url,
                 "elapsed_ms": decision.duration_ms,
             })
+            if decision.action == "click" and exec_res.get("success") is False:
+                log.warning(f"Ultrafast click failed (selector={decision.selector!r}) on {url}")
 
             # Check termination
             if decision.action == "finish":
                 final_answer = exec_res.get("output", decision.value or "Goal completed successfully")
+                if "youtube" in goal_lower and any(kw in goal_lower for kw in _PLAY_INTENT_KW):
+                    await self._ensure_video_playing()
+                    cur_title = ""
+                    for _ in range(6):
+                        cur = await self.browser.get_current_url()
+                        cur_title = (cur.get("title") or "").replace(" - YouTube", "").strip()
+                        if cur_title and cur_title.lower() != "youtube":
+                            break
+                        await asyncio.sleep(0.7)
+                    if cur_title:
+                        final_answer = f"Now playing on YouTube: {cur_title}"
                 break
 
             if decision.action == "extract" and exec_res.get("output"):
@@ -915,7 +1179,7 @@ class LayaUltrafastEngine:
                     break
 
             # Short sleep to allow DOM updates / AJAX transitions
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.15)
 
         total_elapsed = round((time.perf_counter() - t0) * 1000, 1)
 
