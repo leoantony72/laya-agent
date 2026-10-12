@@ -224,7 +224,12 @@ class WinBrowAgent:
             cdp_result = await self.browser.ensure_browser_with_cdp()
             if not cdp_result.get("success"):
                 return {"type": "browser", "tool": "ensure_cdp", "success": False, 
-                        "output": f"Failed to start browser with CDP: {cdp_result.get('output', 'Unknown error')}"}
+                        "output": f"Failed to start browser with CDP: {cdp_result.get('output') or cdp_result.get('stdout', 'Unknown error')}"}
+            if cdp_result.get("setup") == "enable_remote_debugging":
+                # One-time browser opt-in not done yet: keep going (operations
+                # fall back to keyboard shortcuts) but surface the hint.
+                self._cdp_setup_hint = cdp_result.get("stdout")
+                log.warning(f"CDP not enabled yet: {self._cdp_setup_hint}")
 
         # Ultrafast multi-step browser task execution
         # Triggers for: flights, booking, shopping, form fill, interactive search, etc.
@@ -346,7 +351,9 @@ class WinBrowAgent:
         url_match = re.search(r"(https?://\S+|[\w\-]+\.(com|org|net|io|dev|ai|gov|edu|co|me|app)[\S]*)", utterance, re.IGNORECASE)
         if url_match:
             url = url_match.group(0)
-            new = "new tab" in lower
+            # New tab by default (never hijack the tab holding the prompt);
+            # only reuse the current tab when explicitly asked.
+            new = not any(phrase in lower for phrase in ("same tab", "this tab", "current tab"))
             out = await self.browser.navigate_to(url, new_tab=new)
             return {"type": "browser", "tool": "navigate", "success": True, "output": out.get("stdout", f"Opened {url}")}
 

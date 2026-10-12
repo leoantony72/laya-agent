@@ -139,6 +139,7 @@ class BrowserRequest(BaseModel):
     text: Optional[str] = None
     direction: Optional[str] = "next"
     num: Optional[int] = 1
+    new_tab: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +275,7 @@ async def browser_action(req: BrowserRequest):
     if action == "tabs":
         result = await b.list_tabs()
     elif action == "navigate":
-        result = await b.navigate_to(req.url or "", new_tab=False)
+        result = await b.navigate_to(req.url or "", new_tab=req.new_tab)
     elif action == "new_tab":
         result = await b.new_tab()
     elif action == "close_tab":

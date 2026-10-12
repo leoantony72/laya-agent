@@ -1069,7 +1069,9 @@ class LayaUltrafastEngine:
 
         if target_url:
             log.info(f"Ultrafast: navigating to {target_url} for goal: {goal!r}")
-            await self.browser.navigate_to(target_url)
+            # Open the target in a NEW tab so the user's current tab (e.g. the
+            # prompt/UI tab) is never hijacked; same window, not a new one.
+            await self.browser.navigate_to(target_url, new_tab=True)
             await asyncio.sleep(0.8)  # brief wait for initial page render
 
         steps_history: List[UltrafastStep] = []
