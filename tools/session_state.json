@@ -1,0 +1,217 @@
+{
+  "sessions": {
+    "test": {
+      "turns": [
+        {
+          "ts": 1792164581.2239623,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "You have 2 files open."
+        },
+        {
+          "ts": 1792164583.8792033,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164586.2846859,
+          "utterance": "and then make it a bit louder",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "stub volume_set_level"
+        },
+        {
+          "ts": 1792164588.9179854,
+          "utterance": "who are you?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164604.947723,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "You have 2 files open."
+        },
+        {
+          "ts": 1792164608.2268314,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164610.4485898,
+          "utterance": "and then make it a bit louder",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "stub volume_set_level"
+        },
+        {
+          "ts": 1792164613.1578789,
+          "utterance": "who are you?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164658.344513,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "You have 2 files open."
+        },
+        {
+          "ts": 1792164661.0552597,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164663.2740192,
+          "utterance": "and then make it a bit louder",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "stub volume_set_level"
+        },
+        {
+          "ts": 1792164665.977053,
+          "utterance": "who are you?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164826.549244,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "You have 2 files open."
+        },
+        {
+          "ts": 1792164829.7649598,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164832.085175,
+          "utterance": "and then make it a bit louder",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "stub volume_set_level"
+        },
+        {
+          "ts": 1792164834.6956644,
+          "utterance": "who are you?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164882.4333522,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "You have 2 files open."
+        },
+        {
+          "ts": 1792164885.0699065,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164887.318339,
+          "utterance": "and then make it a bit louder",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "stub volume_set_level"
+        },
+        {
+          "ts": 1792164889.9366498,
+          "utterance": "who are you?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164925.0429947,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "You have 2 files open."
+        },
+        {
+          "ts": 1792164927.764142,
+          "utterance": "how many files are open?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        },
+        {
+          "ts": 1792164929.997601,
+          "utterance": "and then make it a bit louder",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": true,
+          "output_snippet": "stub volume_set_level"
+        },
+        {
+          "ts": 1792164932.529653,
+          "utterance": "who are you?",
+          "route_kind": "new_action",
+          "tool_name": "",
+          "success": false,
+          "output_snippet": "I couldn't figure out how to automate that yet \u2014 no real action was taken. Try rephrasing with a concrete target (e.g. which image, file, or setting you mean)."
+        }
+      ],
+      "entities": {
+        "file": [],
+        "folder": [],
+        "app": [],
+        "url": [],
+        "query": []
+      }
+    },
+    "default": {
+      "turns": [],
+      "entities": {
+        "file": [],
+        "folder": [],
+        "app": [],
+        "url": [],
+        "query": []
+      }
+    }
+  }
+}

@@ -33,6 +33,25 @@ from winbrow.windows import run_powershell
 from winbrow.model_manager import get_model_path, ensure_llama_cpp, ensure_all_models
 from winbrow.llm import QwenLLM
 
+
+def _load_env_file() -> None:
+    """Tiny .env loader (no python-dotenv dependency). Ignored if absent."""
+    import logging as _logging
+    env_path = Path(__file__).parent / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception as e:
+        _logging.getLogger("winbrow-server").warning(f".env load failed (non-fatal): {e}")
+
 # ---------------------------------------------------------------------------
 # Setup & Logging
 # ---------------------------------------------------------------------------
@@ -44,7 +63,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("winbrow-server")
 
-app = FastAPI(title="WinBrow — Hands-free Windows & Browser Control", version="2.0.0")
+# Load OPENROUTER_API_KEY etc. from .env (if present) before anything reads env
+_load_env_file()
+
+app = FastAPI(title="WinBrow — Hands-free Windows & Browser Control", version="3.0.0")
 
 # Global Agent Instance
 agent = WinBrowAgent()
@@ -71,29 +93,41 @@ _ws_clients: list[WebSocket] = []
 
 @app.on_event("startup")
 async def _startup() -> None:
-    """Download models and start LLM server on startup."""
+    """Download models and warm executors on startup.
+
+    The cloud-first v3 brain needs no local LLM: llama.cpp/Qwen only starts
+    when WINBROW_LOCAL_LLM=1 (offline mode).
+    """
     global llm_instance
-    
+
     log.info("Starting WinBrow server...")
-    
-    # 1. Ensure models are downloaded
+
+    # 1. Ensure STT models are downloaded (whisper). Skip LLM models in cloud mode.
     try:
         log.info("Checking/downloading required models...")
         await asyncio.get_event_loop().run_in_executor(None, ensure_all_models)
         log.info("Models ready")
     except Exception as e:
         log.warning(f"Model download failed (will retry on first use): {e}")
-    
-    # 2. Start llama.cpp server with Qwen model
-    try:
-        log.info("Starting local LLM server...")
-        llm_instance = QwenLLM()
-        await llm_instance.start()
-        log.info(f"LLM server ready at {llm_instance.base_url}")
-    except Exception as e:
-        log.warning(f"LLM server failed to start (will retry on first use): {e}")
-        llm_instance = None
-    
+
+    # 2. Optional local LLM (offline mode only)
+    if os.environ.get("WINBROW_LOCAL_LLM", "") == "1":
+        try:
+            log.info("Starting local LLM server (offline mode)...")
+            llm_instance = QwenLLM()
+            await llm_instance.start()
+            log.info(f"LLM server ready at {llm_instance.base_url}")
+        except Exception as e:
+            log.warning(f"LLM server failed to start (will retry on first use): {e}")
+            llm_instance = None
+    else:
+        if agent.gateway.available:
+            prov = agent.gateway.providers[0]
+            log.info(f"Brain online: {prov.name} / {prov.model}")
+        else:
+            log.warning("Brain offline: set OPENROUTER_API_KEY for full intelligence "
+                        "(generator tier + heuristics still work).")
+
     # 3. Warm up PowerShell
     try:
         await run_powershell("Write-Output warm", timeout=60)
@@ -121,6 +155,7 @@ class ExecuteRequest(BaseModel):
     api_key: Optional[str] = None
     endpoint: Optional[str] = None
     project_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class SettingsRequest(BaseModel):
@@ -158,7 +193,7 @@ async def index():
 
 @app.post("/api/execute")
 async def execute_command(req: ExecuteRequest):
-    """Execute a desktop or browser task through the Laya routing engine."""
+    """Execute a desktop or browser task through the routing engine + brain."""
     cmd = req.command.strip()
     if not cmd:
         return JSONResponse({"error": "Empty command"}, status_code=400)
@@ -168,12 +203,18 @@ async def execute_command(req: ExecuteRequest):
     endpoint = req.endpoint or runtime_settings["endpoint"]
     project_id = req.project_id or runtime_settings["project_id"]
 
+    async def _emit(event: dict) -> None:
+        """Stream brain plan/step events to WebSocket clients."""
+        await _broadcast(event)
+
     result = await agent.execute(
         cmd,
         api_key=api_key if api_key else None,
         provider=provider,
         custom_endpoint=endpoint if endpoint else None,
         project_id=project_id if project_id else None,
+        emit=_emit,
+        session_id=req.session_id or "default",
     )
 
     # Broadcast to all WebSocket clients (send both types for compatibility)
@@ -193,15 +234,17 @@ async def get_context():
 
 @app.get("/api/system")
 async def system_info():
-    """System info: context + server version + Laya router status."""
+    """System info: context + server version + Laya router + brain status."""
     loop = asyncio.get_event_loop()
     ctx = await loop.run_in_executor(None, agent.get_context)
     return JSONResponse({
         "context": ctx.to_dict(),
-        "version": "2.0.0",
+        "version": "3.0.0",
         "laya_loaded": agent.router._loaded,
         "tool_count": len(agent.registry.all_tools()),
         "history_count": len(agent.history),
+        "brain": agent.gateway.status(),
+        "session_summary": agent.session.summary(),
     })
 
 
@@ -237,13 +280,86 @@ async def get_history():
     return JSONResponse(agent.history[-50:])
 
 
+# ---------------------------------------------------------------------------
+# Session & memory endpoints (v3)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/session")
+async def get_session_state():
+    """Current conversation: turns + resolved entities."""
+    s = agent.session
+    return JSONResponse({
+        "session_id": s.session_id,
+        "summary": s.summary(),
+        "turns": [t.to_dict() for t in s.turns],
+        "entities": {k: [e.to_dict() for e in v] for k, v in s.entities.items()},
+    })
+
+
+class SessionRequest(BaseModel):
+    session_id: Optional[str] = None
+
+
+@app.post("/api/session/reset")
+async def reset_session(req: SessionRequest):
+    """Clear working memory (start a fresh conversation)."""
+    if req.session_id and req.session_id != "default":
+        from winbrow.memory import get_session
+        get_session(req.session_id).reset()
+    else:
+        agent.session.reset()
+    return JSONResponse({"status": "reset"})
+
+
+@app.get("/api/memories")
+async def get_memories(q: Optional[str] = None, limit: int = 20):
+    """Search episodic memory ('what did I do yesterday?') or list recent."""
+    if q:
+        hits = agent.store.search_episodic(q, limit=min(limit, 50))
+    else:
+        hits = agent.store.get_recent(limit=min(limit, 50))
+    return JSONResponse({
+        "query": q,
+        "results": [
+            {
+                "kind": h.kind,
+                "label": h.label,
+                "path": h.path,
+                "app": h.app,
+                "ts": h.timestamp,
+                "metadata": h.metadata,
+            }
+            for h in hits
+        ],
+    })
+
+
+class MemoryRequest(BaseModel):
+    fact: str
+
+
+@app.post("/api/memories/fact")
+async def add_fact(req: MemoryRequest):
+    """Manually teach the agent a fact ('remember my exports folder is X')."""
+    fact = req.fact.strip()
+    if not fact:
+        return JSONResponse({"error": "Empty fact"}, status_code=400)
+    agent.store.add_fact(fact)
+    return JSONResponse({"status": "saved", "fact": fact})
+
+
 @app.post("/api/settings")
 async def save_settings(req: SettingsRequest):
-    """Update runtime LLM settings."""
+    """Update runtime LLM settings. provider='openrouter' + api_key wires the brain."""
     runtime_settings["provider"] = req.provider
     runtime_settings["api_key"] = req.api_key
     runtime_settings["endpoint"] = req.endpoint
     runtime_settings["project_id"] = req.project_id
+    if req.provider == "openrouter" and req.api_key:
+        os.environ["OPENROUTER_API_KEY"] = req.api_key
+        from winbrow.brain import reset_gateway
+        reset_gateway()
+        agent.rebuild_gateway()
     return JSONResponse({"status": "saved", "settings": {
         "provider": req.provider,
         "has_api_key": bool(req.api_key),
@@ -369,6 +485,8 @@ async def websocket_endpoint(ws: WebSocket):
                         provider=runtime_settings.get("provider", "auto"),
                         custom_endpoint=runtime_settings.get("endpoint") or None,
                         project_id=runtime_settings.get("project_id") or None,
+                        session_id=str(msg.get("session_id") or "default"),
+                        emit=lambda ev: ws.send_json(ev),
                     )
                     await ws.send_json({"type": "result", "data": res})
 

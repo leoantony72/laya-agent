@@ -22,8 +22,12 @@ import time
 from typing import Any, Optional
 
 from .browser_task import BrowserController
+from .brain import AgentBrain, GatewayUnavailable, ModelGateway
+from .brain.agent_loop import _ctx_block
+from .brain.prompts import build_chat_messages
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
+from .memory import MemoryStore, SessionMemory, get_session, get_store
 from .registry import Tool, ToolRegistry
 from .resolvers import resolve_file, resolve_folder
 from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter, _strip_conversational_prefix, autocorrect_utterance, _tokens, _fuzzy_in, _SEARCH_VERBS, _WEB_LOCS, _LOCAL_FIND, _LAUNCH_APPS, _COMMON_APPS
@@ -161,17 +165,128 @@ def _is_known_task(utterance: str) -> bool:
 class WinBrowAgent:
     """The central orchestrator for Windows and Browser control."""
 
-    def __init__(self):
-        self.registry = ToolRegistry()
+    def __init__(
+        self,
+        gateway: Optional[ModelGateway] = None,
+        registry: Optional[ToolRegistry] = None,
+        session: Optional[SessionMemory] = None,
+        store: Optional[MemoryStore] = None,
+    ):
+        self.registry = registry or ToolRegistry()
         self.router = WinBrowRouter(self.registry)
         self.generator = ScriptGenerator(self.registry)
         self.browser = BrowserController()
-        self.memory = ContextMemory()
+        self.memory = ContextMemory()          # legacy 3-slot memory (fast-path refs)
         self.history: list[dict[str, Any]] = []
+        # --- v3: session working memory + episodic store + brain ---
+        self.store = store or get_store()
+        self.session = session or get_session()
+        self.gateway = gateway or ModelGateway()
+        self.brain = AgentBrain(
+            gateway=self.gateway,
+            registry=self.registry,
+            store=self.store,
+            executor=self.run_skill,
+        )
 
     def get_context(self) -> WindowsContext:
         """Capture live Windows environment context."""
         return get_current_windows_context()
+
+    def rebuild_gateway(self) -> None:
+        """Rebuild the model gateway + brain (after env/settings change)."""
+        from .brain import reset_gateway
+        reset_gateway()
+        self.gateway = ModelGateway()
+        self.brain = AgentBrain(
+            gateway=self.gateway,
+            registry=self.registry,
+            store=self.store,
+            executor=self.run_skill,
+        )
+
+    # ------------------------------------------------------------------ shared skill executor
+    async def run_skill(self, tool_name: str, args: dict[str, str]) -> dict[str, Any]:
+        """Execute one registry tool by name — the single dispatch point shared
+        by the fast-path and the brain (volume bypass, browser tools, templates)."""
+        tool = self.registry.get(tool_name)
+        if tool is None:
+            return {"success": False, "output": f"Unknown tool '{tool_name}'"}
+        if tool_name == "volume_set_level":
+            level_arg = str(args.get("level", "50"))
+            out_msg = set_windows_volume(level_arg)
+            return {
+                "type": "tool_execution",
+                "tool": tool_name,
+                "script": f"set_windows_volume({level_arg})",
+                "success": "set to" in out_msg.lower(),
+                "output": out_msg,
+                "elapsed_ms": 1.0,
+            }
+        if tool_name in ("laya_ultrafast_browser", "web_search"):
+            goal = str(args.get("goal") or args.get("query") or "")
+            out = await self.browser.run_ultrafast_task(goal)
+            return {
+                "type": "browser",
+                "tool": "laya_ultrafast_browser",
+                "success": out.get("success", True),
+                "output": out.get("final_answer") or str(out.get("steps", [])),
+                "steps": out.get("steps", []),
+                "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+                "method": out.get("method", "laya_ultrafast"),
+            }
+        rendered = tool.render_script(args)
+        exec_out = await run_powershell(rendered)
+        return {
+            "type": "tool_execution",
+            "tool": tool_name,
+            "is_learned": tool.is_learned,
+            "script": rendered,
+            "success": exec_out.get("success", False),
+            "output": exec_out.get("stdout") or exec_out.get("stderr") or "Done",
+            "elapsed_ms": exec_out.get("elapsed_ms", 0),
+        }
+
+    # ------------------------------------------------------------------ brain helpers
+    async def brain_chat(self, utterance: str, ctx: WindowsContext, session: SessionMemory) -> str:
+        """Conversational answer via the gateway, grounded in session + episodic memory."""
+        messages = build_chat_messages(utterance, _ctx_block(ctx), session.context_block())
+        resp = await self.gateway.chat(messages, temperature=0.5, max_tokens=300)
+        return resp.content.strip() or "Nothing to say."
+
+    async def _generator_fallback(
+        self, utterance: str, ctx: WindowsContext,
+        api_key: Optional[str], provider: str,
+        custom_endpoint: Optional[str], project_id: Optional[str],
+    ) -> dict[str, Any]:
+        """Dynamic PowerShell generation tier (pre-v3 fallback when no brain)."""
+        gen_out = await self.generator.generate_and_execute(
+            utterance, ctx,
+            api_key=api_key, provider=provider,
+            custom_endpoint=custom_endpoint, project_id=project_id,
+        )
+        return {
+            "type": "generated_tool",
+            "tool": gen_out.get("tool").name if gen_out.get("tool") else "custom_action",
+            "is_learned": True,
+            "script": gen_out.get("rendered_script", ""),
+            "success": gen_out.get("success", False),
+            "output": gen_out.get("stdout") or gen_out.get("stderr") or gen_out.get("reason", "Executed"),
+            "elapsed_ms": gen_out.get("elapsed_ms", 0),
+        }
+
+    def _canned_chat(self) -> dict[str, Any]:
+        return {
+            "type": "chat",
+            "output": (
+                "I'm WinBrow, your desktop and browser control agent. "
+                "I can control Windows (volume, dark mode, app launch, window management, settings, "
+                "desktop cleanup, clipboard), drive Chrome/Edge (tab management, navigation, JS execution, "
+                "screenshots, page reading), and plan multi-step tasks. Set OPENROUTER_API_KEY to unlock "
+                "full conversational intelligence."
+            ),
+            "success": True,
+        }
 
     def _record_open_result(self, tool_name: str | None, args: dict[str, str], success: bool) -> None:
         """Record successful opens into context memory (for "that file" follow-ups).
@@ -381,16 +496,20 @@ class WinBrowAgent:
         provider: str = "auto",
         custom_endpoint: Optional[str] = None,
         project_id: Optional[str] = None,
+        *,
+        emit: Optional[Any] = None,
+        session_id: str = "default",
     ) -> dict[str, Any]:
         """
         Process user command end-to-end:
         1. Capture live Windows context
         2. Check for browser intent fast-path
         3. Route with Laya decision engine (~200ms)
-        4. Execute or trigger generator tier
-        5. Return structured trace
+        4. Execute or trigger brain / generator tier
+        5. Record turn in session + episodic memory; return structured trace
         """
         t0 = time.perf_counter()
+        session = self.session if session_id == "default" else get_session(session_id)
         # Context capture does process enumeration + COM reads (15-600ms);
         # keep it off the event loop so routing/execution stay responsive.
         loop = asyncio.get_event_loop()
@@ -443,6 +562,8 @@ class WinBrowAgent:
             self.history.append(result)
             if len(self.history) > 100:
                 self.history = self.history[-100:]
+            session.record_turn(utterance, result["route"], result["execution"])
+            self.store.record_command(utterance, result["route"], result["execution"], total_ms)
             return result
 
         # 1. Laya Routing (context memory lets "that file" resolve)
@@ -518,10 +639,31 @@ class WinBrowAgent:
             result["route"]["kind"] = "browser"
 
         elif route.kind == NEW_ACTION:
+            # Brain first (context-aware multi-step + follow-ups). Falls back to
+            # the generator tier when no LLM provider is configured.
+            if self.gateway.available:
+                try:
+                    contextualized, resolutions = session.resolve_references(utterance)
+                    if resolutions:
+                        log.info(f"Session resolved references: {resolutions}")
+                    brain_res = await self.brain.handle(
+                        contextualized, ctx, session, emit=emit,
+                    )
+                    result["execution"] = brain_res.to_dict()
+                    if resolutions:
+                        result["session_resolutions"] = resolutions
+                except GatewayUnavailable:
+                    result["execution"] = await self._generator_fallback(
+                        utterance, ctx, api_key, provider, custom_endpoint, project_id,
+                    )
+                except Exception as e:
+                    log.warning(f"Brain failed ({e}); trying generator tier.")
+                    result["execution"] = await self._generator_fallback(
+                        utterance, ctx, api_key, provider, custom_endpoint, project_id,
+                    )
             # If this looks like a known task (search, open, volume, etc.) that should
             # have been caught by heuristic routing, don't call the generator.
-            # The generator is for novel PowerShell tasks, not common built-in actions.
-            if _is_known_task(utterance):
+            elif _is_known_task(utterance):
                 result["execution"] = {
                     "type": "error",
                     "success": False,
@@ -533,43 +675,25 @@ class WinBrowAgent:
                     "elapsed_ms": 0,
                 }
                 result["route"]["tier"] = "heuristic-miss"
-            # Try browser dispatch first if heuristic suggests it
-            elif browser_fast and not is_search:
-                browser_out = await self._dispatch_browser(utterance)
-                result["execution"] = browser_out
-                result["route"]["kind"] = "browser"
             else:
-                # Trigger dynamic script generation tier
-                gen_out = await self.generator.generate_and_execute(
-                    utterance,
-                    ctx,
-                    api_key=api_key,
-                    provider=provider,
-                    custom_endpoint=custom_endpoint,
-                    project_id=project_id,
+                result["execution"] = await self._generator_fallback(
+                    utterance, ctx, api_key, provider, custom_endpoint, project_id,
                 )
-                result["execution"] = {
-                    "type": "generated_tool",
-                    "tool": gen_out.get("tool").name if gen_out.get("tool") else "custom_action",
-                    "is_learned": True,
-                    "script": gen_out.get("rendered_script", ""),
-                    "success": gen_out.get("success", False),
-                    "output": gen_out.get("stdout") or gen_out.get("stderr") or gen_out.get("reason", "Executed"),
-                    "elapsed_ms": gen_out.get("elapsed_ms", 0),
-                }
 
         elif route.kind == CHAT:
-            result["execution"] = {
-                "type": "chat",
-                "output": (
-                    "I'm WinBrow, your desktop and browser control agent. "
-                    "I can control Windows (volume, dark mode, app launch, window management, settings, "
-                    "desktop cleanup, clipboard), drive Chrome/Edge (tab management, navigation, JS execution, "
-                    "screenshots, page reading), and generate new PowerShell tools on the fly for anything else. "
-                    "Just say what you need!"
-                ),
-                "success": True,
-            }
+            if self.gateway.available:
+                try:
+                    answer = await self.brain_chat(utterance, ctx, session)
+                    result["execution"] = {
+                        "type": "chat",
+                        "output": answer,
+                        "success": True,
+                    }
+                except Exception as e:
+                    log.warning(f"Brain chat failed ({e}); canned reply.")
+                    result["execution"] = self._canned_chat()
+            else:
+                result["execution"] = self._canned_chat()
 
         elif route.kind == STOP:
             result["execution"] = {
@@ -592,6 +716,13 @@ class WinBrowAgent:
                 route.tool.name, route.args,
                 result.get("execution", {}).get("success"),
             )
+
+        # v3: record the turn in session working memory + episodic store.
+        try:
+            session.record_turn(utterance, result["route"], result.get("execution", {}))
+            self.store.record_command(utterance, result["route"], result.get("execution", {}), total_ms)
+        except Exception as e:
+            log.debug(f"Memory recording failed (non-fatal): {e}")
 
         # M0 instrumentation: persistent JSONL trace (never breaks execution)
         try:

@@ -7,3 +7,8 @@ psutil
 Pillow
 jinja2
 python-multipart
+# Optional but recommended (search/vector memory, UIA, voice, skills)
+chromadb
+comtypes
+sounddevice
+pyyaml
