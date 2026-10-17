@@ -4,36 +4,6 @@
   "last_app": null,
   "history": [
     {
-      "ts": 1791135513.3292508,
-      "kind": "folder",
-      "path": "C:\\Users\\USER\\Downloads",
-      "label": "downloads"
-    },
-    {
-      "ts": 1791135543.9040215,
-      "kind": "file",
-      "path": "C:\\Users\\USER\\Downloads\\images.jpg",
-      "label": "images.jpg"
-    },
-    {
-      "ts": 1791136455.7541842,
-      "kind": "folder",
-      "path": "C:\\Users\\USER\\Downloads",
-      "label": "downloads"
-    },
-    {
-      "ts": 1791136483.8139095,
-      "kind": "folder",
-      "path": "C:\\Users\\USER\\Documents",
-      "label": "documents"
-    },
-    {
-      "ts": 1791525318.6331253,
-      "kind": "folder",
-      "path": "C:\\Users\\sayuj\\Downloads",
-      "label": "downloads"
-    },
-    {
       "ts": 1791527077.706624,
       "kind": "folder",
       "path": "C:\\Users\\sayuj\\Downloads",
@@ -113,6 +83,42 @@
     },
     {
       "ts": 1791718627.2218502,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1792218509.3636909,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1792219116.8335326,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1792219326.8661997,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1792219603.246566,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1792219785.4567866,
+      "kind": "folder",
+      "path": "C:\\Users\\USER\\Downloads",
+      "label": "downloads"
+    },
+    {
+      "ts": 1792220456.307191,
       "kind": "folder",
       "path": "C:\\Users\\USER\\Downloads",
       "label": "downloads"

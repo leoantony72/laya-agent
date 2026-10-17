@@ -69,9 +69,12 @@ class ScriptGenerator:
         provider: str = "auto",  # "auto" | "ollama" | "lmstudio" | "openai" | "gemini"
         custom_endpoint: Optional[str] = None,
         project_id: Optional[str] = None,
+        tiered: bool = False,
     ) -> dict[str, Any]:
         """
         Generate a new tool using LLM, validate, execute, and persist.
+        tiered=True (v3/M3): run the rendered script through the tiered
+        permission gate (policy.script_tier) BEFORE any execution.
         """
         log.info(f"Generating new tool for: '{utterance}'")
 
@@ -119,6 +122,36 @@ class ScriptGenerator:
             render_args[a.name] = a.default or ""
         rendered_script = tool.render_script(render_args)
 
+        # 4b. v3/M3 tiered gate — generated content is never below T2, and
+        # system-class content is T3 (confirmed EVERY time, never remembered).
+        if tiered:
+            from .permissions import get_permissions
+            perm = get_permissions()
+            allowed, deny_reason, pending = await perm.gate(
+                "generated_script", {"goal": utterance[:200]},
+                utterance=utterance, session_id="default",
+                script=rendered_script,
+            )
+            if not allowed:
+                if pending is not None:
+                    log.info(f"Generated script tier {pending['tier']} pending approval: {pending['confirmation_id']}")
+                    return {
+                        "success": False,
+                        "tool": tool,
+                        "rendered_script": rendered_script,
+                        "permission": pending,
+                        "reason": (
+                            f"Approval needed (tier '{pending['tier']}'). "
+                            f"confirmation_id={pending['confirmation_id']}"
+                        ),
+                    }
+                return {
+                    "success": False,
+                    "tool": None,
+                    "rendered_script": rendered_script,
+                    "reason": f"Action denied: {deny_reason or 'blocked by policy'}",
+                }
+
         # 5. Execute the script
         exec_result = await run_powershell(rendered_script, timeout=30)
 
@@ -153,6 +186,23 @@ class ScriptGenerator:
             "stderr": exec_result.get("stderr", ""),
             "elapsed_ms": exec_result.get("elapsed_ms", 0),
         }
+
+    async def generate_tiered(
+        self,
+        utterance: str,
+        ctx: WindowsContext,
+        api_key: Optional[str] = None,
+        provider: str = "auto",
+        custom_endpoint: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """M3 wrapper: generate + tiered permission gate + execute."""
+        return await self.generate_and_execute(
+            utterance, ctx,
+            api_key=api_key, provider=provider,
+            custom_endpoint=custom_endpoint, project_id=project_id,
+            tiered=True,
+        )
 
     async def _call_llm(
         self,

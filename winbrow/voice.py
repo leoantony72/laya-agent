@@ -1,328 +1,424 @@
 """
-Voice Ingestion Pipeline
-========================
-Complete voice pipeline: Audio Recording -> STT -> Intent Parsing -> Execution
+Voice pipeline v3 (M4) — VAD-gated hands-free loop
+===================================================
+Architecture (UPGRADE_PLAN §12.2):
+
+    mic frames (16k mono int16)
+      │
+      ▼
+    [VAD gate] silero ONNX (or energy fallback) — standby CPU ~2–5%
+      │ only speech frames advance
+      ▼
+    [entry] wake-word phrase in stream  |  push-to-talk hotkey  |  file input
+      │
+      ▼
+    [utterance capture] VAD end-of-speech (0.8s trailing silence), ≤30s
+      │
+      ▼
+    [whisper.cpp / cloud STT] prompt primed from memory (recent files, apps,
+      last session entities)  → proper nouns transcribe correctly
+      │
+      ├─ optional cloud STT (WINBROW_CLOUD_STT=1, Groq/openai whisper)
+      ▼
+    { text, confidence } → agent.execute() — same path as typed input
+      │
+      ▼
+    [TTS — Windows SAPI] spoken result; spoken confirmations for T2/T3
+      permission gates (say "confirm" / "cancel").
+
+Stage latencies (vad/wake/stt/execute/tts/confirm) are traced via trace.stage_event
+under a shared command_id.
+
+Entry points:
+  • python -m winbrow.voice            — default: push-to-talk (F9) or VAD+wake env
+  • WINBROW_VOICE_MODE=vad|ptt|file    — mode selection
+  • Headless/test: VoiceLoop(...).process_text("...") directly
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
-from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Callable, Dict, Optional
+import wave
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
 
-from .stt import AudioRecorder, transcribe_audio_file, TranscriptionResult
-from .llm import QwenLLM, FakeLLM, get_llm
+from . import tts
 from .agent import WinBrowAgent
-from .memory import SemanticMemory, get_memory
-from .router import WinBrowRouter, Route, CHAT, NEW_ACTION, STOP
-from .windows import WindowsContext, get_current_windows_context
+from .memory import get_session, get_store
+from .stt import AudioRecorder, TranscriptionResult, transcribe_best
+from .trace import new_command_id, stage_event
+from .vad import VADGate, ensure_silero_model
+from .windows import get_current_windows_context
 
 log = logging.getLogger("winbrow.voice")
 
+WAKE_PHRASES = ("hey winbrow", "hey win brow", "hey winbro")
 
-@dataclass
-class VoiceCommand:
-    """Result of voice command processing."""
-    transcription: TranscriptionResult
-    intent: Dict[str, Any]
-    route: Optional[Any] = None
-    execution_result: Optional[Dict] = None
-    total_latency_ms: float = 0
-    success: bool = False
-    error: Optional[str] = None
+# End-of-speech / bounds
+EOS_SILENCE_S = 0.8
+MAX_UTTERANCE_S = 30.0
+PRE_ROLL_S = 1.2               # audio kept before speech start (for fast starters)
+
+# Push-to-talk default: F9
+PTT_KEY_DEFAULT = 0x78
 
 
-class VoiceAgent:
-    """Complete voice-controlled agent pipeline."""
-    
+def build_prime_prompt(session: Any = None, store: Any = None,
+                       ctx: Any = None) -> str:
+    """Whisper decoder prompt from working memory: recent files, apps, entities.
+
+    Prime list is rebuilt per utterance — the single highest-leverage fix for
+    "it doesn't understand file names".
+    """
+    bits: list[str] = []
+    try:
+        d = ctx.to_dict() if hasattr(ctx, "to_dict") else (ctx or {})
+        apps = (d.get("running_apps") or [])[:8]
+        if apps:
+            bits.append("Apps: " + ", ".join(apps))
+    except Exception:
+        pass
+    try:
+        if store is not None:
+            bits.extend("File: " + m.label for m in store.get_recent_files(6))
+    except Exception:
+        pass
+    try:
+        if session is not None:
+            ents: list[str] = []
+            for vals in getattr(session, "entities", {}).values():
+                ents.extend(getattr(e, "value", str(e)) for e in vals[-3:])
+            if ents:
+                bits.append("Names: " + ", ".join(ents[:8]))
+    except Exception:
+        pass
+    return "Possible words: " + "; ".join(bits) if bits else ""
+
+
+class VoiceLoop:
+    """The orchestrator: mic frames → VAD → STT → agent → TTS.
+
+    All external touches are injectable for headless tests:
+      mic             — iterable/async-iterable of (bytes_pcm16, dt) frames
+      transcriber     — async fn(path, initial_prompt) -> TranscriptionResult
+      agent           — WinBrowAgent with .execute(text)
+      key_state       — async fn() -> bool (push-to-talk key down?)
+      confirm_fn      — async fn(description: dict) -> bool (voice confirm)
+    """
+
     def __init__(
         self,
-        stt_model: str = "whisper",
-        llm_model: str = "qwen",
-        use_fake_llm: bool = False,
-        wake_word: str = "hey winbrow",
-        silence_threshold: float = 1.5,  # seconds of silence to stop recording
-        max_recording_time: float = 30.0,
+        agent: Optional[WinBrowAgent] = None,
+        mode: Optional[str] = None,
+        mic: Optional[Any] = None,
+        transcriber: Optional[Callable] = None,
+        key_state: Optional[Callable] = None,
+        vad: Optional[VADGate] = None,
+        speak_fn: Optional[Callable] = None,
+        session_id: str = "default",
     ):
-        self.wake_word = wake_word.lower()
-        self.silence_threshold = silence_threshold
-        self.max_recording_time = max_recording_time
-        self.use_fake_llm = use_fake_llm
-        
-        # Initialize components
-        self.stt = None  # Will be initialized on first use
-        self.llm = None
-        self.agent = WinBrowAgent()
-        self.memory = get_memory()
-        self.router = WinBrowRouter.from_registry  # We'll initialize properly
-        
-        self._listening = False
-        self._wake_word_detected = False
-        
-    async def initialize(self) -> None:
-        """Initialize all components."""
-        # Initialize STT
-        from .model_manager import get_model_path
-        from .stt import WhisperSTT
-        self.stt = WhisperSTT(language="en")
-        
-        # Initialize LLM
-        self.llm = await get_llm(use_fake=False)
-        
-        # Initialize agent's router with registry
-        self.agent.router = WinBrowRouter(self.agent.registry)
-        
-        log.info("Voice agent initialized")
-    
-    async def listen_for_wake_word(self, callback: Callable[[str], None]) -> None:
-        """Continuously listen for wake word."""
-        self._listening = True
-        recorder = AudioRecorder()
-        
-        log.info(f"Listening for wake word: '{self.wake_word}'")
-        
-        while self._listening:
-            # Record short chunk for wake word detection
-            recorder.start()
-            await asyncio.sleep(1.0)  # 1 second chunks
-            audio_path = recorder.stop()
-            
-            try:
-                result = await transcribe_audio_file(audio_path)
-                os.unlink(audio_path)
-                
-                text = result.text.lower()
-                if self.wake_word in text:
-                    # Extract command after wake word
-                    command = text.split(self.wake_word, 1)[-1].strip()
-                    if command:
-                        log.info(f"Wake word detected: '{command}'")
-                        await callback(command)
-                    else:
-                        log.info("Wake word detected, waiting for command...")
-                        # Listen for follow-up command
-                        await self.listen_for_command(callback)
-            except Exception as e:
-                log.error(f"Wake word detection error: {e}")
-            finally:
-                try:
-                    os.unlink(audio_path)
-                except:
-                    pass
-    
-    async def listen_for_command(self, callback: Callable[[str], None], timeout: float = 10.0) -> None:
-        """Listen for a command after wake word."""
-        recorder = AudioRecorder()
-        recorder.start()
-        
-        start_time = time.time()
-        last_speech_time = time.time()
-        
-        while time.time() - start_time < timeout:
-            await asyncio.sleep(0.5)
-            
-            # Check for silence
-            if time.time() - last_speech_time > self.silence_threshold:
-                break
-            
-            if time.time() - start_time > self.max_recording_time:
-                break
-        
-        audio_path = recorder.stop()
+        self.mode = mode or os.environ.get("WINBROW_VOICE_MODE", "ptt").lower()
+        self.agent = agent or WinBrowAgent()
+        self.mic = mic                      # None = real AudioRecorder
+        self.transcriber = transcriber
+        self.vad = vad or VADGate()
+        self.speak_fn = speak_fn or tts.speak_result
+        self.key_state = key_state
+        self.session_id = session_id
+        self._wake_ready = False            # wake word spoken since last command?
+        self.last_stages: list[dict] = []   # per-utterance stage report (tests/observability)
+
+    # ------------------------------------------------------------------ helpers
+    def _stages_reset(self) -> None:
+        self.last_stages = []
+
+    def _stage(self, cid: str, name: str, t0: float, **meta) -> float:
+        ms = (time.perf_counter() - t0) * 1000
+        stage_event(cid, name, ms, meta or None)
+        self.last_stages.append({"stage": name, "elapsed_ms": round(ms, 1), **meta})
+        return ms
+
+    async def _transcribe(self, path: Path, prime: str) -> TranscriptionResult:
+        t0 = time.perf_counter()
+
+        async def _run() -> TranscriptionResult:
+            if self.transcriber is not None:
+                res = self.transcriber(path, initial_prompt=prime)
+                if hasattr(res, "__await__"):
+                    res = await res
+                return res
+            return await transcribe_best(path, initial_prompt=prime)
+
         try:
-            result = await transcribe_audio_file(audio_path)
-            if result.text.strip():
-                await callback(result.text)
+            res = await _run()
+        except Exception as e:
+            log.error(f"STT failed: {e}")
+            res = TranscriptionResult(text="", language="en", duration_ms=0.0, segments=[])
+        finally:
+            _ms = (time.perf_counter() - t0) * 1000
+        self.last_stages.append({"stage": "stt", "elapsed_ms": round(_ms, 1)})
+        return res
+
+    def _save_wav(self, frames: list[bytes]) -> Path:
+        import tempfile
+        fd = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        fd.close()
+        with wave.open(fd.name, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(b"".join(frames))
+        return Path(fd.name)
+
+    @staticmethod
+    def strip_wake(text: str) -> str:
+        """Remove the wake phrase + a leading pause marker if present."""
+        low = (text or "").strip().lower()
+        for w in WAKE_PHRASES:
+            if w in low:
+                low = low.split(w, 1)[1].strip(" ,.!?")
+                return low.strip()
+        return low
+
+    # ------------------------------------------------------------------ confirm hook
+    async def voice_confirm(self, desc: dict) -> bool:
+        """Spoken confirmation for T2/T3 actions: say the ask, listen for
+        'confirm/yes' vs 'cancel/stop'. Wired via permissions.set_confirm_fn."""
+        from .trace import stage_event as _st
+        cid = new_command_id()
+        t0 = time.perf_counter()
+        tool = str(desc.get("tool") or "action")
+        ask = (f"Approval needed: {tool.replace('_', ' ')}. "
+               f"Say confirm to allow, or cancel.")
+        tts.speak(ask)
+        path = await self._capture(5.0)
+        if path is None:
+            _st(cid, "confirm", (time.perf_counter() - t0) * 1000,
+                {"ok": False, "mode": "no-input"})
+            return False
+        try:
+            res = await self._transcribe(path, prime="")
+            answer = res.text.lower()
         finally:
             try:
-                os.unlink(audio_path)
-            except:
+                os.unlink(path)
+            except OSError:
                 pass
-    
-    async def process_voice_command(self, utterance: str) -> VoiceCommand:
-        """Process a voice command through the full pipeline."""
-        t0 = time.perf_counter()
-        
-        # Get context
-        ctx = await asyncio.get_event_loop().run_in_executor(
-            None, get_current_windows_context
-        )
-        
-        # Get memory context
-        memory = get_memory()
-        context_summary = self.agent.memory.get_context_summary()
-        
-        # Parse intent with LLM
-        llm = await get_llm(use_fake=False)
-        intent = await self.llm.extract_intent(
-            utterance=utterance,
-            context=context_summary,
-            available_tools=[t.name for t in self.agent.registry.all_tools()]
-        )
-        
-        # Route through router (which now includes LLM tier)
-        from .router import WinBrowRouter
-        from .registry import ToolRegistry
-        from .windows import WindowsContext
-        
-        router = WinBrowRouter(ToolRegistry())
-        ctx = get_current_windows_context()
-        
-        # Create memory instance for this session
-        memory = get_memory()
-        
-        route = await router.route(utterance, ctx, memory=ContextMemory())
-        
-        # Execute
-        result = await self.agent.execute(
-            utterance,
-            provider="auto",
-            api_key=None,
-            custom_endpoint=None,
-        )
-        
-        total_ms = (time.perf_counter() - t0) * 1000
-        
-        return VoiceCommand(
-            transcription=TranscriptionResult(
-                text=utterance,
-                language="en",
-                duration_ms=0,
-                segments=[],
-            ),
-            intent={"tool": "processed", "confidence": 1.0},
-            route=result.get("route"),
-            execution_result=result.get("execution"),
-            total_latency_ms=total_ms,
-            success=result.get("execution", {}).get("success", False),
-            error=result.get("execution", {}).get("output") if not result.get("execution", {}).get("success") else None,
-        )
-    
-    async def run_voice_loop(self) -> None:
-        """Main voice interaction loop."""
-        print(f"🎤 Voice agent ready. Say '{self.wake_word}' to activate.")
-        
-        async def handle_command(command: str):
-            print(f"🎯 Processing: {command}")
-            result = await self.process_voice_command(command)
-            
-            if result.success:
-                output = result.execution_result.get("output", "Done")
-                print(f"✅ {output[:200]}")
-            else:
-                print(f"❌ Error: {result.error}")
-        
-        try:
-            await self.listen_for_wake_word(handle_command)
-        except KeyboardInterrupt:
-            print("\n👋 Voice agent stopped")
-        except Exception as e:
-            log.error(f"Voice loop error: {e}")
+        allowed = any(w in answer for w in
+                      ("confirm", "approve", "yes", "allow", "do it"))
+        _st(cid, "confirm", (time.perf_counter() - t0) * 1000,
+            {"ok": allowed, "answer": answer[:60]})
+        if allowed:
+            tts.speak("Allowed.")
+            return True
+        tts.speak("Denied.")
+        return False
 
-
-class VoiceCommandHandler:
-    """High-level handler for voice commands with STT + LLM + Execution."""
-    
-    def __init__(self):
-        self.agent = WinBrowAgent()
-        self.memory = get_memory()
-        self.stt = None
-        self.llm = None
-        
-    async def initialize(self):
-        from .stt import WhisperSTT
-        from .model_manager import get_model_path
-        from .llm import get_llm
-        
-        self.stt = WhisperSTT(language="en")
-        self.llm = await get_llm()
-        
-    async def process_audio_file(self, audio_path: Path) -> dict:
-        """Process an audio file through the full pipeline."""
-        # 1. Transcribe
-        result = await transcribe_audio_file(audio_path)
-        
-        # 2. Parse intent
-        intent = await self.llm.extract_intent(
-            result.text,
-            context="",
-            available_tools=[t.name for t in WinBrowAgent().registry.all_tools()]
-        )
-        
-        # 3. Execute via agent
-        agent = WinBrowAgent()
-        ctx = get_current_windows_context()
-        route = await WinBrowRouter(agent.registry).route(result.text, ctx)
-        
-        agent = WinBrowAgent()
-        result = await agent.execute(result.text)
-        
-        return {
-            "transcription": result.text,
-            "intent": intent,
-            "route": route,
-            "execution": result.get("execution"),
-            "success": result.get("execution", {}).get("success", False),
-        }
-    
-    async def listen_and_execute(self, callback: Callable[[dict], None]) -> None:
-        """Continuous listen and execute loop."""
-        recorder = AudioRecorder()
-        
-        print("🎤 Listening... (Ctrl+C to stop)")
-        
-        while True:
+    async def _capture(self, seconds: float) -> Optional[Path]:
+        """Voice capture: injected mic (frames iter) or the real recorder."""
+        if self.mic is not None:
+            frames: list[bytes] = []
+            if isinstance(self.mic, (str, Path)):      # file mode: no live capture
+                return Path(self.mic)
+            start = time.perf_counter()
             try:
-                recorder.start()
-                await asyncio.sleep(5.0)  # 5 second chunks
-                audio_path = recorder.stop()
-                
-                result = await self.process_audio_file(audio_path)
-                os.unlink(audio_path)
-                
-                await callback(result)
-                
-            except KeyboardInterrupt:
-                break
+                async for chunk, _dt in self._iter_mic():
+                    frames.append(chunk)
+                    if time.perf_counter() - start >= seconds:
+                        break
+            except Exception:
+                return None
+            return self._save_wav(frames) if frames else None
+        rec = AudioRecorder()
+        try:
+            rec.start()
+            await asyncio.sleep(seconds)
+            return rec.stop()
+        except Exception as e:
+            log.warning(f"Confirm capture failed ({e})")
+            return None
+
+    async def _iter_mic(self) -> Iterable:
+        if hasattr(self.mic, "__aiter__"):
+            async for item in self.mic:
+                yield item
+        elif hasattr(self.mic, "__iter__"):
+            for item in self.mic:
+                yield item
+                await asyncio.sleep(0)
+        else:
+            return
+
+    # ------------------------------------------------------------------ core utterance
+    async def process_text(self, text: str, modality: str = "voice") -> dict:
+        """One utterance → agent → spoken reply. The single merged entry point."""
+        cid = new_command_id()
+        self._stages_reset()
+        t0 = time.perf_counter()
+        result = await self.agent.execute(text, session_id=self.session_id,
+                                          emit=None)
+        self._stage(cid, "execute", t0, modality=modality, type=result.get("execution", {}).get("type"))
+        exe = result.get("execution", {})
+        spoken = None
+        if modality == "voice":
+            t1 = time.perf_counter()
+            try:
+                spoken = self.speak_fn(exe)
             except Exception as e:
-                log.error(f"Voice loop error: {e}")
-                await asyncio.sleep(1)
+                log.debug(f"Speak failed (non-fatal): {e}")
+                spoken = None
+            self._stage(cid, "tts", t1, ok=bool(spoken))
+        result["voice"] = {"command_id": cid, "spoken": spoken,
+                           "stages": list(self.last_stages)}
+        return result
+
+    # ------------------------------------------------------------------ main loop
+    async def run(self) -> None:
+        """Continuous loop. vad = wake-word in stream; ptt = hold hotkey."""
+        from .permissions import get_permissions
+        get_permissions().set_confirm_fn(self.voice_confirm)   # spoken T2/T3 asks
+        ensure_silero_model()
+        if self.mode == "file":
+            if self.mic is None or not isinstance(self.mic, (str, Path)):
+                raise ValueError("file mode requires mic=Path to a wav file")
+            session = get_session(self.session_id)
+            store = get_store()
+            ctx = await asyncio.get_event_loop().run_in_executor(
+                None, get_current_windows_context)
+            res = await self._transcribe(Path(self.mic), build_prime_prompt(session, store, ctx))
+            await self.process_text(res.text or "")
+            return
+
+        if self.mode == "vad":
+            tts.speak("Voice mode on. Say 'hey winbrow' followed by a command.")
+            await self._run_vad_wake()
+            return
+
+        tts.speak("Push to talk ready. Hold F9 and speak.")
+        while True:
+            down = await self._key_down()
+            if not down:
+                await asyncio.sleep(0.05)
+                continue
+            await asyncio.sleep(1.2)   # let the user press + start speaking
+            path = await self._capture(MAX_UTTERANCE_S)
+            if path is None:
+                continue
+            prime = build_prime_prompt(get_session(self.session_id), get_store())
+            res = await self._transcribe(path, prime)
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            text = res.text.strip()
+            if not text:
+                continue
+            await self.process_text(text)
+
+    async def _run_vad_wake(self) -> None:
+        """VAD-gated wake word loop: transcribe ONLY while speech is present."""
+        speaking = False
+        silence_after = 0.0
+        utter_frames: list[bytes] = []
+        pre_roll: list[bytes] = []
+        async for chunk, dt in self._iter_mic():
+            if self.vad.feed(chunk):
+                if not speaking:
+                    speaking = True
+                    silence_after = 0.0
+                    utter_frames = list(pre_roll[-max(1, int(PRE_ROLL_S / max(dt, 0.05))):])
+                    stage_event(new_command_id(), "vad", 0,
+                                {"event": "speech_start", "speech": True})
+                utter_frames.append(chunk)
+                silence_after = 0.0
+            else:
+                if speaking:                    # inside an utterance
+                    utter_frames.append(chunk)
+                    silence_after += dt
+                    if silence_after >= EOS_SILENCE_S:
+                        speaking = False
+                        await self._on_utterance(utter_frames)
+                        utter_frames = []
+                else:
+                    pre_roll.append(chunk)
+                    if len(pre_roll) > int(3.0 / max(dt, 0.05)):
+                        pre_roll.pop(0)
+
+    async def _on_utterance(self, frames: list[bytes]) -> None:
+        path = self._save_wav(frames)
+        try:
+            session = get_session(self.session_id)
+            store = get_store()
+            ctx = await asyncio.get_event_loop().run_in_executor(
+                None, get_current_windows_context)
+            prime = build_prime_prompt(session, store, ctx)
+            res = await self._transcribe(path, prime)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        text = self.strip_wake(res.text)
+        if not text:
+            return
+        stage_event(new_command_id(), "wake", res.duration_ms,
+                    {"wake_matched": res.text.lower() != text, "text": text[:80]})
+        await self.process_text(text)
+
+    async def _key_down(self) -> bool:
+        """Push-to-talk key policy (injectable)."""
+        if self.key_state is not None:
+            res = self.key_state()
+            if hasattr(res, "__await__"):
+                res = await res
+            return bool(res)
+        # Real fallback: GetAsyncKeyState polls (Windows)
+        import ctypes
+        return bool(ctypes.windll.user32.GetAsyncKeyState(PTT_KEY_DEFAULT) & 0x8000)
 
 
-async def main():
-    """Main entry point for voice agent."""
+def _main() -> None:
+    """CLI: python -m winbrow.voice [--mode vad|ptt|file] [wav files...]"""
     import argparse
-    
-    parser = argparse.ArgumentParser(description="WinBrow Voice Agent")
-    parser.add_argument("--file", type=Path, help="Transcribe audio file")
-    parser.add_argument("--listen", action="store_true", help="Start voice listening loop")
-    parser.add_argument("--test", action="store_true", help="Run self-test")
-    args = parser.parse_args()
-    
-    handler = VoiceCommandHandler()
-    await handler.initialize()
-    
-    if args.file:
-        result = await handler.process_audio_file(args.file)
-        print(json.dumps(result, indent=2))
-    elif args.listen:
-        await handler.listen_and_execute(lambda r: print(f"Result: {r}"))
-    elif args.test:
-        # Run self-test
-        print("Running self-test...")
-        # Test STT
-        print("Testing STT...")
-        # Test LLM
-        print("Testing LLM...")
-        print("All tests passed!")
-    else:
-        parser.print_help()
+    from .agent import WinBrowAgent
+
+    ap = argparse.ArgumentParser(prog="winbrow.voice",
+                                 description="WinBrow voice loop (VAD wake, push-to-talk, or file e2e)")
+    ap.add_argument("--mode", default=os.environ.get("WINBROW_VOICE_MODE", "ptt"),
+                    choices=["vad", "ptt", "file"],
+                    help="vad: wake-gated mic; ptt: hold F9; file: process WAVs then exit")
+    ap.add_argument("--session", default="voice")
+    ap.add_argument("wavs", nargs="*", type=Path, help="WAV files (file mode)")
+    args = ap.parse_args()
+
+    if args.mode == "file" and not args.wavs:
+        ap.error("file mode needs at least one wav path")
+
+    agent = WinBrowAgent()
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    async def _process_files() -> None:
+        for wav in args.wavs:
+            vl = VoiceLoop(agent=agent, mode="file", mic=wav,
+                           session_id=args.session)
+            await vl.run()
+
+    try:
+        if args.mode == "file":
+            loop.run_until_complete(_process_files())
+        else:
+            vl = VoiceLoop(agent=agent, mode=args.mode,
+                           session_id=args.session)
+            loop.run_until_complete(vl.run())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
 
 
 if __name__ == "__main__":
-    import asyncio
-    import json
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    _main()

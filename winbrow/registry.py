@@ -43,6 +43,7 @@ class Tool:
     speak: str = "done"  # "done" | "result" | template
     examples: list[str] = field(default_factory=list)
     is_learned: bool = False
+    impl: Optional[str] = None  # Python-backed executor key (e.g. "computer"); None = PowerShell script
 
     def choice_description(self) -> dict[str, Any]:
         """Description passed to Laya router for tool choice."""
@@ -57,6 +58,8 @@ class Tool:
     def render_script(self, args: dict[str, str]) -> str:
         """Render script template by substituting {{arg}} with safely escaped values."""
         rendered = self.script
+        if not rendered:
+            return ""  # Python-backed tools execute via their impl, not a script
         for arg in self.args:
             val = args.get(arg.name, arg.default or "")
             # Escape quotes in replacement values

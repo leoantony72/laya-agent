@@ -251,6 +251,7 @@ async def system_info():
 @app.get("/api/tools")
 async def get_tools():
     """Get all registered tools including dynamically learned ones."""
+    from winbrow.permissions import tool_tier
     tools_list = []
     for t in agent.registry.all_tools():
         tools_list.append({
@@ -259,6 +260,7 @@ async def get_tools():
             "is_learned": t.is_learned,
             "scope": t.scope,
             "examples": t.examples,
+            "tier": tool_tier(t.name),
             "args": [
                 {
                     "name": a.name,
@@ -309,6 +311,82 @@ async def reset_session(req: SessionRequest):
     else:
         agent.session.reset()
     return JSONResponse({"status": "reset"})
+
+
+class SkillsRequest(BaseModel):
+    skill_id: Optional[str] = None
+
+
+@app.get("/api/skills")
+async def list_skills():
+    """Procedural memory: captured multi-step skills (replayable)."""
+    return JSONResponse({"skills": agent.skills.list()})
+
+
+@app.post("/api/skills/delete")
+async def delete_skill(req: SkillsRequest):
+    """Remove a captured skill (user-editable procedural memory)."""
+    if not req.skill_id:
+        return JSONResponse({"error": "skill_id required"}, status_code=400)
+    ok = agent.skills.delete(req.skill_id)
+    return JSONResponse({"deleted": ok, "remaining": len(agent.skills)})
+
+
+# ---------------------------------------------------------------------------
+# Permissions & installer endpoints (v3/M3)
+# ---------------------------------------------------------------------------
+
+class ConfirmRequest(BaseModel):
+    confirmation_id: str
+    approve: bool = False
+    remember: bool = False   # force-remember T2 choice (T3 always re-asks)
+
+
+@app.get("/api/permissions")
+async def get_permissions_state():
+    """Pending confirmations + remembered T2 allowlist."""
+    from winbrow.permissions import get_permissions
+    pm = get_permissions()
+    return JSONResponse({
+        "pending": pm.pending_list(),
+        "allowed": pm.list_allowed(),
+    })
+
+
+@app.post("/api/confirm")
+async def confirm_pending(req: ConfirmRequest):
+    """Approve/deny a pending T2/T3 action; approval re-runs the cached utterance."""
+    from winbrow.permissions import get_permissions
+    pm = get_permissions()
+    p = pm.get_pending(req.confirmation_id)
+    if not p:
+        return JSONResponse({"error": "Unknown confirmation_id"}, status_code=404)
+    # T2 choices are remembered by default (plan §6); T3 never.
+    remember = req.remember or (p.tier == "t2")
+    pm.resolve_pending(p.id, approve=req.approve, remember=remember)
+    if not req.approve:
+        pm.consume(p.tool, p.args)
+        return JSONResponse({
+            "status": "denied", "confirmation_id": p.id,
+            "tool": p.tool, "result": {
+                "success": False, "type": "denied",
+                "output": "Action denied by user.",
+            },
+        })
+    # Re-run the cached utterance in the same session (gate sees 'approved').
+    result = await agent.execute(p.utterance, session_id=p.session_id or "default")
+    pm.consume(p.tool, p.args)
+    return JSONResponse({
+        "status": "approved", "confirmation_id": p.id,
+        "tool": p.tool, "result": result,
+    })
+
+
+@app.get("/api/install/status")
+async def install_status(job_id: Optional[str] = None):
+    """Streaming install job progress (winget output tail)."""
+    from winbrow.installer import installer_status
+    return JSONResponse(installer_status(job_id))
 
 
 @app.get("/api/memories")

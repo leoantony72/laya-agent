@@ -1,0 +1,18 @@
+{
+  "home": {
+    "active_app": "Brave",
+    "active_title": "OpenRouter Dashboard - Brave",
+    "running_apps": ["Brave", "Code", "notepad", "explorer", "Spotify"],
+    "volume_level": 40,
+    "is_muted": false,
+    "dark_mode": false
+  },
+  "editor": {
+    "active_app": "Code",
+    "active_title": "report.py - Code",
+    "running_apps": ["Code", "explorer", "notepad"],
+    "volume_level": 55,
+    "is_muted": false,
+    "dark_mode": true
+  }
+}

@@ -19,6 +19,13 @@ from .session import (
     Turn,
     get_session,
 )
+from .skills import (
+    SkillMemory,
+    SkillRecord,
+    SkillStep,
+    get_skills,
+    reset_skills,
+)
 
 # Old module API compat (voice.py imports these names from winbrow.memory)
 SemanticMemory = MemoryStore
@@ -38,4 +45,9 @@ __all__ = [
     "Entity",
     "Turn",
     "SemanticMemory",
+    "SkillMemory",
+    "SkillRecord",
+    "SkillStep",
+    "get_skills",
+    "reset_skills",
 ]

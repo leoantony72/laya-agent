@@ -31,11 +31,14 @@ from .model_gateway import (
     extract_json_object,
 )
 from . import prompts
+from ..computer import COMPUTER_IMPL
+from ..adapters.manager import ADAPTER_IMPL
 
 log = logging.getLogger("winbrow.brain.loop")
 
 MAX_STEPS_DEFAULT = int(6)
 MAX_REPLANS = 1
+MAX_PLANNER_TOOLS = 80
 
 # Meta-skills the brain can call that are not registry tools.
 # Implemented in-process against the memory store.
@@ -110,7 +113,14 @@ class AgentBrain:
     # ------------------------------------------------------------------ skills block
     def _skills_block(self, ctx: Any) -> str:
         lines = []
-        for t in self.registry.available(ctx)[:48]:
+        available = self.registry.available(ctx)
+        # Seed tools first; Python-backed atoms/adapters always visible
+        seeded, python_backed = [], []
+        for t in available:
+            impl = getattr(t, "impl", None)
+            (python_backed if impl in (COMPUTER_IMPL, ADAPTER_IMPL) else seeded).append(t)
+        budget = max(MAX_PLANNER_TOOLS - len(python_backed), 0)
+        for t in seeded[:budget] + python_backed:
             args_desc = ", ".join(
                 f"{a.name}({a.kind})" for a in t.args
             ) or "no args"
@@ -182,6 +192,12 @@ class AgentBrain:
                     pass
 
             if not step_res.success:
+                # Hard stops: approval gates / policy denials — re-planning
+                # cannot change the outcome, so surface them immediately.
+                if step_res.output.startswith("[permission-required]") or step_res.output.startswith("[denied]"):
+                    result.success = False
+                    result.response = step_res.output
+                    return result
                 # Recovery: one re-plan with the failure in context
                 recovered = await self._try_recover(utterance, step_res, ctx, session, skills_block, emit)
                 if recovered is not None:
@@ -292,6 +308,24 @@ class AgentBrain:
                 return BrainStepResult(skill, args, False, f"Unknown skill '{skill}'", why)
 
             exec_out = await self.executor(skill, args)
+            # v3/M3: the permission is a hard stop — no re-plan can bypass it
+            if exec_out.get("type") == "permission_required":
+                p = exec_out.get("pending") or {}
+                return BrainStepResult(
+                    skill, args, False,
+                    (f"[permission-required] Needs your approval first: '{skill}' "
+                     f"(tier {p.get('tier', '?')}). Approve it, then say the command again. "
+                     f"confirmation_id={p.get('confirmation_id')}"),
+                    why,
+                    round((time.perf_counter() - t0) * 1000, 1),
+                )
+            if exec_out.get("type") == "denied":
+                return BrainStepResult(
+                    skill, args, False,
+                    f"[denied] {exec_out.get('output', 'Blocked by policy')}",
+                    why,
+                    round((time.perf_counter() - t0) * 1000, 1),
+                )
             success = bool(exec_out.get("success", False))
             output = str(exec_out.get("output") or exec_out.get("stdout") or "Done")
             return BrainStepResult(skill, args, success, output, why,

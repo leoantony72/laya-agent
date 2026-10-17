@@ -257,6 +257,18 @@ class MemoryStore:
             ).fetchone()
         return row["content"] if row else None
 
+    def corrections_map(self, limit: int = 500) -> dict:
+        """All learned normalizations as {wrong: right} (M4 autocorrect v3)."""
+        out: dict = {}
+        with self._db_conn() as conn:
+            rows = conn.execute(
+                "SELECT label, content FROM memories WHERE kind = ? ORDER BY timestamp DESC LIMIT ?",
+                (K_CORRECTION, limit),
+            ).fetchall()
+        for r in rows:
+            out.setdefault(r["label"].lower(), r["content"].lower())
+        return out
+
     def search_episodic(self, query: str, limit: int = 8) -> List[MemoryEntry]:
         """Hybrid search: FTS5 (or LIKE) + recency. Vector search when Chroma is up."""
         if not query:

@@ -11,4 +11,5 @@ python-multipart
 chromadb
 comtypes
 sounddevice
+onnxruntime
 pyyaml

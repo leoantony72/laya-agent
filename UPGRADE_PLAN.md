@@ -378,17 +378,24 @@ Windows "observe" background service (proactive suggestions: "you opened report.
 
 ## 12. Voice, STT & autocorrect — current state and v3 design
 
-### 12.1 Current state (as-built)
+### 12.1 Current state (as-built, updated after M4)
 
 | Piece | File | Status |
 |---|---|---|
-| Recording | `stt.py:130` AudioRecorder — sounddevice 16kHz mono int16, temp WAV | Works |
-| STT | `stt.py:84` WhisperSTT — spawns `whisper-cli.exe` (base.en GGUF) per file | Works, one-shot only |
-| Wake word | `voice.py:86` — transcribes **every 1s chunk** and substring-matches "hey winbrow" | Works, ~10× CPU waste on 2 cores |
-| Streaming | `stt.py:127` | `NotImplementedError` |
-| Autocorrect | `router.py:317` `autocorrect_utterance()` — token Levenshtein vs ~60-word vocab; concat-word merge; disk-exists guard so real paths are never "repaired" | Works for commands; no proper-noun memory |
-| Known bug | `stt.py:49,77` use `platform.system()` without importing `platform` | Crashes when binary missing |
-| Known waste | `voice.py` rebuilds agents/routers per command; calls `extract_intent()` then discards the result | To be deleted in M4 |
+| Recording | `stt.py` AudioRecorder — sounddevice 16kHz mono int16, temp WAV | Works |
+| STT | `stt.py` WhisperSTT — spawns `whisper-cli.exe` (base.en GGUF) per file | Works; `transcribe_file(initial_prompt=)` for priming |
+| Cloud STT | `stt.py` `cloud_stt_config` / `cloud_transcribe_file` / `transcribe_best` — Groq whisper-large-v3 / OpenAI whisper-1, cloud-first with local fallback | Works behind `WINBROW_CLOUD_STT=1` |
+| VAD gate | `vad.py` VADGate — silero ONNX (~2MB, h/c state) via onnxruntime single-thread; energy RMS fallback; `WINBROW_VAD=silero\|energy` | Works; `ensure_silero_model()` downloads on first run |
+| Wake word | `voice.py` `VoiceLoop._run_vad_wake` — VAD-gated speech capture, `strip_wake()` on the transcript, 0.8s EOS, 1.2s pre-roll, 30s cap; PTT (hold F9) and file modes as fallbacks | Works (substring wake on primed transcript, not streaming KWS) |
+| STT snowballing | `voice.py` — one agent/route/session per utterance; agents shared via VoiceLoop, no more per-command rebuild | Fixed in M4 rewrite |
+| Autocorrect | `router.py` `autocorrect_utterance()` v3 — Stage 3 learned corrections first, then Levenshtein vs vocab + `_FUNCTION_WORDS` guard (never rewrites "what"/"it"/"and"...), disk-exists guard | Works; `WinBrowRouter(store=)` loads corrections from semantic memory |
+| Stage 2 normalize | `brain/normalize.py` + `agent.py` — gateway rewrite on brain-failure fallback, one re-route (`+normalize` tier); `WINBROW_NORMALIZE=0` disables | Works (brain-first, so it costs nothing on success) |
+| Stage 3 learning | `brain/normalize.py` `learn_corrections()` → memory `corrections_map()` → Stage 1 hot path | Works, tested |
+| TTS | `tts.py` — PowerShell System.Speech, fire-and-forget Popen; `speak_result()` terse spoken shapes; spoken T2/T3 confirm via `voice_confirm()` hook on `permissions.set_confirm_fn` | Works; `WINBROW_TTS`, `WINBROW_TTS_VOICE`, `WINBROW_TTS_RATE` |
+| Trace v2 | `trace.py` `stage_event(...)` + `new_command_id()`; voice emits `vad`/`wake`/`stt`/`confirm`/`execute`/`tts` stages joined by `command_id` (`WINBROW_TRACE_PATH`) | Works |
+| Prompt priming | `voice.py` `build_prime_prompt(session, store, ctx)` — recent entities + episodic files + running apps → whisper `-p` prompt | Works |
+| CLI | `python -m winbrow.voice --mode vad\|ptt\|file [wavs...]` | Works |
+| Known bug | ~~`stt.py` `platform` import~~ | Fixed in M4 |
 
 ### 12.2 v3 voice pipeline
 

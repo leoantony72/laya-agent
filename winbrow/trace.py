@@ -1,6 +1,6 @@
 """
-Structured Trace Logging (M0 instrumentation)
-=============================================
+Structured Trace Logging (M0 instrumentation → M4 trace v2)
+============================================================
 Append-only JSONL log of every executed command: utterance, routing tier,
 decision, latencies, and outcome. This is the raw material for latency
 tables, threshold calibration, and future fine-tuning. Survives restarts
@@ -8,22 +8,35 @@ tables, threshold calibration, and future fine-tuning. Survives restarts
 
 Log location: <repo>/logs/trace.jsonl (created on first write).
 Failures to write a trace must never break command execution.
+
+v2 (M4): stage-level events — voice pipeline stages (vad/wake/stt/execute/
+tts/confirm) carry a shared `command_id` so a single utterance can be joined
+end-to-end; command events additionally carry per-stage latency breakdown.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import pathlib
 import threading
 import time
+import uuid
 from typing import Any
 
 log = logging.getLogger("winbrow.trace")
 
-TRACE_PATH = pathlib.Path(__file__).parent.parent / "logs" / "trace.jsonl"
+TRACE_PATH = pathlib.Path(
+    os.environ.get("WINBROW_TRACE_PATH",
+                   str(pathlib.Path(__file__).parent.parent / "logs" / "trace.jsonl")))
 
 _lock = threading.Lock()
+
+
+def new_command_id() -> str:
+    """Correlate one command across all pipeline stages."""
+    return uuid.uuid4().hex[:12]
 
 
 def log_event(event: dict[str, Any]) -> None:
@@ -37,6 +50,21 @@ def log_event(event: dict[str, Any]) -> None:
                 f.write(line + "\n")
     except Exception as e:
         log.debug(f"Trace write failed (non-fatal): {e}")
+
+
+def stage_event(command_id: str, stage: str, elapsed_ms: float,
+                meta: dict[str, Any] | None = None) -> None:
+    """One pipeline-stage timing record (vad / wake / stt / execute / tts /
+    confirm). `elapsed_ms` = duration of the stage; meta adds context."""
+    event: dict[str, Any] = {
+        "type": "stage",
+        "command_id": command_id,
+        "stage": stage,
+        "elapsed_ms": round(float(elapsed_ms or 0.0), 1),
+    }
+    if meta:
+        event.update(meta)
+    log_event(event)
 
 
 def command_event(

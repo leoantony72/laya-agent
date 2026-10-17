@@ -245,6 +245,33 @@ _COMMAND_VOCAB = frozenset({
     "phone", "phones", "screenshot", "reload", "scroll", "incognito",
     "calculator", "notepad", "paint", "terminal", "explorer", "time",
     "dark", "light", "mode", "theme", "please", "the", "for", "in", "on",
+    # Relative volume words: must stay intact or "louder" gets corrected
+    # into "folder" and the volume nudge is destroyed.
+    "louder", "quieter", "sound", "audio", "voice",
+    # Contextual connectors — stripping/rewriting these changes intent:
+    # "make it louder" would autocorrect "make" → "mode" and become a bare nudge.
+    "make", "turn", "keep", "set", "then", "and", "up", "down", "bit", "little",
+    # Antecedent pronouns: "it" would autocorrect to "in" and lose context.
+    "it", "its", "them", "that", "this",
+})
+
+# Function words the fuzzy layer must never touch. Levenshtein loves
+# swapping "what"→"that" or "when"→"them", which destroys questions
+# ("what time is it") and chat intent. Learned Stage-3 corrections still
+# override these, because the user explicitly taught the mapping.
+_FUNCTION_WORDS = frozenset({
+    "what", "when", "where", "which", "who", "why", "how", "whats",
+    "the", "a", "an", "and", "or", "but", "if", "then", "than", "else",
+    "is", "are", "was", "were", "be", "been", "am", "do", "does", "did",
+    "i", "im", "id", "you", "your", "yours", "he", "she", "we", "they",
+    "my", "mine", "me", "us", "him", "his", "her", "hers", "their",
+    "to", "of", "at", "for", "with", "from", "by", "as", "so", "not",
+    "no", "yes", "can", "could", "would", "should", "will", "shall",
+    "may", "might", "must", "have", "has", "had", "there", "here",
+    "again", "also", "very", "just", "even", "some", "any", "all",
+    # Already-guarded tokens repeated for explicitness:
+    "it", "its", "them", "that", "this", "in", "on", "up", "down",
+    "out", "off", "over", "under", "please", "okay", "ok", "hey",
 })
 
 _SEARCH_VERBS = frozenset({"search", "google", "browse", "lookup"})
@@ -256,6 +283,89 @@ _LOCAL_FIND = frozenset({
     "file", "files", "folder", "folders", "disk", "desktop", "downloads",
     "documents", "page", "window",
 })
+
+# Volume nudges that reference a conversation antecedent ("make it louder",
+# "turn it up a bit") belong to the brain — only standalone nudges fast-path.
+_CHAT = CHAT
+_STOP_RE = re.compile(
+    r"\b(stop listening|stop winbrow|stop the assistant|exit winbrow|"
+    r"shut down winbrow|cancel listening|halt)\b"
+)
+
+_CONTEXTUAL_VOLUME_RE = re.compile(
+    r"\b(?:make|keep|set)\s+(?:its?|them)\b"
+    r"|\b(?:turn|put|keep|set)\s+(?:its?|them)\s+(?:up|down)\b"
+    r"|\b(?:up|down|louder|quieter)\s+(?:a\s+)?(?:bit|little|lot|mote)\b"
+    r"|(?:bit|little|lot)\b"
+)
+
+# ---------------------------------------------------------------------------
+# v3/M3 installer routing (winget): "install 7zip", "uninstall spotify",
+# "update all apps", "search for the app 7zip". T3 (except search) — the
+# permission gate confirms before anything runs.
+# ---------------------------------------------------------------------------
+_INSTALL_RE = re.compile(
+    r"\b(?:install|instal|setup)\b\s+(?:a\s+|an\s+|the\s+|new\s+)?"
+    r"(?:app\s+(?:called|named)\s+)?(.{3,40})$", re.I)
+_UNINSTALL_RE = re.compile(
+    r"\b(?:uninstall|uninstal|deinstall)\b\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:app\s+(?:called|named)\s+)?(.{3,40})$", re.I)
+_UPGRADE_ALL_RE = re.compile(
+    r"\b(?:upgrade|update|refresh)\b\s+(?:a\s+|an\s+|the\s+)?"
+    r"(?:all|everything)(?:\s+(?:my\s+)?(?:apps|programs|software|packages))?\b"
+    r"|\b(?:update|upgrade)\s+(?:my\s+)?(?:apps|programs|software|packages)\b", re.I)
+_APPSEARCH_RE = re.compile(
+    r"\bwinget\s+search\s+(.{2,40})$"
+    r"|(?:\b(?:search|find|look)\b(?:\s+for)?\s+(?:the\s+|a\s+)?"
+    r"\b(?:app|application|package|program|software)\s+(?:called\s+|named\s+)?(.{2,40}))", re.I)
+
+# Do not treat "remove the file" / "delete folder" as package uninstalls.
+_INSTALLER_NONGO_WORDS = ("file", "folder", "directory", "history", "bookmark",
+                          "password", "tab", "window", "drive", "photo",
+                          "document", "setting", "cookie", "cache")
+
+
+def _installer_route(lower: str, registry, route_cls, elapsed_ms: float):
+    """Return a Route for installer intents, else None."""
+    def clean_pkg(s: str) -> str:
+        s = s.strip()
+        s = re.sub(r"^(?:the|a|an|my|old|some)\s+", "", s)
+        s = re.sub(r"\s*(?:app|application|program|software|package|tool)s?\s*(?:app)?\s*$", "", s)
+        s = re.sub(r"\s*(?:please|now|quickly|immediately|silently|silent|quietly|from\s+winget)\s*$", "", s)
+        return s.strip()
+
+    m = _INSTALL_RE.search(lower)
+    if m:
+        pkg = clean_pkg(m.group(1))
+        if pkg and not any(w in pkg for w in _INSTALLER_NONGO_WORDS):
+            t = registry.get("app_install")
+            if t is not None:
+                return route_cls(kind="tool", tool=t, args={"package": pkg},
+                                 confidence=0.82, latency_ms=elapsed_ms, tier="heuristic")
+    m = _UNINSTALL_RE.search(lower)
+    if m:
+        pkg = clean_pkg(m.group(1))
+        if pkg and not any(w in pkg for w in _INSTALLER_NONGO_WORDS):
+            t = registry.get("app_uninstall")
+            if t is not None:
+                return route_cls(kind="tool", tool=t, args={"package": pkg},
+                                 confidence=0.82, latency_ms=elapsed_ms, tier="heuristic")
+    if _UPGRADE_ALL_RE.search(lower):
+        t = registry.get("app_upgrade_all")
+        if t is not None:
+            return route_cls(kind="tool", tool=t, args={},
+                             confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
+    m = _APPSEARCH_RE.search(lower)
+    if m:
+        pkg = clean_pkg(m.group(1) or m.group(2) or "")
+        if pkg and not any(w in pkg for w in _INSTALLER_NONGO_WORDS):
+            t = registry.get("app_search")
+            if t is not None:
+                return route_cls(kind="tool", tool=t, args={"package": pkg},
+                                 confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
+    return None
+
+
 _COMMON_APPS = {
     "calculator": "calculator", "calc": "calculator",
     "paint": "paint", "mspaint": "paint",
@@ -314,13 +424,24 @@ def _resolves_on_disk(token: str) -> bool:
         return False
 
 
-def autocorrect_utterance(text: str, extra: Optional[list[str]] = None) -> str:
-    """Repair STT/typo tokens against command vocabulary. Never touches paths."""
+def autocorrect_utterance(
+    text: str,
+    extra: Optional[list[str]] = None,
+    corrections: Optional[dict] = None,
+) -> str:
+    """Repair STT/typo tokens against command vocabulary. Never touches paths.
+
+    M4 v3: `corrections` is the Stage-3 learned map {wrong: right} from
+    semantic memory — consulted first, before Levenshtein can guess.
+    Function words ("what", "that", "this", ...) are never fuzzy-rewritten:
+    rewriting them wrecks the sentence ("what time is it" → "that time it it").
+    """
     vocab = set(_COMMAND_VOCAB)
     for item in extra or []:
         for tok in re.split(r"\W+", item.lower()):
             if len(tok) >= 3:
                 vocab.add(tok)
+    corr_map = corrections or {}
     parts = text.split()
     out: list[str] = []
     for part in parts:
@@ -328,14 +449,24 @@ def autocorrect_utterance(text: str, extra: Optional[list[str]] = None) -> str:
         if not stripped:
             out.append(part)
             continue
+        # Stage 3: learned corrections win over fuzzy guesses
+        hit = corr_map.get(stripped.lower())
+        if hit:
+            out.append(hit)
+            continue
+        low = stripped.lower()
+        if low in _FUNCTION_WORDS:
+            out.append(part)
+            continue
         hit = _closest_word(stripped, vocab)
         if hit:
             # Never "repair" a token that already names a real folder/file:
             # "codee" must not become a running app name like "mode".
-            if hit == stripped or not _resolves_on_disk(stripped):
-                out.append(hit)
-            else:
+            func_hit = hit.lower() in _FUNCTION_WORDS
+            if func_hit or (hit != stripped and _resolves_on_disk(stripped)):
                 out.append(part)
+            else:
+                out.append(hit)
             continue
         if len(stripped) >= 8:
             merged = None
@@ -510,12 +641,14 @@ class Route:
 class WinBrowRouter:
     """Orchestrates Laya's typed decision engine to select tools and parameters."""
 
-    def __init__(self, registry: ToolRegistry, timeout: Optional[float] = None):
+    def __init__(self, registry: ToolRegistry, timeout: Optional[float] = None,
+                 store: Any = None):
         self.registry = registry
         # Read env dynamically (not the import-time constant) so tests and
         # host config can override LAYA_TIMEOUT_S per process start.
         self.timeout = timeout if timeout is not None else _laya_timeout_default()
         self._worker = get_laya_worker()
+        self.store = store
 
     @property
     def _loaded(self) -> bool:
@@ -539,7 +672,15 @@ class WinBrowRouter:
         
         # Apply typo repair and prefix stripping FIRST, before any routing
         stripped = _strip_conversational_prefix(text)
-        corrected = autocorrect_utterance(stripped, extra)
+        corrections = None
+        for src in (memory, self.store):
+            try:
+                if src is not None and hasattr(src, "corrections_map"):
+                    corrections = src.corrections_map()
+                    break
+            except Exception:
+                corrections = None
+        corrected = autocorrect_utterance(stripped, extra, corrections)
         if corrected.lower() != stripped.lower():
             log.info(f"Normalized '{text}' → '{corrected}'")
 
@@ -807,8 +948,18 @@ class WinBrowRouter:
         lower = cleaned.lower()
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
+        # --- STOP (top precedence: a wrong louder/screenshot is annoying, a
+        # stop that never fires is worse). Not swallowed by later branches.
+        if _STOP_RE.search(lower):
+            return Route(kind=STOP, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- INSTALLER (winget): T3 confirmed by the permission gate ---
+        _inst = _installer_route(lower, self.registry, Route, elapsed_ms)
+        if _inst is not None:
+            return _inst
+
         # --- VOLUME (exact + fuzzy) ---
-        if any(w in lower for w in ["volume", "volueme", "voluem", "voume", "vol ", "vol.", "mute", "unmute", "audio", "sound"]):
+        if any(w in lower for w in ["volume", "volueme", "voluem", "voume", "vol ", "vol.", "mute", "unmute", "audio", "sound", "louder", "quieter"]):
             if re.search(r"\b(max|maximum|full|all the way up|full blast)\b", lower) or "100%" in lower:
                 t = self.registry.get("volume_set_level")
                 return Route(kind="tool", tool=t, args={"level": "100"}, confidence=0.98, latency_ms=elapsed_ms, tier="heuristic")
@@ -826,6 +977,17 @@ class WinBrowRouter:
             if re.search(r"\bmute\b", lower):
                 t = self.registry.get("system_volume")
                 return Route(kind="tool", tool=t, args={"action": "mute"}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+            # Relative nudges: "turn the volume up", "sound quieter", etc.
+            if re.search(r"\b(up|louder|raise|increase|crank)\b", lower):
+                if _CONTEXTUAL_VOLUME_RE.search(lower):
+                    return Route(kind=NEW_ACTION, confidence=0.5, latency_ms=elapsed_ms, tier="heuristic")
+                t = self.registry.get("system_volume")
+                return Route(kind="tool", tool=t, args={"action": "up"}, confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
+            if re.search(r"\b(down|quieter|decrease|reduce|lower)\b", lower):
+                if _CONTEXTUAL_VOLUME_RE.search(lower):
+                    return Route(kind=NEW_ACTION, confidence=0.5, latency_ms=elapsed_ms, tier="heuristic")
+                t = self.registry.get("system_volume")
+                return Route(kind="tool", tool=t, args={"action": "down"}, confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
 
         # --- LOCK SCREEN ---
         if "lock" in lower and any(w in lower for w in ["screen", "computer", "pc", "workstation"]):
@@ -934,13 +1096,20 @@ class WinBrowRouter:
                         return Route(kind="tool", tool=t, args={"app_name": remainder}, confidence=0.75, latency_ms=elapsed_ms, tier="heuristic")
 
         # --- WINDOW ACTIONS ---
-        if any(w in lower for w in ["minimize", "maximize", "snap left", "snap right", "show desktop", "close window"]):
+        if any(w in lower for w in ["minimize", "maximize", "snap left", "snap right", "show desktop", "close window",
+                                    "close this window", "close the window", "close current window",
+                                    "close active window", "shut this window"]):
             action_map = {
                 "minimize": "minimize",
-                "maximize": "maximize", 
+                "maximize": "maximize",
                 "snap left": "snap_left",
                 "snap right": "snap_right",
                 "show desktop": "desktop",
+                "close this window": "close",
+                "close the window": "close",
+                "close current window": "close",
+                "close active window": "close",
+                "shut this window": "close",
                 "close window": "close",
             }
             for kw, action in action_map.items():
@@ -1060,8 +1229,16 @@ class WinBrowRouter:
         lower = cleaned.lower()
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
+        if _STOP_RE.search(lower):
+            return Route(kind=STOP, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- INSTALLER (winget): T3 confirmed by the permission gate ---
+        _inst = _installer_route(lower, self.registry, Route, elapsed_ms)
+        if _inst is not None:
+            return _inst
+
         # Volume level (exact): max/min keywords or an explicit number.
-        if ("setting" not in lower and any(w in lower for w in ["volume", "volueme", "voluem", "voume", "vol ", "vol.", "mute", "unmute", "audio", "sound"])):
+        if ("setting" not in lower and any(w in lower for w in ["volume", "volueme", "voluem", "voume", "vol ", "vol.", "mute", "unmute", "audio", "sound", "louder", "quieter"])):
             if re.search(r"\b(max|maximum|full|all the way up|full blast)\b", lower) or "100%" in lower:
                 t = self.registry.get("volume_set_level")
                 return Route(kind="tool", tool=t, args={"level": "100"}, confidence=0.98, latency_ms=elapsed_ms, tier="heuristic")
@@ -1081,6 +1258,17 @@ class WinBrowRouter:
             if re.search(r"\bmute\b", lower):
                 t = self.registry.get("system_volume")
                 return Route(kind="tool", tool=t, args={"action": "mute"}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+            # Relative nudges: "turn the volume up", "sound quieter", etc.
+            if re.search(r"\b(up|louder|raise|increase|crank)\b", lower):
+                if _CONTEXTUAL_VOLUME_RE.search(lower):
+                    return Route(kind=NEW_ACTION, confidence=0.5, latency_ms=elapsed_ms, tier="heuristic")
+                t = self.registry.get("system_volume")
+                return Route(kind="tool", tool=t, args={"action": "up"}, confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
+            if re.search(r"\b(down|quieter|decrease|reduce|lower)\b", lower):
+                if _CONTEXTUAL_VOLUME_RE.search(lower):
+                    return Route(kind=NEW_ACTION, confidence=0.5, latency_ms=elapsed_ms, tier="heuristic")
+                t = self.registry.get("system_volume")
+                return Route(kind="tool", tool=t, args={"action": "down"}, confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
 
         # Lock screen (exact).
         if "lock" in lower and any(w in lower for w in ["screen", "computer", "pc", "workstation"]):

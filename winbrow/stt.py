@@ -83,11 +83,22 @@ class WhisperSTT:
         
         raise RuntimeError("Failed to build whisper.cpp")
     
-    def transcribe_file(self, audio_path: Path, language: Optional[str] = None) -> TranscriptionResult:
-        """Transcribe an audio file."""
+    def transcribe_file(
+        self,
+        audio_path: Path,
+        language: Optional[str] = None,
+        initial_prompt: Optional[str] = None,
+        timeout: float = 60.0,
+    ) -> TranscriptionResult:
+        """Transcribe an audio file.
+
+        M4: `initial_prompt` primes the whisper decoder with likely names
+        (recent files, apps, previous entities) so proper nouns like
+        'leoantony.png' transcribe correctly instead of being autocorrected.
+        """
         import time
         t0 = time.perf_counter()
-        
+
         lang = language or self.language
         cmd = [
             str(self.whisper_bin),
@@ -97,15 +108,17 @@ class WhisperSTT:
             "-oj",  # JSON output
             "-nt",  # No timestamps
         ]
-        
+        if initial_prompt:
+            cmd += ["-p", initial_prompt[:800]]
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=True)
             output = json.loads(result.stdout)
-            
+
             text = output.get("text", "").strip()
             segments = output.get("segments", [])
             language = output.get("language", lang)
-            
+
             return TranscriptionResult(
                 text=text,
                 language=language,
@@ -199,6 +212,96 @@ async def transcribe_audio_file(audio_path: Path, language: str = "en") -> Trans
     """Convenience function to transcribe a single file."""
     stt = WhisperSTT(language=language)
     return stt.transcribe_file(audio_path)
+
+
+# --------------------------------------------------------------------------- cloud STT (M4)
+import urllib.error  # noqa: E402
+import urllib.request  # noqa: E402
+import uuid  # noqa: E402
+
+_CLOUD_ENDPOINTS = {
+    "groq": "https://api.groq.com/openai/v1/audio/transcriptions",
+    "openai": "https://api.openai.com/v1/audio/transcriptions",
+}
+_CLOUD_MODELS = {"groq": "whisper-large-v3", "openai": "whisper-1"}
+
+
+def cloud_stt_config() -> Optional[tuple]:
+    """(provider, url, model, api_key) when cloud STT is enabled, else None."""
+    if os.environ.get("WINBROW_CLOUD_STT", "0").strip().lower() not in ("1", "true"):
+        return None
+    provider = (os.environ.get("WINBROW_CLOUD_STT_PROVIDER") or "").lower()
+    if not provider:
+        if os.environ.get("GROQ_API_KEY"):
+            provider = "groq"
+        elif os.environ.get("OPENAI_API_KEY"):
+            provider = "openai"
+        else:
+            return None
+    if provider not in _CLOUD_ENDPOINTS:
+        return None
+    key = os.environ.get("GROQ_API_KEY" if provider == "groq" else "OPENAI_API_KEY")
+    if not key:
+        return None
+    return (provider, _CLOUD_ENDPOINTS[provider], _CLOUD_MODELS[provider], key)
+
+
+def cloud_transcribe_file(audio_path: Path, timeout: float = 20.0) -> TranscriptionResult:
+    """OpenAI-compatible multipart transcription (Groq Whisper / openai whisper-1)."""
+    import time as _time
+    cfg = cloud_stt_config()
+    if cfg is None:
+        raise RuntimeError("Cloud STT not configured")
+    provider, url, model, key = cfg
+    t0 = _time.perf_counter()
+    boundary = f"winbrow-{uuid.uuid4().hex}"
+    data = audio_path.read_bytes()
+    payload = b"\r\n".join([
+        f"--{boundary}".encode(),
+        f'Content-Disposition: form-data; name="model"'.encode(),
+        b"",
+        model.encode(),
+        f"--{boundary}".encode(),
+        f'Content-Disposition: form-data; name="language"'.encode(),
+        b"",
+        b"en",
+        f"--{boundary}".encode(),
+        b'Content-Disposition: form-data; name="file"; filename="audio.wav"',
+        b"Content-Type: audio/wav",
+        b"",
+        data,
+        f"--{boundary}--".encode(),
+    ])
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Authorization": f"Bearer {key}",
+        },
+    )
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    out = json.loads(resp.read().decode("utf-8"))
+    return TranscriptionResult(
+        text=str(out.get("text", "")).strip(),
+        language="en",
+        duration_ms=(_time.perf_counter() - t0) * 1000,
+        segments=[],
+    )
+
+
+async def transcribe_best(audio_path: Path, language: str = "en",
+                          initial_prompt: Optional[str] = None) -> TranscriptionResult:
+    """Cloud STT when configured (faster, better accents), local whisper otherwise.
+    Cloud failure falls back to the local binary transparently."""
+    if cloud_stt_config() is not None:
+        import asyncio
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                None, lambda: cloud_transcribe_file(audio_path))
+        except Exception as e:
+            log.warning(f"Cloud STT failed ({e}); falling back to local whisper")
+    stt = WhisperSTT(language=language)
+    return stt.transcribe_file(audio_path, initial_prompt=initial_prompt)
 
 
 async def record_and_transcribe(duration_seconds: float = 5.0, language: str = "en") -> TranscriptionResult:

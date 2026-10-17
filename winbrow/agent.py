@@ -25,6 +25,11 @@ from .browser_task import BrowserController
 from .brain import AgentBrain, GatewayUnavailable, ModelGateway
 from .brain.agent_loop import _ctx_block
 from .brain.prompts import build_chat_messages
+from .computer import COMPUTER_IMPL, get_computer_tools
+from .computer.tools import execute_computer_tool
+from .adapters import ADAPTER_IMPL, get_adapter_tools
+from .adapters.manager import execute_adapter_tool
+from .installer import INSTALLER_IMPL, INSTALL_OPS, get_installer_tools
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
@@ -72,6 +77,12 @@ _INTERACTIVE_PATTERNS = [
 def _is_browser_intent(utterance: str) -> bool:
     cleaned = _strip_conversational_prefix(utterance)
     lower = cleaned.lower()
+    # M4 scenario-suite finding: loose browser keywords ("show me", "chrome")
+    # swallow pure system intents. Those are tool routes, never the browser.
+    if _SYSTEM_INTENT_RE.search(lower):
+        return False
+    if _APP_LAUNCH_RE.search(lower):
+        return False
     for kw in BROWSER_KEYWORDS:
         if " " in kw or "://" in kw or "-" in kw or "." in kw:
             # Multi-word phrases / URLs: substring match is safe.
@@ -83,6 +94,24 @@ def _is_browser_intent(utterance: str) -> bool:
             if re.search(r"\b" + re.escape(kw) + r"s?\b", lower):
                 return True
     return False
+
+
+# System-status / control intents that loose browser keywords must not capture.
+_SYSTEM_INTENT_RE = re.compile(
+    r"\b(network status|internet connection|internet status|check internet|"
+    r"my ip|ip address|what time|current time|whats the time|whats the date|"
+    r"current date|what date|battery|volume|volueme|voluem|mute|unmute|"
+    r"louder|quieter|screenshot|screen capture|clipboard|dark mode|"
+    r"light mode|toggle theme|switch theme)\b"
+)
+
+# Explicit app-launch intents: "open chrome" opens CHROME (heuristic
+# app_focus_or_launch), not the Laya browser. Brave/Laya stay routed to
+# the browser (options: only exclude non-Laya browsers).
+_APP_LAUNCH_RE = re.compile(
+    r"\b(open|launch|start|run)\s+(?:the\s+)?(chrome|google chrome|edge|"
+    r"microsoft edge|firefox)\b"
+)
 
 
 def _is_interactive_task(utterance: str) -> bool:
@@ -173,7 +202,13 @@ class WinBrowAgent:
         store: Optional[MemoryStore] = None,
     ):
         self.registry = registry or ToolRegistry()
-        self.router = WinBrowRouter(self.registry)
+        # register Python-backed computer atoms + app adapter ops once
+        for _t in get_computer_tools() + get_adapter_tools() + get_installer_tools():
+            if self.registry.get(_t.name) is None:
+                self.registry.register(_t)
+        # v3/M2: procedural memory (captured plans → instant replay)
+        from .memory.skills import get_skills
+        self.skills = get_skills()
         self.generator = ScriptGenerator(self.registry)
         self.browser = BrowserController()
         self.memory = ContextMemory()          # legacy 3-slot memory (fast-path refs)
@@ -182,6 +217,7 @@ class WinBrowAgent:
         self.store = store or get_store()
         self.session = session or get_session()
         self.gateway = gateway or ModelGateway()
+        self.router = WinBrowRouter(self.registry, store=self.store)
         self.brain = AgentBrain(
             gateway=self.gateway,
             registry=self.registry,
@@ -206,12 +242,44 @@ class WinBrowAgent:
         )
 
     # ------------------------------------------------------------------ shared skill executor
-    async def run_skill(self, tool_name: str, args: dict[str, str]) -> dict[str, Any]:
+    async def run_skill(self, tool_name: str, args: dict[str, str],
+                        utterance: str = "", session_id: Optional[str] = None) -> dict[str, Any]:
         """Execute one registry tool by name — the single dispatch point shared
-        by the fast-path and the brain (volume bypass, browser tools, templates)."""
+        by the fast-path and the brain (volume bypass, browser tools, templates).
+        v3/M3: every execution passes through the tiered permission gate."""
         tool = self.registry.get(tool_name)
         if tool is None:
             return {"success": False, "output": f"Unknown tool '{tool_name}'"}
+
+        # Scripted templates (registry + learned tools): render once up front so
+        # the gate can tier by CONTENT (system-class content ⇒ T3).
+        pre_rendered = tool.render_script(args) if getattr(tool, "impl", None) is None else ""
+
+        # ── M3: tiered permission gate (single funnel, no exceptions) ──
+        from .permissions import get_permissions
+        perm = get_permissions()
+        allowed, deny_reason, pending = await perm.gate(
+            tool_name, args,
+            utterance=utterance or "", session_id=session_id or "default",
+            tool=tool, script=pre_rendered,
+        )
+        if not allowed:
+            if pending is not None:
+                return {
+                    "type": "permission_required",
+                    "tool": tool_name,
+                    "success": False,
+                    "pending": pending,
+                    "output": (f"Approval needed for tier '{pending['tier']}': {tool_name}. "
+                               f"confirmation_id={pending['confirmation_id']}"),
+                }
+            return {
+                "type": "denied",
+                "tool": tool_name,
+                "success": False,
+                "output": f"Action denied: {deny_reason or 'blocked by policy'}",
+            }
+
         if tool_name == "volume_set_level":
             level_arg = str(args.get("level", "50"))
             out_msg = set_windows_volume(level_arg)
@@ -235,7 +303,33 @@ class WinBrowAgent:
                 "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
                 "method": out.get("method", "laya_ultrafast"),
             }
-        rendered = tool.render_script(args)
+        # v3/M1: Python-backed native computer atoms (no script template)
+        if getattr(tool, "impl", None) == COMPUTER_IMPL:
+            out = execute_computer_tool(tool_name, args)
+            out.update({
+                "type": "computer",
+                "tool": tool_name,
+            })
+            return out
+        # v3/M2: app adapter ops (CLI/COM/JSX packaged ops)
+        if getattr(tool, "impl", None) == ADAPTER_IMPL:
+            out = await execute_adapter_tool(tool_name, args)
+            out.update({
+                "type": "adapter",
+                "tool": tool_name,
+            })
+            return out
+        # v3/M3: installer ops (winget-first, T3-gated above)
+        if getattr(tool, "impl", None) == INSTALLER_IMPL:
+            op = INSTALL_OPS.get(tool_name)
+            if op is None:
+                return {"success": False, "output": f"Unknown installer op '{tool_name}'"}
+            out = await op(args)
+            out.update({"type": "installer", "tool": tool_name})
+            # one-shot usage of the approved confirmation
+            get_permissions().consume(tool_name, args)
+            return out
+        rendered = pre_rendered or tool.render_script(args)
         exec_out = await run_powershell(rendered)
         return {
             "type": "tool_execution",
@@ -259,8 +353,11 @@ class WinBrowAgent:
         api_key: Optional[str], provider: str,
         custom_endpoint: Optional[str], project_id: Optional[str],
     ) -> dict[str, Any]:
-        """Dynamic PowerShell generation tier (pre-v3 fallback when no brain)."""
-        gen_out = await self.generator.generate_and_execute(
+        """Dynamic PowerShell generation tier (pre-v3 fallback when no brain).
+        v3/M3: generated scripts are tiered by policy.script_tier() — never
+        below T2, T3 for system-class content — and must pass the permission
+        gate before execution."""
+        gen_out = await self.generator.generate_tiered(
             utterance, ctx,
             api_key=api_key, provider=provider,
             custom_endpoint=custom_endpoint, project_id=project_id,
@@ -273,7 +370,23 @@ class WinBrowAgent:
             "success": gen_out.get("success", False),
             "output": gen_out.get("stdout") or gen_out.get("stderr") or gen_out.get("reason", "Executed"),
             "elapsed_ms": gen_out.get("elapsed_ms", 0),
+            "permission": gen_out.get("permission"),
         }
+
+    def _capture_skill_candidate(self, utterance: str, brain_res: Any) -> None:
+        """v3/M2: turn a successful brain plan into a replayable skill (non-fatal)."""
+        try:
+            meta_skills = {"remember_fact", "recall_memory"}
+            steps = [
+                {"skill": s.skill, "args": dict(getattr(s, "args", {}) or {})}
+                for s in getattr(brain_res, "steps", [])
+                if getattr(s, "success", False) and s.skill not in meta_skills
+            ]
+            if steps:
+                self.skills.save(name=utterance[:60], utterance=utterance,
+                                 steps=steps, source="brain")
+        except Exception as e:
+            log.debug(f"Skill capture skipped ({e})")
 
     def _canned_chat(self) -> dict[str, Any]:
         return {
@@ -287,6 +400,64 @@ class WinBrowAgent:
             ),
             "success": True,
         }
+
+    async def _dispatch_tool_execution(self, route: "Route", utterance: str, session_id: str) -> dict:
+        """Shared tool dispatch: fast specials first, single gated funnel else."""
+        if route.tool.name == "volume_set_level":
+            level_arg = route.args.get("level", "50")
+            out_msg = set_windows_volume(level_arg)
+            return {
+                "type": "tool_execution",
+                "tool": route.tool.name,
+                "is_learned": False,
+                "script": f"set_windows_volume({level_arg})",
+                "success": "set to" in out_msg.lower(),
+                "output": out_msg,
+                "elapsed_ms": 1.0,
+            }
+        if route.tool.name in ("laya_ultrafast_browser", "web_search"):
+            goal = route.args.get("goal") or route.args.get("query") or utterance
+            out = await self.browser.run_ultrafast_task(goal)
+            return {
+                "type": "browser",
+                "tool": "laya_ultrafast_browser",
+                "success": out.get("success", True),
+                "output": out.get("final_answer") or str(out.get("steps", [])),
+                "steps": out.get("steps", []),
+                "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+                "method": out.get("method", "laya_ultrafast"),
+            }
+        # v3/M3: everything else (templates, atoms, adapters,
+        # installers, learned tools) goes through the single
+        # permission-gated executor — no direct paths.
+        return await self.run_skill(
+            route.tool.name, route.args,
+            utterance=utterance, session_id=session_id,
+        )
+
+    async def _normalize_reroute(self, utterance: str, ctx, session, session_id: str):
+        """v3/M4 Stage 2 (plan §12.3): one cheap gateway normalize rewrite,
+        then ONE re-route. Returns (route, meta); route is None when the
+        rewrite did not unlock an executable tool.
+        """
+        try:
+            from .brain.normalize import normalize_utterance
+            text, meta = await normalize_utterance(
+                self.gateway, utterance, ctx, session, self.store,
+                low_confidence=True,
+            )
+            if not meta.get("changed"):
+                return None, meta
+            route2 = await self.router.route(text, ctx, memory=self.memory)
+            if route2.kind != "tool" or route2.tool is None or route2.confidence < 0.65:
+                return None, meta
+            meta["rerouted"] = True
+            route2.latency_ms = route2.latency_ms or 0
+            route2.tier = f"{route2.tier or route2.kind}+normalize"
+            return route2, meta
+        except Exception as e:
+            log.debug(f"Normalize stage skipped: {e}")
+            return None, None
 
     def _record_open_result(self, tool_name: str | None, args: dict[str, str], success: bool) -> None:
         """Record successful opens into context memory (for "that file" follow-ups).
@@ -510,6 +681,74 @@ class WinBrowAgent:
         """
         t0 = time.perf_counter()
         session = self.session if session_id == "default" else get_session(session_id)
+
+        # ── v3/M2: procedural replay ──
+        # A captured skill matching this utterance replays its exact steps
+        # locally (CLI/atom adapters ≈ tens of ms per step) before any routing
+        # or LLM cost. Failures fall through to normal routing.
+        try:
+            replay_hit = self.skills.find_match(utterance)
+        except Exception:
+            replay_hit = None
+        if replay_hit is not None:
+            skill, score = replay_hit
+            from .memory.skills import MAX_STEPS as _SKILL_MAX
+            started = time.perf_counter()
+            steps_out: list[dict[str, Any]] = []
+            all_ok = True
+            for step in skill.steps[:_SKILL_MAX]:
+                try:
+                    r = await self.run_skill(step.skill, step.args,
+                                             utterance=utterance, session_id=session_id)
+                except Exception as e:
+                    r = {"success": False, "output": str(e)}
+                ok = bool(r.get("success"))
+                all_ok = all_ok and ok
+                steps_out.append({
+                    "skill": step.skill,
+                    "args": step.args,
+                    "success": ok,
+                    "output": str(r.get("output"))[:300],
+                })
+                if not ok:
+                    break
+            replay_ms = round((time.perf_counter() - started) * 1000, 1)
+            if all_ok:
+                try:
+                    self.skills.mark_used(skill.id)
+                except Exception:
+                    pass
+            result: dict[str, Any] = {
+                "utterance": utterance,
+                "route": {
+                    "kind": "tool",
+                    "tool_name": f"skill:{skill.id}",
+                    "args": {},
+                    "confidence": 1.0 if all_ok else 0.6,
+                    "latency_ms": 0.5,
+                    "probabilities": {},
+                    "tier": "replay",
+                },
+                "context": {},
+                "execution": {
+                    "type": "replayed_skill",
+                    "tool": f"skill:{skill.id}",
+                    "success": all_ok,
+                    "output": (f"Replayed skill '{skill.name}' ({len(steps_out)} steps, "
+                               f"{replay_ms}ms, match {score:.2f})"),
+                    "steps": steps_out,
+                    "elapsed_ms": replay_ms,
+                },
+                "total_elapsed_ms": replay_ms,
+            }
+            log.info(f"Replayed skill '{skill.id}' ({replay_ms}ms, match {score:.2f})")
+            self.history.append(result)
+            if len(self.history) > 100:
+                self.history = self.history[-100:]
+            session.record_turn(utterance, result["route"], result["execution"])
+            self.store.record_command(utterance, result["route"], result["execution"], replay_ms)
+            return result
+
         # Context capture does process enumeration + COM reads (15-600ms);
         # keep it off the event loop so routing/execution stay responsive.
         loop = asyncio.get_event_loop()
@@ -585,45 +824,18 @@ class WinBrowAgent:
             "execution": {},
         }
 
+        # ── v3/M4 autocorrect Stage 2: low-confidence NEW_ACTION → one cheap
+        # gateway "normalize" rewrite against the live vocabulary block. ──
+        # Fires as a FALLBACK after the brain tier fails (plan §12.3: rewrite
+        # is for commands that "reach the brain"); unscripted-path cost is one
+        # extra round-trip only when the brain had no plan.
+        normalize_meta: Optional[dict] = None
+
         # 2. Dispatch
         if route.kind == "tool" and route.tool:
-            if route.tool.name == "volume_set_level":
-                level_arg = route.args.get("level", "50")
-                out_msg = set_windows_volume(level_arg)
-                result["execution"] = {
-                    "type": "tool_execution",
-                    "tool": route.tool.name,
-                    "is_learned": False,
-                    "script": f"set_windows_volume({level_arg})",
-                    "success": "set to" in out_msg.lower(),
-                    "output": out_msg,
-                    "elapsed_ms": 1.0,
-                }
-            elif route.tool.name in ("laya_ultrafast_browser", "web_search"):
-                goal = route.args.get("goal") or route.args.get("query") or utterance
-                out = await self.browser.run_ultrafast_task(goal)
-                result["execution"] = {
-                    "type": "browser",
-                    "tool": "laya_ultrafast_browser",
-                    "success": out.get("success", True),
-                    "output": out.get("final_answer") or str(out.get("steps", [])),
-                    "steps": out.get("steps", []),
-                    "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
-                    "method": out.get("method", "laya_ultrafast"),
-                }
-            else:
-                # Render script with arguments
-                rendered = route.tool.render_script(route.args)
-                exec_out = await run_powershell(rendered)
-                result["execution"] = {
-                    "type": "tool_execution",
-                    "tool": route.tool.name,
-                    "is_learned": route.tool.is_learned,
-                    "script": rendered,
-                    "success": exec_out.get("success", False),
-                    "output": exec_out.get("stdout") or exec_out.get("stderr") or "Done",
-                    "elapsed_ms": exec_out.get("elapsed_ms", 0),
-                }
+            result["execution"] = await self._dispatch_tool_execution(
+                route, utterance, session_id,
+            )
 
         elif browser_fast and route.kind != "tool":
             out = await self.browser.run_ultrafast_task(utterance)
@@ -650,6 +862,10 @@ class WinBrowAgent:
                         contextualized, ctx, session, emit=emit,
                     )
                     result["execution"] = brain_res.to_dict()
+                    # v3/M2: procedural capture — successful brain plans become
+                    # replayable skills (memory/skills.py), exact steps + args.
+                    if brain_res.success and brain_res.kind == "action":
+                        self._capture_skill_candidate(utterance, brain_res)
                     if resolutions:
                         result["session_resolutions"] = resolutions
                 except GatewayUnavailable:
@@ -657,10 +873,36 @@ class WinBrowAgent:
                         utterance, ctx, api_key, provider, custom_endpoint, project_id,
                     )
                 except Exception as e:
-                    log.warning(f"Brain failed ({e}); trying generator tier.")
-                    result["execution"] = await self._generator_fallback(
-                        utterance, ctx, api_key, provider, custom_endpoint, project_id,
+                    # Stage-2 fallback (plan §12.3): one gateway rewrite
+                    # against the vocabulary block, then one re-route. A
+                    # tool route here skips the generator entirely.
+                    route2, meta = await self._normalize_reroute(
+                        utterance, ctx, session, session_id,
                     )
+                    if route2 is not None:
+                        normalize_meta = meta
+                        result["normalize"] = meta
+                        result["utterance"] = str(meta.get("text") or utterance)
+                        result["route"] = {
+                            "kind": route2.kind,
+                            "tool_name": route2.tool.name if route2.tool else None,
+                            "args": route2.args,
+                            "confidence": round(route2.confidence, 3),
+                            "latency_ms": route2.latency_ms,
+                            "probabilities": route2.probabilities,
+                            "tier": route2.tier or route2.kind,
+                        }
+                        route = route2
+                        log.info(f"Post-normalize re-route → {route2.kind} "
+                                 f"({route2.tool.name if route2.tool else None})")
+                        result["execution"] = await self._dispatch_tool_execution(
+                            route2, result["utterance"], session_id,
+                        )
+                    else:
+                        log.warning(f"Brain failed ({e}); trying generator tier.")
+                        result["execution"] = await self._generator_fallback(
+                            utterance, ctx, api_key, provider, custom_endpoint, project_id,
+                        )
             # If this looks like a known task (search, open, volume, etc.) that should
             # have been caught by heuristic routing, don't call the generator.
             elif _is_known_task(utterance):
@@ -724,9 +966,33 @@ class WinBrowAgent:
         except Exception as e:
             log.debug(f"Memory recording failed (non-fatal): {e}")
 
+        # v3/M4 Stage 3: successful execution of a normalized rewrite →
+        # persist learned corrections so Stage 1 handles it next time.
+        try:
+            if normalize_meta is not None and normalize_meta.get("changed") and \
+                    result.get("execution", {}).get("success"):
+                from .brain.normalize import learn_corrections
+                changes = normalize_meta.get("changes") or []
+                if changes:
+                    learn_corrections(changes, self.store)
+        except Exception as e:
+            log.debug(f"Correction learning skipped (non-fatal): {e}")
+
         # M0 instrumentation: persistent JSONL trace (never breaks execution)
+        # v3/M4: per-stage breakdown (normalize rewires, brain step latencies)
         try:
             from .trace import command_event
+            extra: dict[str, Any] = {}
+            if normalize_meta is not None:
+                extra["normalize"] = normalize_meta
+            brain_out = result.get("execution", {})
+            if brain_out.get("type") == "brain":
+                steps = brain_out.get("steps") or []
+                extra["plan_elapsed_ms"] = brain_out.get("plan_elapsed_ms")
+                extra["step_count"] = len(steps)
+                extra["step_lats_ms"] = [
+                    round(float(s.get("elapsed_ms", 0) or 0)) for s in steps
+                ]
             command_event(
                 utterance=utterance,
                 tier=route.tier or route.kind,
@@ -735,6 +1001,7 @@ class WinBrowAgent:
                 route_latency_ms=route.latency_ms,
                 success=result.get("execution", {}).get("success"),
                 total_elapsed_ms=total_ms,
+                extra=extra,
             )
         except Exception:
             pass
