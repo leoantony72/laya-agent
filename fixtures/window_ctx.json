@@ -14,5 +14,21 @@
     "volume_level": 55,
     "is_muted": false,
     "dark_mode": true
+  },
+  "notepad": {
+    "active_app": "notepad",
+    "active_title": "Untitled - Notepad",
+    "running_apps": ["notepad", "Code", "explorer"],
+    "volume_level": 55,
+    "is_muted": false,
+    "dark_mode": true
+  },
+  "notepad_saved": {
+    "active_app": "notepad",
+    "active_title": "home.txt - Notepad",
+    "running_apps": ["notepad", "Code", "explorer"],
+    "volume_level": 55,
+    "is_muted": false,
+    "dark_mode": true
   }
 }

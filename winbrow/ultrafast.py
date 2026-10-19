@@ -20,6 +20,7 @@ import logging
 import re
 import time
 import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1081,17 +1082,36 @@ class LayaUltrafastEngine:
         # Early termination: if we just navigated to a search results page,
         # extract content and return immediately — no multi-step loop needed.
         if target_url and "google.com/search" in (target_url or ""):
-            await asyncio.sleep(0.5)  # let results render
+            await asyncio.sleep(0.8)  # let results render
             page_text = await self.browser.read_page_text()
             text = page_text.get("text", "")
             title_info = await self.browser.get_current_url()
             page_title = title_info.get("title", "")
-            snippet = (text[:500] + "...") if len(text) > 500 else text
+
+            # If browser extraction didn't yield text, query Wikipedia API fallback
+            if not text:
+                try:
+                    clean_q = cleaned_query or goal
+                    clean_q = re.sub(r"^(?:fetch|get|show|tell)\s+(?:me\s+)?(?:the\s+)?(?:details\s+of\s+|info\s+about\s+)?", "", clean_q, flags=re.I).strip()
+                    wiki_q = urllib.parse.quote(clean_q.replace(" ", "_"))
+                    req = urllib.request.Request(
+                        f"https://en.wikipedia.org/api/rest_v1/page/summary/{wiki_q}",
+                        headers={"User-Agent": "WinBrow/1.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=3.5) as r:
+                        wdata = json.loads(r.read().decode("utf-8", errors="replace"))
+                        if wdata.get("extract"):
+                            text = f"{wdata.get('title')}: {wdata.get('extract')}"
+                            page_title = wdata.get("title", page_title)
+                except Exception:
+                    pass
+
+            snippet = (text[:800] + "...") if len(text) > 800 else text
             total_elapsed = round((time.perf_counter() - t0) * 1000, 1)
             return UltrafastResult(
                 goal=goal,
                 success=True,
-                final_answer=f"{page_title}\n{snippet}" if snippet else f"Searched for: {goal}",
+                final_answer=f"{page_title}\n{snippet}" if (page_title and snippet) else (snippet or f"Searched for: {goal}"),
                 steps=[{"step": 1, "action": "navigate", "reason": f"Direct search: {target_url}", "elapsed_ms": total_elapsed}],
                 total_elapsed_ms=total_elapsed,
                 method="laya_ultrafast",

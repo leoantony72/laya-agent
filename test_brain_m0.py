@@ -363,6 +363,7 @@ class TestAgentIntegration(unittest.TestCase):
     def _agent(self):
         from winbrow.agent import WinBrowAgent
         agent = WinBrowAgent(gateway=FakeGateway())
+        agent.skills.find_match = lambda u: None
         # stub skill execution — no real system side effects in tests
         async def fake_skill(name, args):
             return {"success": True, "output": f"stub {name}"}

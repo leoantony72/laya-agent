@@ -16,6 +16,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -30,6 +31,7 @@ from .computer.tools import execute_computer_tool
 from .adapters import ADAPTER_IMPL, get_adapter_tools
 from .adapters.manager import execute_adapter_tool
 from .installer import INSTALLER_IMPL, INSTALL_OPS, get_installer_tools
+from .mcp import MCP_IMPL, get_mcp_tools, execute_mcp_tool, get_mcp_hub
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
@@ -121,6 +123,75 @@ def _is_interactive_task(utterance: str) -> bool:
     return any(pat in lower for pat in _INTERACTIVE_PATTERNS)
 
 
+# City/country → IANA timezone for MCP time shortcuts ("what time is it in X").
+_TZ_ALIASES = {
+    # India + neighbours
+    "delhi": "Asia/Kolkata", "newdelhi": "Asia/Kolkata", "mumbai": "Asia/Kolkata",
+    "bombay": "Asia/Kolkata", "bangalore": "Asia/Kolkata", "bengaluru": "Asia/Kolkata",
+    "kolkata": "Asia/Kolkata", "calcutta": "Asia/Kolkata", "chennai": "Asia/Kolkata",
+    "hyderabad": "Asia/Kolkata", "pune": "Asia/Kolkata", "india": "Asia/Kolkata",
+    "karachi": "Asia/Karachi", "dhaka": "Asia/Dhaka", "colombo": "Asia/Colombo",
+    "kathmandu": "Asia/Kathmandu",
+    # East/SE Asia
+    "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai", "china": "Asia/Shanghai",
+    "hongkong": "Asia/Hong_Kong", "seoul": "Asia/Seoul", "korea": "Asia/Seoul",
+    "singapore": "Asia/Singapore", "jakarta": "Asia/Jakarta", "bangkok": "Asia/Bangkok",
+    "kualalumpur": "Asia/Kuala_Lumpur", "manila": "Asia/Manila", "hanoi": "Asia/Ho_Chi_Minh",
+    "taipei": "Asia/Taipei", "japan": "Asia/Tokyo",
+    # Middle East / Africa
+    "dubai": "Asia/Dubai", "riyadh": "Asia/Riyadh", "doha": "Asia/Qatar",
+    "tehran": "Asia/Tehran", "jerusalem": "Asia/Jerusalem", "istanbul": "Europe/Istanbul",
+    "cairo": "Africa/Cairo", "lagos": "Africa/Lagos", "nairobi": "Africa/Nairobi",
+    "johannesburg": "Africa/Johannesburg", "capetown": "Africa/Johannesburg",
+    # Europe
+    "london": "Europe/London", "uk": "Europe/London", "england": "Europe/London",
+    "paris": "Europe/Paris", "france": "Europe/Paris", "berlin": "Europe/Berlin",
+    "germany": "Europe/Berlin", "rome": "Europe/Rome", "milan": "Europe/Rome",
+    "madrid": "Europe/Madrid", "barcelona": "Europe/Madrid", "lisbon": "Europe/Lisbon",
+    "amsterdam": "Europe/Amsterdam", "brussels": "Europe/Brussels", "zurich": "Europe/Zurich",
+    "geneva": "Europe/Zurich", "vienna": "Europe/Vienna", "prague": "Europe/Prague",
+    "warsaw": "Europe/Warsaw", "stockholm": "Europe/Stockholm", "oslo": "Europe/Oslo",
+    "helsinki": "Europe/Helsinki", "copenhagen": "Europe/Copenhagen",
+    "athens": "Europe/Athens", "dublin": "Europe/Dublin", "moscow": "Europe/Moscow",
+    "russia": "Europe/Moscow",
+    # Americas / Oceania
+    "losangeles": "America/Los_Angeles", "sanfrancisco": "America/Los_Angeles",
+    "seattle": "America/Los_Angeles", "chicago": "America/Chicago",
+    "washington": "America/New_York", "boston": "America/New_York",
+    "toronto": "America/Toronto", "canada": "America/Toronto",
+    "saopaulo": "America/Sao_Paulo", "brazil": "America/Sao_Paulo",
+    "mexicocity": "America/Mexico_City", "sydney": "Australia/Sydney",
+    "melbourne": "Australia/Melbourne", "australia": "Australia/Sydney",
+    "auckland": "Pacific/Auckland", "usa": "America/New_York", "us": "America/New_York",
+}
+
+
+def _city_timezone(place: str) -> Optional[str]:
+    """Resolve a city/country phrase to an IANA timezone name.
+
+    Aliases win; otherwise scan zoneinfo for a zone whose last segment
+    matches ("tokyo" → Asia/Tokyo, "new york" → America/New_York)."""
+    name = re.sub(r"[^a-z]", "", (place or "").lower())
+    if not name:
+        return None
+    if name in ("utc", "gmt", "greenwich"):
+        return "UTC"
+    if name in _TZ_ALIASES:
+        return _TZ_ALIASES[name]
+    try:
+        from zoneinfo import available_timezones
+        for zone in sorted(available_timezones()):
+            if re.sub(r"[^a-z]", "", zone.split("/")[-1].lower()) == name:
+                return zone
+    except Exception:
+        pass
+    return None
+
+
+# Windows drive path ending in .pdf inside an utterance.
+_PDF_PATH_RE = re.compile(r'([A-Za-z]:[\\/][^"\'\r\n]+?\.pdf)\b', re.I)
+
+
 def _is_known_task(utterance: str) -> bool:
     """
     Check if utterance looks like a known task (search, open, volume, etc.)
@@ -206,6 +277,12 @@ class WinBrowAgent:
         for _t in get_computer_tools() + get_adapter_tools() + get_installer_tools():
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
+        # v3/M6: MCP bridge — cached catalogs offline-register; fresh
+        # connects happen later in server startup / first use
+        try:
+            get_mcp_tools(self.registry)
+        except Exception as _e:
+            log.debug(f"MCP tool bootstrap skipped: {_e}")
         # v3/M2: procedural memory (captured plans → instant replay)
         from .memory.skills import get_skills
         self.skills = get_skills()
@@ -303,6 +380,41 @@ class WinBrowAgent:
                 "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
                 "method": out.get("method", "laya_ultrafast"),
             }
+        if tool_name == "app_focus_or_launch":
+            app_name = str(args.get("app_name", "notepad")).strip()
+            from .windows import focus_or_launch_app
+            out = await focus_or_launch_app(app_name)
+            return {
+                "type": "tool_execution",
+                "tool": tool_name,
+                "success": bool(out.get("success", True)),
+                "output": out.get("output", f"Focused {app_name}"),
+                "elapsed_ms": 15.0,
+            }
+        if tool_name == "type_text":
+            text = str(args.get("text", ""))
+            # Ensure target application is focused before typing
+            target_app = str(args.get("app") or "").strip().lower()
+            u_low = (utterance or "").lower()
+            if not target_app:
+                for app in ("notepad", "word", "code", "calc"):
+                    if app in u_low:
+                        target_app = app
+                        break
+            if target_app:
+                from .windows import focus_or_launch_app
+                await focus_or_launch_app(target_app)
+                await asyncio.sleep(0.2)
+            from .computer.driver import ComputerDriver
+            driver = ComputerDriver(guard_screen=False)
+            out = driver.type_text(text, via_clipboard=True)
+            return {
+                "type": "tool_execution",
+                "tool": tool_name,
+                "success": bool(out.get("success", True)),
+                "output": f"Typed text into active window ({len(text)} chars)",
+                "elapsed_ms": 20.0,
+            }
         # v3/M1: Python-backed native computer atoms (no script template)
         if getattr(tool, "impl", None) == COMPUTER_IMPL:
             out = execute_computer_tool(tool_name, args)
@@ -328,6 +440,10 @@ class WinBrowAgent:
             out.update({"type": "installer", "tool": tool_name})
             # one-shot usage of the approved confirmation
             get_permissions().consume(tool_name, args)
+            return out
+        # v3/M6: MCP bridge tools (mcp://{server}/{remote-tool} carrier)
+        if getattr(tool, "impl", None) == MCP_IMPL:
+            out = await execute_mcp_tool(tool_name, tool, args)
             return out
         rendered = pre_rendered or tool.render_script(args)
         exec_out = await run_powershell(rendered)
@@ -376,13 +492,21 @@ class WinBrowAgent:
     def _capture_skill_candidate(self, utterance: str, brain_res: Any) -> None:
         """v3/M2: turn a successful brain plan into a replayable skill (non-fatal)."""
         try:
-            meta_skills = {"remember_fact", "recall_memory"}
+            NON_CAPTURE_SKILLS = {
+                "remember_fact", "recall_memory", "type_text", "computer_type",
+                "computer_paste", "paste", "quick_note", "file_dialog_save",
+            }
+            all_steps = getattr(brain_res, "steps", [])
+            # If the plan contains transient text/payload steps, do not capture as static replayable macro
+            if any(getattr(s, "skill", "") in NON_CAPTURE_SKILLS for s in all_steps):
+                log.debug("Skill capture skipped: plan contains dynamic payload skill")
+                return
             steps = [
                 {"skill": s.skill, "args": dict(getattr(s, "args", {}) or {})}
-                for s in getattr(brain_res, "steps", [])
-                if getattr(s, "success", False) and s.skill not in meta_skills
+                for s in all_steps
+                if getattr(s, "success", False) and s.skill not in NON_CAPTURE_SKILLS
             ]
-            if steps:
+            if steps and len(steps) >= 2:
                 self.skills.save(name=utterance[:60], utterance=utterance,
                                  steps=steps, source="brain")
         except Exception as e:
@@ -682,6 +806,34 @@ class WinBrowAgent:
         t0 = time.perf_counter()
         session = self.session if session_id == "default" else get_session(session_id)
 
+        # ── Check if user is approving or denying a pending permission action ──
+        clean_words = (utterance or "").strip().lower().rstrip(".!?,")
+        if clean_words in ("yes", "approve", "confirm", "allow", "proceed", "go ahead", "do it", "sure", "yep", "ok do it", "accept"):
+            from .permissions import get_permissions
+            pm = get_permissions()
+            pending_list = pm.pending_list()
+            if pending_list:
+                last_pending = pending_list[-1]
+                remember = last_pending.get("tier") == "t2"
+                pm.resolve_pending(last_pending["confirmation_id"], approve=True, remember=remember)
+                pm.consume(last_pending["tool"], last_pending["args"])
+                log.info(f"User approved pending action '{last_pending['tool']}' via chat: re-running '{last_pending['utterance']}'")
+                return await self.execute(last_pending["utterance"], session_id=session_id)
+        elif clean_words in ("no", "deny", "cancel", "reject", "don't do it", "dont"):
+            from .permissions import get_permissions
+            pm = get_permissions()
+            pending_list = pm.pending_list()
+            if pending_list:
+                last_pending = pending_list[-1]
+                pm.resolve_pending(last_pending["confirmation_id"], approve=False)
+                pm.consume(last_pending["tool"], last_pending["args"])
+                return {
+                    "utterance": utterance,
+                    "route": {"kind": "stop", "tier": "permission"},
+                    "execution": {"type": "denied", "success": False, "output": f"Action '{last_pending['tool']}' was denied by user."},
+                    "total_elapsed_ms": 1.0,
+                }
+
         # ── v3/M2: procedural replay ──
         # A captured skill matching this utterance replays its exact steps
         # locally (CLI/atom adapters ≈ tens of ms per step) before any routing
@@ -770,9 +922,155 @@ class WinBrowAgent:
             "tab", "reload", "scroll", "screenshot", "find on page", "incognito"
         ]) and not is_interactive  # interactive tasks should NOT be treated as simple search
 
-        # ── ROUTE ALL WEB & BROWSER TASKS DIRECTLY TO LAYA-ULTRAFAST ──
-        # Any browser intent or search query (even basic search) is driven by laya-ultrafast.
-        if browser_fast or is_search:
+        # Multi-step command check: if the user wants multiple steps (e.g. search + save to desktop),
+        # do NOT hijack with browser fast-path; let it route to the multi-step brain planner.
+        is_multi_step = any(kw in utterance_lower for kw in [
+            "save it", "save in", "save to", "save as", "in desktop", "on desktop",
+            "in a .txt", "in a txt", "in notepad", "to notepad", "and then", "and also",
+            "and save", "then save", "write it", "note it", "make a note", "save the"
+        ])
+
+        # MCP direct shortcuts for high-confidence lookups and local reads —
+        # these MUST run before the browser/is_search fast-path so "search
+        # wikipedia for X" reaches the wiki server instead of Google, and
+        # before router/brain so git/time/pdf/local files work brainless.
+        mcp_shortcut_tool = None
+        mcp_shortcut_args: dict[str, Any] = {}
+        if not is_multi_step and not is_interactive:
+            wiki_tool = self.registry.get("mcp_wikipedia_get_summary") or self.registry.get("mcp_wikipedia_search_wikipedia")
+            dict_tool = self.registry.get("mcp_dictionary_define")
+            git_tools = {verb: self.registry.get(f"mcp_git_git_{verb}")
+                         for verb in ("status", "log", "diff", "branch", "show")}
+            time_tool = self.registry.get("mcp_time_get_current_time")
+            pdf_extract = self.registry.get("mcp_pdf_pdf_extract_text")
+            pdf_info = self.registry.get("mcp_pdf_pdf_info")
+            pdf_search = self.registry.get("mcp_pdf_pdf_search")
+            read_file = self.registry.get("mcp_filesystem_read_text_file")
+            if dict_tool and (utterance_lower.startswith("define ") or utterance_lower.startswith("meaning of ")):
+                word = re.sub(r"^(?:define|meaning of)\s+", "", cleaned_utterance, flags=re.I).strip().strip("\"'")
+                if word:
+                    mcp_shortcut_tool = dict_tool.name
+                    mcp_shortcut_args = {"word": word}
+            elif wiki_tool:
+                topic = None
+                explicit_search = False
+                m_search = (re.match(r"^(?:search|look up|find)\s+(?:for\s+)?(?:wikipedia|wiki)\s+(?:for\s+)?(.+)$", cleaned_utterance, re.I)
+                            or re.match(r"^search\s+for\s+(.+?)\s+(?:on|in)\s+(?:wikipedia|wiki)$", cleaned_utterance, re.I)
+                            or re.match(r"^look\s+up\s+(.+?)\s+on\s+(?:wikipedia|wiki)$", cleaned_utterance, re.I))
+                if m_search:
+                    topic, explicit_search = m_search.group(1), True
+                else:
+                    m_wiki = re.match(r"^(?:wikipedia|wiki|what is|what are|who is|who was|details of|info on|tell me about)\s+(?:the\s+)?(.+)$", cleaned_utterance, re.I)
+                    if m_wiki:
+                        topic = m_wiki.group(1)
+                if topic:
+                    topic = topic.strip().strip("?.!\"'")
+                    if topic and not _SYSTEM_INTENT_RE.search(utterance_lower) and not any(k in topic.lower() for k in ("volume", "time", "battery", "my ip", "network")):
+                        chosen = wiki_tool
+                        if explicit_search:
+                            chosen = self.registry.get("mcp_wikipedia_search_wikipedia") or wiki_tool
+                        mcp_shortcut_tool = chosen.name
+                        arg_key = "title" if "get_summary" in chosen.name else "query"
+                        mcp_shortcut_args = {arg_key: topic}
+            if mcp_shortcut_tool is None and any(git_tools.values()):
+                m_git = re.match(r"^(?:show|run|get|check|display)?\s*(?:me\s+)?(?:the\s+)?git\s+(status|log|diff|branch|show)\b(.*)$", cleaned_utterance, re.I)
+                if m_git and git_tools.get(m_git.group(1).lower()):
+                    mcp_shortcut_tool = git_tools[m_git.group(1).lower()].name
+                    mcp_shortcut_args = {"repo_path": "."}
+            if mcp_shortcut_tool is None and time_tool:
+                m_time = re.match(r"^(?:what(?:'s| is)?\s+(?:the\s+)?)?(?:current\s+)?time(?:\s+is\s+it|\s+now)?\s+(?:in|at)\s+(.+)$", cleaned_utterance, re.I)
+                if m_time:
+                    zone = _city_timezone(m_time.group(1))
+                    if zone:
+                        mcp_shortcut_tool = time_tool.name
+                        mcp_shortcut_args = {"timezone": zone}
+            if mcp_shortcut_tool is None and (pdf_extract or pdf_info or pdf_search):
+                m_pdf = _PDF_PATH_RE.search(cleaned_utterance)
+                if m_pdf:
+                    path = m_pdf.group(1).strip().strip("\"'")
+                    if pdf_info and re.search(r"\b(info|metadata|details|pages|page count)\b", utterance_lower):
+                        mcp_shortcut_tool = pdf_info.name
+                        mcp_shortcut_args = {"path": path}
+                    elif pdf_search and re.search(r"\b(search|find|look for|mention|mentions|containing)\b", utterance_lower):
+                        tail = cleaned_utterance[m_pdf.end():]
+                        query = re.sub(r"^(?:\s*(?:for|about|containing|mentions?|with)\s*)", "", tail, flags=re.I).strip(" ?.!\"'")
+                        if query:
+                            mcp_shortcut_tool = pdf_search.name
+                            mcp_shortcut_args = {"path": path, "query": query}
+                    if mcp_shortcut_tool is None and pdf_extract:
+                        mcp_shortcut_tool = pdf_extract.name
+                        mcp_shortcut_args = {"path": path}
+            if mcp_shortcut_tool is None and read_file:
+                m_rf = re.match(r"^(?:read|show)\s+(?:me\s+)?(?:the\s+)?(?:contents\s+of\s+|file\s+)?([A-Za-z]:[\\/].+)$", cleaned_utterance, re.I)
+                if m_rf:
+                    mcp_shortcut_tool = read_file.name
+                    mcp_shortcut_args = {"path": m_rf.group(1).strip().strip("\"'")}
+
+        if mcp_shortcut_tool:
+            log.info(f"Direct MCP shortcut: {mcp_shortcut_tool} args={mcp_shortcut_args}")
+            out = await self.run_skill(mcp_shortcut_tool, mcp_shortcut_args, utterance=utterance, session_id=session_id)
+            # wikipedia search has a cold-start flake: the first calls after
+            # the stdio server boots can return slow/empty results — one
+            # bounded retry recovers most of those (warmup probes in mcp.py
+            # make this rare)
+            if mcp_shortcut_tool == "mcp_wikipedia_search_wikipedia" and out.get("success", True):
+                try:
+                    parsed = json.loads(str(out.get("output") or ""))
+                    if isinstance(parsed, dict) and not parsed.get("results"):
+                        await asyncio.sleep(0.7)
+                        retry = await self.run_skill(
+                            mcp_shortcut_tool, mcp_shortcut_args,
+                            utterance=utterance, session_id=session_id)
+                        try:
+                            rp = json.loads(str(retry.get("output") or ""))
+                            if isinstance(rp, dict) and rp.get("results"):
+                                out = retry
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            total_ms = round((time.perf_counter() - t0) * 1000, 1)
+            display_out = out.get("output") or "Done."
+            try:
+                parsed_out = json.loads(display_out)
+                if isinstance(parsed_out, dict):
+                    if "summary" in parsed_out:
+                        display_out = f"**{parsed_out.get('title', '')}**\n\n{parsed_out['summary']}"
+                    elif "meaning" in parsed_out:
+                        meanings = parsed_out.get("meaning", [])
+                        display_out = f"**{parsed_out.get('word', '')}**\n\n" + "\n".join(meanings)
+            except Exception:
+                pass
+            result = {
+                "utterance": utterance,
+                "route": {
+                    "kind": "tool",
+                    "tool_name": mcp_shortcut_tool,
+                    "args": mcp_shortcut_args,
+                    "confidence": 0.95,
+                    "latency_ms": 0,
+                    "probabilities": {},
+                    "tier": "mcp_shortcut",
+                },
+                "context": ctx.to_dict(),
+                "execution": {
+                    "type": "mcp",
+                    "tool": mcp_shortcut_tool,
+                    "success": out.get("success", True),
+                    "output": display_out,
+                    "elapsed_ms": out.get("elapsed_ms", 0.0),
+                },
+                "total_elapsed_ms": total_ms,
+            }
+            self.history.append(result)
+            if len(self.history) > 100:
+                self.history = self.history[-100:]
+            session.record_turn(utterance, result["route"], result["execution"])
+            self.store.record_command(utterance, result["route"], result["execution"], total_ms)
+            return result
+
+        # ── ROUTE WEB & BROWSER TASKS DIRECTLY TO LAYA-ULTRAFAST ──
+        if (browser_fast or is_search) and not is_multi_step:
             out = await self.browser.run_ultrafast_task(utterance)
             total_ms = round((time.perf_counter() - t0) * 1000, 1)
             result = {
@@ -805,8 +1103,10 @@ class WinBrowAgent:
             self.store.record_command(utterance, result["route"], result["execution"], total_ms)
             return result
 
-        # 1. Laya Routing (context memory lets "that file" resolve)
-        route: Route = await self.router.route(utterance, ctx, memory=self.memory)
+        # NOTE: multi-step detection now lives in the router (route() 2b
+        # fallback): single-step matches (e.g. the editor recipe) win first,
+        # only unresolvable multi-step phrasing falls to the Brain planner.
+        route = await self.router.route(utterance, ctx, memory=self.memory)
         log.info(f"Routed '{utterance}' → {route.kind} (tool: {route.tool.name if route.tool else None}, conf: {route.confidence:.2f})")
 
         result: dict[str, Any] = {

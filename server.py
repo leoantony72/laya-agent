@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,6 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from winbrow.agent import WinBrowAgent
+from winbrow.brain import uses_builtin_local_server
 from winbrow.windows import run_powershell
 from winbrow.model_manager import get_model_path, ensure_llama_cpp, ensure_all_models
 from winbrow.llm import QwenLLM
@@ -74,6 +76,36 @@ agent = WinBrowAgent()
 # Global LLM Instance
 llm_instance: Optional[QwenLLM] = None
 
+# M5: proactive suggestions observer (background refresh + on-demand reads)
+from winbrow.observe import Observer, Suggestion  # noqa: E402
+_observer: Optional[Observer] = None
+_observe_task: Optional[asyncio.Task] = None
+_last_refresh_ts: float = 0.0
+_OBSERVE_MIN_INTERVAL_PRI_SEC = 30.0
+
+# M6: MCP bridge connections (background connect + status)
+from winbrow.mcp import get_mcp_hub, reset_mcp_hub  # noqa: E402
+_mcp_task: Optional[asyncio.Task] = None
+_mcp_conns: list = []
+
+
+def get_observer() -> Observer:
+    global _observer
+    if _observer is None:
+        _observer = Observer()
+    return _observer
+
+
+async def _observe_loop() -> None:
+    """Background suggestion refresh — cheap (SQLite), off the request path."""
+    interval = float(os.environ.get("WINBROW_OBSERVE_INTERVAL_S", "180"))
+    while True:
+        try:
+            get_observer().refresh()
+        except Exception as e:
+            log.warning(f"Observe refresh failed (non-fatal): {e}")
+        await asyncio.sleep(max(30.0, interval))
+
 # Static Files
 static_dir = Path(__file__).parent / "static"
 static_dir.mkdir(exist_ok=True)
@@ -110,23 +142,29 @@ async def _startup() -> None:
     except Exception as e:
         log.warning(f"Model download failed (will retry on first use): {e}")
 
-    # 2. Optional local LLM (offline mode only)
-    if os.environ.get("WINBROW_LOCAL_LLM", "") == "1":
+    # 2. Local Qwen brain (WINBROW_BRAIN_PROVIDER=local|qwen, or WINBROW_LOCAL_LLM=1).
+    # Uses the built-in llama.cpp server unless WINBROW_LOCAL_LLM_ENDPOINT points
+    # at an external OpenAI-compatible server (Ollama / LM Studio).
+    if uses_builtin_local_server():
         try:
-            log.info("Starting local LLM server (offline mode)...")
+            log.info("Starting local Qwen brain (llama.cpp)...")
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: ensure_llama_cpp(download=True))
             llm_instance = QwenLLM()
             await llm_instance.start()
-            log.info(f"LLM server ready at {llm_instance.base_url}")
+            log.info(f"Local Qwen brain ready at {llm_instance.base_url}")
         except Exception as e:
-            log.warning(f"LLM server failed to start (will retry on first use): {e}")
+            log.warning(f"Local LLM server failed to start ({e}); "
+                        "brain will use the cloud fallback provider.")
             llm_instance = None
+
+    if agent.gateway.available:
+        prov = agent.gateway.providers[0]
+        fallbacks = ", ".join(p.name for p in agent.gateway.providers[1:]) or "none"
+        log.info(f"Brain online: {prov.name} / {prov.model} (fallbacks: {fallbacks})")
     else:
-        if agent.gateway.available:
-            prov = agent.gateway.providers[0]
-            log.info(f"Brain online: {prov.name} / {prov.model}")
-        else:
-            log.warning("Brain offline: set OPENROUTER_API_KEY for full intelligence "
-                        "(generator tier + heuristics still work).")
+        log.warning("Brain offline: set OPENROUTER_API_KEY or WINBROW_BRAIN_PROVIDER=local "
+                    "(generator tier + heuristics still work).")
 
     # 3. Warm up PowerShell
     try:
@@ -134,14 +172,96 @@ async def _startup() -> None:
     except Exception as e:
         log.warning(f"PowerShell warm-up failed (non-fatal): {e}")
 
+    # 4. M5: observe service — proactive suggestions on a background loop
+    global _observe_task
+    try:
+        get_observer().refresh()
+        _observe_task = asyncio.create_task(_observe_loop())
+        log.info("Observe service running "
+                 f"({len(get_observer().current)} suggestion(s) seeded)")
+    except Exception as e:
+        log.warning(f"Observe service failed to start (non-fatal): {e}")
+
+    # 5. M6: MCP bridge — best-effort background connect for all enabled
+    # servers; tools register into the shared agent registry (fresh
+    # catalogs served from cache if a server is offline).
+    global _mcp_task, _mcp_conns
+    if not get_mcp_hub().disabled:
+        _mcp_task = asyncio.create_task(_mcp_connect_loop())
+
+
+async def _mcp_connect_loop() -> None:
+    """Connect ONLY preload servers at boot; the rest spawn lazily on use."""
+    global _mcp_conns
+    try:
+        hub = get_mcp_hub()
+        preload = [s for s in hub.specs() if s.preload and s.enabled]
+        _mcp_conns = await hub.connect_with_registry(
+            agent.registry, specs=preload)
+        ok = sum(1 for c in _mcp_conns if not c.error)
+        log.info(f"MCP bridge: {ok}/{len(_mcp_conns)} preload server(s) connected "
+                 f"({sum(len(c.tools) for c in _mcp_conns if not c.error)} tool(s))")
+    except Exception as e:
+        log.warning(f"MCP bridge connect failed (non-fatal): {e}")
+
+
+# ids of preload servers given a second connect attempt by /api/mcp; kept on
+# failure so a genuinely dead server is not re-spawned on every poll
+_mcp_kick: set = set()
+
+
+async def _mcp_kick_connect(server_id: str) -> None:
+    """One extra background connect for a preload server + tool re-register."""
+    ok = False
+    try:
+        from winbrow.mcp import get_mcp_hub, _register_hub_tools
+        hub = get_mcp_hub()
+        spec = next((s for s in hub.specs() if s.id == server_id), None)
+        if spec is not None:
+            conn = await hub.connect(spec)
+            _register_hub_tools(hub, agent.registry)
+            ok = not conn.error
+            log.info(f"MCP kick: '{server_id}' "
+                     f"{'connected' if ok else 'failed: ' + conn.error}")
+    except Exception as e:
+        log.debug(f"MCP kick connect failed for '{server_id}': {e}")
+    finally:
+        if ok:
+            _mcp_kick.discard(server_id)
+
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """Stop LLM server on shutdown."""
-    global llm_instance
+    """Terminate MCP children, close sockets, bound every stop to seconds."""
+    global llm_instance, _observe_task, _mcp_task, _mcp_conns
+    log.info("Shutting down...")
+    if _observe_task:
+        _observe_task.cancel()
+        _observe_task = None
+    if _mcp_task:
+        _mcp_task.cancel()
+        try:
+            await _mcp_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _mcp_task = None
+    _mcp_conns = []
+    try:
+        reset_mcp_hub()          # terminates all MCP subprocesses
+    except Exception:
+        pass
+    for ws in list(_ws_clients):   # unblock the graceful window immediately
+        try:
+            await ws.close()
+        except Exception:
+            pass
+    _ws_clients.clear()
     if llm_instance:
         log.info("Stopping LLM server...")
-        await llm_instance.stop()
+        try:
+            await asyncio.wait_for(llm_instance.stop(), timeout=3.0)
+        except Exception:
+            pass
         llm_instance = None
 
 
@@ -184,7 +304,10 @@ class BrowserRequest(BaseModel):
 @app.get("/", response_class=HTMLResponse)
 async def index():
     html_path = Path(__file__).parent / "templates" / "index.html"
-    return HTMLResponse(content=html_path.read_text(encoding="utf-8"))
+    # no-store: the UI ships updates with every server restart; browsers must
+    # never keep serving an older mid-edit page from cache
+    return HTMLResponse(content=html_path.read_text(encoding="utf-8"),
+                        headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +340,12 @@ async def execute_command(req: ExecuteRequest):
         session_id=req.session_id or "default",
     )
 
-    # Broadcast to all WebSocket clients (send both types for compatibility)
-    await _broadcast({"type": "result", "data": result})
-    await _broadcast({"type": "execution", "data": result})
+    # NOTE: We intentionally do NOT broadcast the result over WebSocket here.
+    # The HTTP response already returns the result to the caller (the UI's
+    # run() function), and the UI's ws.onmessage handler also calls
+    # renderCard() for "result" messages — causing every task to appear
+    # twice in the trace.  WebSocket-initiated executions (action=execute)
+    # send their own result at line ~778, so those are covered.
 
     return JSONResponse(result)
 
@@ -234,9 +360,14 @@ async def get_context():
 
 @app.get("/api/system")
 async def system_info():
-    """System info: context + server version + Laya router + brain status."""
+    """System info: context + server version + Laya router + brain + MCP status."""
     loop = asyncio.get_event_loop()
     ctx = await loop.run_in_executor(None, agent.get_context)
+    try:
+        mcp = {"servers": get_mcp_hub().status(),
+               "enabled": not get_mcp_hub().disabled}
+    except Exception:
+        mcp = {"servers": [], "enabled": False}
     return JSONResponse({
         "context": ctx.to_dict(),
         "version": "3.0.0",
@@ -245,6 +376,7 @@ async def system_info():
         "history_count": len(agent.history),
         "brain": agent.gateway.status(),
         "session_summary": agent.session.summary(),
+        "mcp": mcp,
     })
 
 
@@ -258,6 +390,7 @@ async def get_tools():
             "name": t.name,
             "description": t.description,
             "is_learned": t.is_learned,
+            "impl": getattr(t, "impl", None),
             "scope": t.scope,
             "examples": t.examples,
             "tier": tool_tier(t.name),
@@ -274,6 +407,56 @@ async def get_tools():
             "script": t.script.strip(),
         })
     return JSONResponse({"tools": tools_list, "count": len(tools_list)})
+
+
+@app.get("/api/mcp")
+async def mcp_detail():
+    """MCP bridge detail for the Tools page: runtime status + full tool
+    catalog per server (live connection preferred, catalog cache fallback)."""
+    from winbrow.mcp import get_mcp_hub, _load_cache
+    from winbrow.permissions import tool_tier
+    try:
+        hub = get_mcp_hub()
+        # a boot-time preload connect can miss its window (cold npx/python
+        # imports); nudge it once in the background so "live" converges
+        # instead of showing 0/N forever
+        for spec in hub.specs():
+            if (spec.preload and spec.enabled
+                    and spec.id not in hub.connections
+                    and spec.id not in _mcp_kick):
+                _mcp_kick.add(spec.id)
+                asyncio.create_task(_mcp_kick_connect(spec.id))
+        st = {s["id"]: s for s in hub.status()}
+        cache = _load_cache(hub.cache_path)
+        servers = []
+        for spec in hub.specs():
+            meta = st.get(spec.id) or {}
+            conn = hub.connections.get(spec.id)
+            catalog = (conn.tools if conn and conn.tools else []) \
+                      or (cache.get(spec.id) or [])
+            tools = [{
+                "name": t.get("name", ""),
+                "full_name": f"mcp_{spec.id}_{t.get('name', '')}",
+                "description": t.get("description", ""),
+                "tier": tool_tier(f"mcp_{spec.id}_{t.get('name', '')}"),
+            } for t in catalog]
+            servers.append({
+                "id": spec.id,
+                "transport": meta.get("transport", "http" if spec.url else "stdio"),
+                "enabled": spec.enabled,
+                "preload": spec.preload,
+                "tier": spec.tier or "",
+                "available": meta.get("available", False),
+                "error": meta.get("error", ""),
+                "source": " ".join(spec.command) if spec.command else (spec.url or ""),
+                "description": spec.description,
+                "tools": tools,
+                "cached": bool(spec.id in cache) and not catalog,
+            })
+        return JSONResponse({"enabled": not hub.disabled, "servers": servers})
+    except Exception as e:
+        return JSONResponse({"enabled": False, "servers": [],
+                             "error": str(e)}, status_code=200)
 
 
 @app.get("/api/history")
@@ -424,6 +607,42 @@ async def add_fact(req: MemoryRequest):
         return JSONResponse({"error": "Empty fact"}, status_code=400)
     agent.store.add_fact(fact)
     return JSONResponse({"status": "saved", "fact": fact})
+
+
+# ---------------------------------------------------------------------------
+# M5: observe service — proactive suggestions
+# ---------------------------------------------------------------------------
+
+class DismissRequest(BaseModel):
+    id: str
+
+
+@app.get("/api/suggestions")
+async def get_suggestions(refresh: Optional[str] = None):
+    """Current proactive suggestions. Refreshed in background every ~3min;
+    ?refresh=1 forces a rebuild (rate-limited to 1 / 30s on 2 cores)."""
+    obs = get_observer()
+    global _last_refresh_ts
+    if refresh and (time.time() - _last_refresh_ts) >= _OBSERVE_MIN_INTERVAL_PRI_SEC:
+        try:
+            await asyncio.get_event_loop().run_in_executor(None, obs.refresh)
+            _last_refresh_ts = time.time()
+        except Exception as e:
+            log.warning(f"Suggestion refresh failed: {e}")
+    return JSONResponse({
+        "suggestions": [s.to_dict() for s in obs.current],
+    })
+
+
+@app.post("/api/suggestions/dismiss")
+async def dismiss_suggestion(req: DismissRequest):
+    """Swat away a suggestion — it stays dismissed for 12h (persisted)."""
+    obs = get_observer()
+    before = [s for s in obs.current if s.id == req.id]
+    obs.dismissals.dismiss(req.id)
+    if before:
+        obs.current = [s for s in obs.current if s.id != req.id]
+    return JSONResponse({"status": "dismissed", "id": req.id})
 
 
 @app.post("/api/settings")
@@ -596,4 +815,10 @@ async def websocket_endpoint(ws: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8765))
-    uvicorn.run("server:app", host="127.0.0.1", port=port, reload=False)
+    # Ctrl+C must always terminate even with WebSocket clients open: bound
+    # the graceful window (voice/live-context sockets otherwise keep the
+    # shutdown waiting on reconnecting browser tabs), then hard-exit for any
+    # stray non-daemon threads (MCP subprocess watchdogs, model workers).
+    uvicorn.run("server:app", host="127.0.0.1", port=port, reload=False,
+                timeout_graceful_shutdown=3)
+    os._exit(0)

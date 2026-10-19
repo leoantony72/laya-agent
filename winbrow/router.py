@@ -166,12 +166,17 @@ class LayaWorker:
         """
         if not self._thread.is_alive():
             raise RuntimeError("Laya worker thread is not running")
+        if self._queue.qsize() > 0:
+            raise asyncio.TimeoutError("Laya worker thread is backlogged")
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._queue.put((fut, text, questions))
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
         while True:
             if fut.done():
+                if fut.cancelled():
+                    raise asyncio.TimeoutError(
+                        f"Laya prediction cancelled after {timeout}s")
                 return fut.result()
             if loop.time() >= deadline:
                 fut.cancel()
@@ -183,6 +188,12 @@ class LayaWorker:
 
 _worker_singleton: Optional[LayaWorker] = None
 _worker_lock = threading.Lock()
+
+
+def _laya_disabled() -> bool:
+    """Full kill switch: WINBROW_DISABLE_LAYA=1|true|yes|on → no torch load."""
+    v = os.environ.get("WINBROW_DISABLE_LAYA", "0").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def get_laya_worker() -> LayaWorker:
@@ -255,8 +266,7 @@ _COMMAND_VOCAB = frozenset({
     "it", "its", "them", "that", "this",
 })
 
-# Function words the fuzzy layer must never touch. Levenshtein loves
-# swapping "what"→"that" or "when"→"them", which destroys questions
+# Function words the fuzzy layer must never touch. Levenshtein loves "what"→"that" or "when"→"them", which destroys questions
 # ("what time is it") and chat intent. Learned Stage-3 corrections still
 # override these, because the user explicitly taught the mapping.
 _FUNCTION_WORDS = frozenset({
@@ -291,6 +301,83 @@ _STOP_RE = re.compile(
     r"\b(stop listening|stop winbrow|stop the assistant|exit winbrow|"
     r"shut down winbrow|cancel listening|halt)\b"
 )
+
+# ── Brain-free conversational "editor recipe" (M5 UX) ──────────────────
+# Step-by-step sessions where the user speaks one command, waits for it to
+# finish, then speaks the next. The focused editable app (Notepad-like)
+# makes typing/saving deterministic, so no cloud brain is needed to
+# sequence the workflow.
+_EDITABLE_APP_TOKENS = frozenset({
+    "notepad", "word", "excel", "code", "vscode", "wordpad", "writer",
+    "sublime", "notion", "editplus",
+})
+_TYPE_RE = re.compile(
+    r"^(?:write|type)\s+(?:(?:in|into)\s+(?:a\s+|the\s+)?notepad\s*)?(.+)$"
+)
+_SAVE_AS_RE = re.compile(r"^(?:save|export)\b", re.I)
+_SAVE_DEST_RE = re.compile(
+    r"\s+(?:in|to|into|on)\s+(?:the\s+|my\s+|a\s+)?"
+    r"(?P<folder>downloads?|documents?|desktop|pics?|pictures?|images?|videos?)"
+    r"(?:\s+folder)?(?:\s*[.!])?\s*$", re.I
+)
+
+
+def _parse_save_utterance(lower: str) -> tuple[str, str]:
+    """'save it as home.txt in the downloads folder' → ('home.txt', 'downloads').
+
+    Destination must terminate the utterance (end-anchored); the remainder
+    is the filename. Returns ("", "") when nothing useful is present.
+    """
+    folder = ""
+    rest = lower
+    m = _SAVE_DEST_RE.search(lower)
+    if m:
+        folder = m.group("folder")
+        rest = (lower[: m.start()] + lower[m.end():]).strip()
+    rest = re.sub(r"^(?:save|export)\b\s*", "", rest, flags=re.I)
+    rest = re.sub(r"^(?:it|this|that|the)\b\s*", "", rest, flags=re.I)
+    rest = re.sub(r"^(?:as|to)\b\s*", "", rest, flags=re.I).strip()
+    rest = rest.strip(".,!")
+    return rest.strip(), folder
+
+
+def _editable_focused(ctx) -> bool:
+    try:
+        app = (ctx.active_app or "").lower()
+        title = (ctx.active_title or "").lower()
+    except AttributeError:
+        return False
+    app_tokens = set(re.findall(r"[a-z0-9+#]+", app))
+    if app_tokens:
+        return bool(app_tokens & _EDITABLE_APP_TOKENS)
+    title_tokens = set(re.findall(r"[a-z0-9+#]+", title))
+    return bool(title_tokens & _EDITABLE_APP_TOKENS)
+
+
+_WIKI_RE = re.compile(r"\b(wikipedia|wiki)\b")
+
+
+def _wiki_strip_article(q: str) -> str:
+    """Drop the leading article: 'the prime meridian' → 'prime meridian'.
+    Wikipedia title lookups hit best without it."""
+    return re.sub(r"^(?:the|a|an)\s+", "", q, count=1)
+
+
+def _wiki_extract(lower: str) -> str:
+    """Utterance → wikipedia query (or ''). Handles the common spoken forms:
+    'what is X on wikipedia', 'search wikipedia for X', 'wiki X',
+    'X on wikipedia', 'who was X in wikipedia'."""
+    m = re.search(r"\b(?:search|look up|find)\s+(?:wikipedia|wiki)\s+(?:for\s+)?(.+)$", lower)
+    if m:
+        return _wiki_strip_article(m.group(1).strip(" ?."))
+    m = re.search(r"(.+?)\s+(?:on|in|from|via)\s+(?:wikipedia|wiki)\b", lower)
+    if m:
+        q = re.sub(r"^(?:what|who|when|where)\s+(?:is|are|was|were)\s+", "", m.group(1)).strip()
+        return _wiki_strip_article(q.strip(" ?."))
+    m = re.match(r"^(?:wikipedia|wiki)\s+(?:search\s+)?(?:for\s+)?(.+)$", lower)
+    if m:
+        return _wiki_strip_article(m.group(1).strip(" ?."))
+    return ""
 
 _CONTEXTUAL_VOLUME_RE = re.compile(
     r"\b(?:make|keep|set)\s+(?:its?|them)\b"
@@ -435,7 +522,14 @@ def autocorrect_utterance(
     semantic memory — consulted first, before Levenshtein can guess.
     Function words ("what", "that", "this", ...) are never fuzzy-rewritten:
     rewriting them wrecks the sentence ("what time is it" → "that time it it").
+    M6: Wikipedia/URL utterances are passed through VERBATIM — they are
+    dominated by proper nouns ("prime meridian", example.com) that Levenshtein
+    happily mangles ("prime"→"time").
     """
+    low_all = (text or "").lower()
+    if "wikipedia" in low_all or " wiki " in f" {low_all} " or \
+            low_all.strip().startswith("wiki ") or "http" in low_all or "www." in low_all:
+        return text
     vocab = set(_COMMAND_VOCAB)
     for item in extra or []:
         for tok in re.split(r"\W+", item.lower()):
@@ -647,18 +741,22 @@ class WinBrowRouter:
         # Read env dynamically (not the import-time constant) so tests and
         # host config can override LAYA_TIMEOUT_S per process start.
         self.timeout = timeout if timeout is not None else _laya_timeout_default()
-        self._worker = get_laya_worker()
+        # WINBROW_DISABLE_LAYA=1 is a FULL kill switch: no worker thread, no
+        # torch import, no model download — heuristics (and brain) remain.
+        self._worker = None if _laya_disabled() else get_laya_worker()
         self.store = store
+        self._consecutive_timeouts = 0
+        self._last_timeout_time = 0.0
 
     @property
     def _loaded(self) -> bool:
         """Whether the decision model is ready (kept for /api/system)."""
-        return self._worker.loaded
+        return bool(self._worker and self._worker.loaded)
 
     @property
     def _router(self) -> Any:
         """The underlying laya Router, or None while loading/unavailable."""
-        return self._worker.router
+        return self._worker.router if self._worker else None
 
     async def route(self, utterance: str, ctx: WindowsContext, memory=None) -> Route:
         """Heuristic-first routing; Laya and a constrained LLM only on misses."""
@@ -684,22 +782,56 @@ class WinBrowRouter:
         if corrected.lower() != stripped.lower():
             log.info(f"Normalized '{text}' → '{corrected}'")
 
-        # 1. Laya on tools
-        try:
-            questions = self._build_questions(corrected, tools, ctx)
-            result = await self._worker.apredict(corrected, questions, self.timeout)
-            routed = self._route_from_answers(result, corrected, t0, memory=memory)
-            if routed.kind != NEW_ACTION and routed.confidence >= 0.6:
-                return routed
-        except asyncio.TimeoutError:
-            log.warning(f"Laya routing timed out after {self.timeout}s; using heuristic fallback.")
-        except Exception as e:
-            log.warning(f"Laya routing failed ({e}); using heuristic fallback.")
+        # Multi-step intent (e.g. "search X and save to desktop"): reroute to
+        # the Brain planner — but ONLY when no single-step heuristic matched,
+        # else it shadows the editor recipe ("save it as home.txt").
+        is_multi_step = any(kw in corrected.lower() for kw in [
+            "save it", "save in", "save to", "save as", "in desktop", "on desktop",
+            "in a .txt", "in a txt", "in notepad", "to notepad", "and then", "and also",
+            "and save", "then save", "write it", "note it", "make a note", "save the"
+        ])
+
+        # 1. Laya on tools (if enabled and healthy). The kill switch governs
+        # WORKER CREATION (init) — an explicitly injected worker still runs.
+        skip_laya = self._worker is None
+        if self._consecutive_timeouts >= 2:
+            if time.time() - self._last_timeout_time > 30.0:
+                self._consecutive_timeouts = 0
+            else:
+                skip_laya = True
+
+        if not skip_laya:
+            try:
+                questions = self._build_questions(corrected, tools, ctx)
+                result = await self._worker.apredict(corrected, questions, self.timeout)
+                self._consecutive_timeouts = 0
+                routed = self._route_from_answers(result, corrected, t0, memory=memory)
+                if routed.kind != NEW_ACTION and routed.confidence >= 0.6:
+                    return routed
+            except asyncio.TimeoutError:
+                self._consecutive_timeouts += 1
+                self._last_timeout_time = time.time()
+                if self._consecutive_timeouts == 1:
+                    log.warning(f"Laya routing timed out after {self.timeout}s; using heuristic fallback.")
+                else:
+                    log.warning(f"Laya timed out repeatedly ({self._consecutive_timeouts}x); circuit-breaker active, using heuristic fallback.")
+            except Exception as e:
+                log.warning(f"Laya routing failed ({e}); using heuristic fallback.")
 
         # 2. Comprehensive heuristic routing (exact-intent + typo-repaired fuzzy matching).
         heuristic_route = self._heuristic_route(corrected, tools, t0, ctx, memory=memory)
         if heuristic_route.kind != NEW_ACTION:
             return heuristic_route
+
+        # 2b. Multi-step fallback: no single-step route matched → planner.
+        if is_multi_step:
+            return Route(
+                kind=NEW_ACTION,
+                confidence=0.5,
+                latency_ms=round((time.perf_counter() - t0) * 1000, 1),
+                reason="Multi-step command dispatched to Brain planner",
+                tier="multi_step",
+            )
 
         # 3. Opt-in constrained local LLM for paraphrases.
         try:
@@ -943,7 +1075,6 @@ class WinBrowRouter:
         Runs BEFORE Laya and handles the vast majority of common commands.
         """
         _ = tools  # We pick tools directly by intent, not by keyword matching against tool list
-        _ = ctx
         cleaned = _strip_conversational_prefix(text.strip())
         lower = cleaned.lower()
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
@@ -952,6 +1083,61 @@ class WinBrowRouter:
         # stop that never fires is worse). Not swallowed by later branches.
         if _STOP_RE.search(lower):
             return Route(kind=STOP, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- MCP KNOWLEDGE TOOLS (brainless quick routes; M6) ---
+        # "what is X on wikipedia" → get_summary ("X" is the title);
+        # "search wikipedia for X" → search_wikipedia (titles + snippets);
+        # "read/fetch/open <url>"  → fetch MCP
+        if _WIKI_RE.search(lower):
+            q = _wiki_extract(lower)
+            if q:
+                is_search = re.search(r"\bsearch\b", lower) is not None
+                name = ("mcp_wikipedia_search_wikipedia" if is_search
+                        else "mcp_wikipedia_get_summary")
+                wt = self.registry.get(name)
+                if wt is None and is_search is False:
+                    wt = self.registry.get("mcp_wikipedia_search_wikipedia")
+                if wt is not None:
+                    arg = ("query" if is_search
+                           else next((a.name for a in wt.args if a.kind == "text"),
+                                     wt.args[0].name if wt.args else "title"))
+                    return Route(kind="tool", tool=wt, args={arg: q},
+                                 confidence=0.8, latency_ms=elapsed_ms,
+                                 tier="heuristic")
+        if re.search(r"https?://", lower) and re.search(r"\b(read|open|fetch|get)\b", lower):
+            f = self.registry.get("mcp_fetch_fetch")
+            if f is not None:
+                m = re.search(r"https?://\S+", lower)
+                return Route(kind="tool", tool=f,
+                             args={"url": m.group(0) if m else ""},
+                             confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- EDITOR RECIPE (brain-free step-by-step sessions) ---
+        # "save it as home.txt"          → notepad_save_as (T2)
+        # "save it in the downloads folder" → same tool, folder hint resolved
+        #                                  from the target Windows folder;
+        #                                  ops fall back to the window title
+        #                                  for the filename.
+        m = _TYPE_RE.match(lower)
+        if m and _editable_focused(ctx):
+            text_arg = re.sub(
+                r"\s*(?:in|into)\s+(?:the\s+|a\s+|my\s+)*notepad\s*$", "",
+                m.group(1), flags=re.I).strip()
+            if text_arg and text_arg.lower() not in ("notepad", "a note", "the note"):
+                t = self.registry.get("computer_type")
+                if t:
+                    return Route(kind="tool", tool=t, args={"text": text_arg},
+                                 confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
+        m = _SAVE_AS_RE.match(lower)
+        if m:
+            name, folder = _parse_save_utterance(lower)
+            if (name or folder) and (re.search(r"\.[a-z0-9]{1,5}$", name, re.I)
+                                     or _editable_focused(ctx)):
+                t = self.registry.get("notepad_save_as")
+                if t:
+                    return Route(kind="tool", tool=t,
+                                 args={"filename": name, "folder": folder},
+                                 confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
 
         # --- INSTALLER (winget): T3 confirmed by the permission gate ---
         _inst = _installer_route(lower, self.registry, Route, elapsed_ms)
@@ -1218,19 +1404,41 @@ class WinBrowRouter:
 
         Covers the intents that must never fail: volume level, mute, lock
         screen, open_folder / close_folder_window gated on a real directory
-        on disk, and open_file gated on a real file on disk (Downloads
-        searched first). Anything else returns NEW_ACTION so the generator
-        tier can try. This method never maps phrases to tools beyond these
-        exact intents.
+        on disk, open_file gated on a real file on disk (Downloads searched
+        first), plus the editor recipe (write/type/save-as) gated on the
+        focused editable app. Anything else returns NEW_ACTION so the
+        generator tier can try. This method never maps phrases to tools
+        beyond these exact intents.
         """
         _ = tools  # tool choice belongs to Laya; the fallback picks no tools by keywords.
-        _ = ctx
         cleaned = _strip_conversational_prefix(text.strip())
         lower = cleaned.lower()
         elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
 
         if _STOP_RE.search(lower):
             return Route(kind=STOP, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- EDITOR RECIPE (same gating as the heuristic layer) ---
+        m = _TYPE_RE.match(lower)
+        if m and _editable_focused(ctx):
+            text_arg = re.sub(
+                r"\s*(?:in|into)\s+(?:the\s+|a\s+|my\s+)*notepad\s*$", "",
+                m.group(1), flags=re.I).strip()
+            if text_arg and text_arg.lower() not in ("notepad", "a note", "the note"):
+                t = self.registry.get("computer_type")
+                if t:
+                    return Route(kind="tool", tool=t, args={"text": text_arg},
+                                 confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
+        m = _SAVE_AS_RE.match(lower)
+        if m:
+            name, folder = _parse_save_utterance(lower)
+            if (name or folder) and (re.search(r"\.[a-z0-9]{1,5}$", name, re.I)
+                                     or _editable_focused(ctx)):
+                t = self.registry.get("notepad_save_as")
+                if t:
+                    return Route(kind="tool", tool=t,
+                                 args={"filename": name, "folder": folder},
+                                 confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
 
         # --- INSTALLER (winget): T3 confirmed by the permission gate ---
         _inst = _installer_route(lower, self.registry, Route, elapsed_ms)

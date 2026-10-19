@@ -155,5 +155,18 @@ class GroundingLadder:
                                     matched=matched[:60],
                                     candidates=[h[2] for h in ocr_hits[:5]])
 
+        # --- rung 4: cloud-VLM pixel tier (opt-in + budget-capped, see vlm.py) ---
+        if use_ocr:      # pixel contexts only make sense visually
+            try:
+                from .vlm import vlm_enabled, vlm_ground
+                if vlm_enabled():
+                    data = vlm_ground(text, hwnd=hwnd)
+                    if data.get("found"):
+                        return GroundingHit(ok=True, source="vlm",
+                                            x=int(data["x"]), y=int(data["y"]),
+                                            matched=(data.get("matched") or "")[:60])
+            except Exception as e:
+                log.debug(f"VLM rung failed: {e}")
+
         return GroundingHit(ok=False, reason="not found on UIA/OCR rungs",
                             candidates=candidates[:8])

@@ -1,0 +1,169 @@
+{
+  "comment": [
+    "MCP servers WinBrow bridges into its tool registry.",
+    "Each entry: id (unique slug), 'command' for stdio servers,",
+    "'url' for streamable-HTTP servers, optional env/timeout_s.",
+    "Add a server = one JSON block. Nothing else to change.",
+    "'preload': connect at agent startup (RAM discipline on 2-core/5.9GB);",
+    "others connect lazily on first use / cache bootstrap.",
+    "'tier' may only LOWER to t0/t1 for verified read-only catalogs;",
+    "writes/system verbs stay T2/T3 via the normal policy classifier.",
+    "mcp-search-server (PyPI: missing) is covered in parts: wikipedia+fetch",
+    "+ arxiv + github-public + gdelt-news + reddit below.",
+    "Node servers MUST run as [cmd, /c, npx, ...]: npx.ps1 is execution-",
+    "policy blocked and Popen will not resolve .cmd itself. All lazy.",
+    "filesystem is sandboxed to the user profile (%USERPROFILE% via cmd);",
+    "git defaults to this repo (pass repo_path for others)."
+  ],
+  "servers": [
+    {
+      "id": "wikipedia",
+      "command": ["python", "-m", "wikipedia_mcp", "--transport", "stdio"],
+      "command_install": "pip install wikipedia-mcp",
+      "tier": "t1",
+      "timeout_s": 60.0,
+      "preload": true,
+      "enabled": true,
+      "description": "Wikipedia search/articles/summaries/sections/links/related/key-facts — 9 tools x2 aliases (PyPI, MIT, no key)"
+    },
+    {
+      "id": "fetch",
+      "command": ["python", "-m", "mcp_server_fetch"],
+      "command_install": "pip install mcp-server-fetch",
+      "tier": "t1",
+      "preload": true,
+      "enabled": true,
+      "description": "Official reference URL fetcher — any URL to clean markdown (no key)"
+    },
+    {
+      "id": "arxiv",
+      "command": ["python", "-m", "arxiv_mcp_server"],
+      "command_install": "pip install arxiv-mcp-server",
+      "enabled": true,
+      "description": "arXiv research paper search + download/read papers (PyPI, no key)"
+    },
+    {
+      "id": "crossref",
+      "command": ["python", "-m", "crossref_mcp.server"],
+      "command_install": "pip install crossref-mcp",
+      "enabled": true,
+      "description": "Crossref DOI/academic metadata: works, journals, publishers (PyPI, no key)"
+    },
+    {
+      "id": "open-meteo",
+      "url": "https://open-meteo.caseyjhand.com/mcp",
+      "timeout_s": 45.0,
+      "enabled": true,
+      "description": "Remote weather MCP over streamable HTTP (no key by design)"
+    },
+    {
+      "id": "dictionary",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "dictionary"],
+      "enabled": true,
+      "description": "WinBrow bundled: definitions/synonyms/phonetics via dictionaryapi.dev"
+    },
+    {
+      "id": "open-library",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "openlibrary"],
+      "enabled": true,
+      "description": "WinBrow bundled: book/ISBN/author lookup via Open Library"
+    },
+    {
+      "id": "nominatim",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "nominatim"],
+      "enabled": true,
+      "description": "WinBrow bundled: OpenStreetMap geocoding (place -> lat/lon)"
+    },
+    {
+      "id": "rest-countries",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "rest-countries"],
+      "enabled": true,
+      "description": "WinBrow bundled: country data via restcountries.com"
+    },
+    {
+      "id": "frankfurter",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "frankfurter"],
+      "enabled": true,
+      "description": "WinBrow bundled: ECB FX rates + currency conversion via frankfurter.dev"
+    },
+    {
+      "id": "usgs-earthquake",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "usgs"],
+      "enabled": true,
+      "description": "WinBrow bundled: USGS earthquake catalog (recent significant events)"
+    },
+    {
+      "id": "hacker-news",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "hacknews"],
+      "enabled": true,
+      "description": "WinBrow bundled: HN front page + story search (Algolia, no key)"
+    },
+    {
+      "id": "github-public",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "github"],
+      "enabled": true,
+      "description": "WinBrow bundled: PUBLIC GitHub repo search (~60 req/hr unauth)"
+    },
+    {
+      "id": "mdn-compat",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "mdn"],
+      "enabled": true,
+      "description": "WinBrow bundled: MDN Web Docs search (HTML/CSS/JS/API references)"
+    },
+    {
+      "id": "gdelt-news",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "gdelt"],
+      "enabled": true,
+      "description": "WinBrow bundled: global news search via GDELT 2.0 DOC API"
+    },
+    {
+      "id": "reddit",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "reddit"],
+      "enabled": true,
+      "description": "WinBrow bundled: Reddit post search via public JSON"
+    },
+    {
+      "id": "filesystem",
+      "command": ["cmd", "/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "%USERPROFILE%"],
+      "timeout_s": 60.0,
+      "enabled": true,
+      "description": "Official filesystem server: read/write/edit/move/create files+dirs, list, tree, glob search, metadata — sandboxed to the user profile (verified live, 14 tools)"
+    },
+    {
+      "id": "git",
+      "command": ["python", "-m", "mcp_server_git", "--repository", "."],
+      "enabled": true,
+      "description": "Official git server: status/diffs/log/branches for this repo by default, other repos via repo_path arg (verified live, 12 tools)"
+    },
+    {
+      "id": "time",
+      "command": ["python", "-m", "mcp_server_time"],
+      "tier": "t1",
+      "enabled": true,
+      "description": "Official time server: current time in any IANA timezone + cross-timezone conversion (verified live, read-only)"
+    },
+    {
+      "id": "memory",
+      "command": ["cmd", "/c", "npx", "-y", "@modelcontextprotocol/server-memory"],
+      "env": {"MEMORY_FILE_PATH": "tools/memory_graph.json"},
+      "timeout_s": 60.0,
+      "enabled": true,
+      "description": "Official memory server: persistent knowledge graph (entities/relations/observations) in tools/memory_graph.json (verified live, 9 tools)"
+    },
+    {
+      "id": "sequential-thinking",
+      "command": ["cmd", "/c", "npx", "-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "tier": "t1",
+      "timeout_s": 60.0,
+      "enabled": true,
+      "description": "Official sequential-thinking server: structured step-by-step dynamic thought replanning during complex chains (verified live, 1 tool)"
+    },
+    {
+      "id": "pdf",
+      "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "pdf"],
+      "tier": "t1",
+      "enabled": true,
+      "description": "WinBrow bundled: LOCAL PDF reading via pymupdf — extract_text (page ranges), info (pages/TOC/metadata), search (page+snippet) (verified live, 3 tools)"
+    }
+  ]
+}

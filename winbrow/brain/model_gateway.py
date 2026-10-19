@@ -10,6 +10,19 @@ One interface, many backends, tried in priority order:
   4. No provider            — chat() raises GatewayUnavailable → callers fall back
                               to heuristics/generator tiers.
 
+Env WINBROW_BRAIN_PROVIDER reorders the chain so the local model can be the
+brain instead of the cloud (cloud stays as fallback):
+
+  WINBROW_BRAIN_PROVIDER=local | qwen   → local Qwen first, cloud after
+  WINBROW_BRAIN_PROVIDER=openrouter | openai → cloud first (default order)
+  (auto — default)                      → cloud first, local last
+
+When the local brain is requested and WINBROW_LOCAL_LLM_ENDPOINT is not set,
+the built-in llama.cpp server at 127.0.0.1:8080 (models/qwen GGUF) is used;
+WINBROW_LOCAL_LLM=1 is an alias for the same. WINBROW_LOCAL_LLM_MODEL picks
+the model name sent to custom endpoints (Ollama/LM Studio); the built-in
+llama.cpp server defaults to "qwen2.5-0.5b-instruct".
+
 Supports OpenAI `tools` (function calling) and `response_format` json_schema.
 API keys are read from env/runtime config and never logged.
 """
@@ -31,6 +44,30 @@ OPENROUTER_BASE = os.environ.get("WINBROW_OPENROUTER_BASE", "https://openrouter.
 DEFAULT_BRAIN_MODEL = os.environ.get("WINBROW_BRAIN_MODEL", "deepseek/deepseek-v4.1-flash")
 
 REQUEST_TIMEOUT_S = float(os.environ.get("WINBROW_BRAIN_TIMEOUT", "45"))
+
+# Built-in local brain: llama.cpp server started by server.py (winbrow/llm.py)
+BUILTIN_LOCAL_ENDPOINT = "http://127.0.0.1:8080"
+BUILTIN_LOCAL_MODEL = "qwen2.5-0.5b-instruct"
+DEFAULT_LOCAL_TIMEOUT_S = 300.0
+
+LOCAL_PROVIDER_ALIASES = ("local", "qwen", "llama.cpp", "llamacpp")
+
+
+def brain_provider_pref() -> str:
+    """Selected brain provider: 'auto' (default) | 'local'/'qwen' | 'openrouter' | 'openai'."""
+    return (os.environ.get("WINBROW_BRAIN_PROVIDER") or "auto").strip().lower()
+
+
+def wants_local_brain() -> bool:
+    """True when env asks for the local Qwen as the primary brain."""
+    if os.environ.get("WINBROW_LOCAL_LLM", "").strip() == "1":
+        return True
+    return brain_provider_pref() in LOCAL_PROVIDER_ALIASES
+
+
+def uses_builtin_local_server() -> bool:
+    """True when the local brain is served by the built-in llama.cpp server."""
+    return wants_local_brain() and not os.environ.get("WINBROW_LOCAL_LLM_ENDPOINT", "").strip()
 
 
 class GatewayUnavailable(Exception):
@@ -77,6 +114,16 @@ class Provider:
         }
 
 
+def _provider_timeout(provider: Provider) -> float:
+    """Local CPU models generate slower; give them a higher default ceiling."""
+    if provider.name == "local":
+        try:
+            return float(os.environ.get("WINBROW_LOCAL_LLM_TIMEOUT", str(DEFAULT_LOCAL_TIMEOUT_S)))
+        except ValueError:
+            return DEFAULT_LOCAL_TIMEOUT_S
+    return REQUEST_TIMEOUT_S
+
+
 def _post_json(url: str, payload: dict, headers: Dict[str, str], timeout: float) -> dict:
     """Blocking HTTP POST returning parsed JSON. Raises on HTTP/network errors."""
     data = json.dumps(payload).encode("utf-8")
@@ -99,29 +146,185 @@ def _redact(obj: Any) -> Any:
         return "<unprintable error>"
 
 
+def _clean_and_load_json(s: str) -> Optional[dict]:
+    """Helper to clean common LLM formatting issues before json.loads."""
+    if not s or ("{" not in s and "[" not in s):
+        return None
+    s = s.strip()
+    if s.startswith("```"):
+        import re
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+    try:
+        data = json.loads(s)
+        if isinstance(data, dict):
+            return data.get("plan") if isinstance(data.get("plan"), dict) else data
+        if isinstance(data, list):
+            return {"kind": "action", "steps": data}
+    except Exception:
+        pass
+
+    import re
+    # Remove single-line and multi-line comments
+    cleaned = re.sub(r"//[^\r\n]*", "", s)
+    cleaned = re.sub(r"/\*.*?\*/", "", cleaned, flags=re.DOTALL)
+    # Remove trailing commas before } or ]
+    cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+
+    try:
+        data = json.loads(cleaned)
+        if isinstance(data, dict):
+            return data.get("plan") if isinstance(data.get("plan"), dict) else data
+        if isinstance(data, list):
+            return {"kind": "action", "steps": data}
+    except Exception:
+        pass
+
+    try:
+        import ast
+        val = ast.literal_eval(cleaned)
+        if isinstance(val, dict):
+            return val.get("plan") if isinstance(val.get("plan"), dict) else val
+        if isinstance(val, list):
+            return {"kind": "action", "steps": val}
+    except Exception:
+        pass
+    return None
+
+
+def _repair_truncated_json(s: str) -> Optional[dict]:
+    """Attempt to balance unclosed quotes, brackets, and braces in truncated JSON."""
+    if not s or ("{" not in s and "[" not in s):
+        return None
+    s = s.strip()
+    if s.startswith("```"):
+        import re
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
+        s = re.sub(r"\s*```$", "", s)
+    idx_brace = s.find("{")
+    idx_bracket = s.find("[")
+    if idx_brace == -1 and idx_bracket == -1:
+        return None
+    start = idx_brace if (idx_bracket == -1 or (idx_brace != -1 and idx_brace < idx_bracket)) else idx_bracket
+    chunk = s[start:]
+
+    in_string = False
+    escape = False
+    stack = []
+    for c in chunk:
+        if c == '"' and not escape:
+            in_string = not in_string
+        elif c == '\\' and in_string:
+            escape = not escape
+            continue
+        elif not in_string:
+            if c in ('{', '['):
+                stack.append('}' if c == '{' else ']')
+            elif c in ('}', ']'):
+                if stack and stack[-1] == c:
+                    stack.pop()
+        escape = False
+
+    repaired = chunk
+    if in_string:
+        repaired += '"'
+    import re
+    repaired = re.sub(r",\s*$", "", repaired)
+    while stack:
+        repaired += stack.pop()
+
+    return _clean_and_load_json(repaired)
+
+
 def extract_json_object(text: str) -> Optional[dict]:
-    """Pull the first JSON object out of an LLM response (handles code fences)."""
+    """Pull the first valid JSON object out of an LLM response (handles code fences, <think> tags, trailing commas)."""
     if not text:
         return None
-    t = text.strip()
-    # strip ```json fences
+    t = str(text).strip()
+
+    # 1. Strip reasoning/think blocks (DeepSeek R1, Qwen reasoning, etc.)
+    import re
+    t = re.sub(r"<(think|thought)>.*?</\1>", "", t, flags=re.DOTALL).strip()
+
+    # 2. Extract from code fence if present
     if "```" in t:
-        parts = t.split("```")
-        for part in parts:
-            p = part.strip()
-            if p.startswith("json"):
-                p = p[4:].strip()
-            if p.startswith("{"):
-                t = p
-                break
+        fence_matches = re.findall(r"```(?:json)?\s*([\s\S]*?)```", t, re.IGNORECASE)
+        for block in fence_matches:
+            block = block.strip()
+            if "{" in block or "[" in block:
+                parsed = _clean_and_load_json(block) or _repair_truncated_json(block)
+                if parsed is not None:
+                    return parsed
+
+    # 3. Try direct clean and load
+    parsed = _clean_and_load_json(t)
+    if parsed is not None:
+        return parsed
+
+    # 4. Search for balanced { ... } block
+    start_idx = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for i, c in enumerate(t):
+        if c == '"' and not escape:
+            in_string = not in_string
+        elif c == '\\' and in_string:
+            escape = not escape
+            continue
+        elif not in_string:
+            if c == '{':
+                if depth == 0:
+                    start_idx = i
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0 and start_idx != -1:
+                    candidate = t[start_idx : i + 1]
+                    res = _clean_and_load_json(candidate)
+                    if res is not None:
+                        return res
+        escape = False
+
+    # 5. Search for balanced [ ... ] block
+    start_idx = -1
+    depth = 0
+    in_string = False
+    escape = False
+    for i, c in enumerate(t):
+        if c == '"' and not escape:
+            in_string = not in_string
+        elif c == '\\' and in_string:
+            escape = not escape
+            continue
+        elif not in_string:
+            if c == '[':
+                if depth == 0:
+                    start_idx = i
+                depth += 1
+            elif c == ']':
+                depth -= 1
+                if depth == 0 and start_idx != -1:
+                    candidate = t[start_idx : i + 1]
+                    res = _clean_and_load_json(candidate)
+                    if res is not None:
+                        return res
+        escape = False
+
+    # 6. Fallback: span from first { to last }
     start = t.find("{")
     end = t.rfind("}")
-    if start < 0 or end <= start:
-        return None
-    try:
-        return json.loads(t[start:end + 1])
-    except json.JSONDecodeError:
-        return None
+    if start >= 0 and end > start:
+        res = _clean_and_load_json(t[start : end + 1])
+        if res is not None:
+            return res
+
+    # 7. Fallback: repair truncated JSON
+    repaired = _repair_truncated_json(t)
+    if repaired is not None:
+        return repaired
+
+    return None
 
 
 class ModelGateway:
@@ -143,6 +346,7 @@ class ModelGateway:
         )
 
     def _build_chain(self, openrouter_key, openai_key, brain_model, local_endpoint) -> None:
+        pref = brain_provider_pref()
         or_key = openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
         if or_key:
             self.providers.append(Provider(
@@ -163,26 +367,46 @@ class ModelGateway:
                 api_key=oa_key,
                 model=os.environ.get("WINBROW_OPENAI_MODEL", "gpt-4o-mini"),
             ))
-        # Local OpenAI-compatible (LM Studio / Ollama serve). Only when reachable.
-        candidates = []
-        if local_endpoint:
-            candidates.append(local_endpoint)
-        else:
-            candidates.append(os.environ.get("WINBROW_LOCAL_LLM_ENDPOINT", ""))
-        for ep in candidates:
-            if not ep:
-                continue
+        # Local OpenAI-compatible (llama.cpp / LM Studio / Ollama serve).
+        # Explicit endpoint first; built-in llama.cpp server when the local
+        # brain is requested and no custom endpoint is configured.
+        builtin = False
+        ep = local_endpoint or os.environ.get("WINBROW_LOCAL_LLM_ENDPOINT", "").strip()
+        if not ep and wants_local_brain():
+            ep = BUILTIN_LOCAL_ENDPOINT
+            builtin = True
+        if ep:
             base = ep.rstrip("/")
             if not base.endswith("/v1"):
                 base = base + "/v1"
+            model = os.environ.get("WINBROW_LOCAL_LLM_MODEL", "").strip()
+            if not model and builtin:
+                model = BUILTIN_LOCAL_MODEL
             self.providers.append(Provider(
                 name="local",
                 base_url=base,
                 api_key=os.environ.get("WINBROW_LOCAL_LLM_KEY", "not-needed"),
-                model=os.environ.get("WINBROW_LOCAL_LLM_MODEL", ""),
+                model=model,
             ))
+
+        # Reorder for the selected brain. Cloud stays as fallback so a weak/
+        # offline local model degrades gracefully instead of failing the task.
+        if wants_local_brain():
+            self._prioritize("local")
+        elif pref == "openai":
+            self._prioritize("openai")
+        elif pref not in ("auto", "", "openrouter"):
+            log.warning(f"Unknown WINBROW_BRAIN_PROVIDER '{pref}'; keeping default chain order.")
+
         if not self.providers:
             log.warning("ModelGateway: no providers configured (set OPENROUTER_API_KEY).")
+
+    def _prioritize(self, name: str) -> None:
+        """Move the named provider (if present) to the front of the chain."""
+        for i, p in enumerate(self.providers):
+            if p.name == name:
+                self.providers.insert(0, self.providers.pop(i))
+                return
 
     # ------------------------------------------------------------------ status
     @property
@@ -214,7 +438,7 @@ class ModelGateway:
             try:
                 resp = await self._chat_with_provider(
                     provider, messages, tools, json_schema, temperature, max_tokens,
-                    timeout or REQUEST_TIMEOUT_S,
+                    timeout or _provider_timeout(provider),
                 )
                 resp.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
                 return resp

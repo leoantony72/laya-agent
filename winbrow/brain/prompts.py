@@ -22,13 +22,18 @@ Decide ONE of:
 For actions, choose the MINIMAL set of steps. Each step is {"skill": "<name>", "args": {…}, "why": "<short reason>"}.
 Rules:
   - Use ONLY skills from the provided list, with args matching their schemas.
+  - Information & web queries: prefer fast, direct MCP skills (e.g. mcp_wikipedia_get_summary / mcp_wikipedia_search_wikipedia for Wikipedia, mcp_dictionary_define for definitions, mcp_fetch_fetch for reading URLs, mcp_open-meteo_get_forecast for weather) whenever available in SKILLS.
+  - Interactive web & sites (YouTube video playback, booking, shopping, form filling, visual web navigation): use laya_ultrafast_browser with the full goal.
+  - Creating notes / saving text to Desktop: use quick_note with content.
   - Volume changes: use volume_set_level with a number 0-100 ("louder" without a number → +15 over current).
   - Opening things: open_file for files, open_folder for folders, app_focus_or_launch for apps.
-  - Anything web/browser (search, YouTube, booking, site interaction): use laya_ultrafast_browser with the full goal.
+  - Writing / typing into an open app:
+    1. ALWAYS emit an app_focus_or_launch step FIRST (e.g. {"skill": "app_focus_or_launch", "args": {"app_name": "notepad"}}) before type_text.
+    2. When typing or saving output from a search/query step, set "text": "$PREVIOUS_OUTPUT". The loop will automatically substitute the actual result.
   - Use remember_fact to save durable preferences the user states ("my exports folder is X").
   - Use recall_memory to search past activity when the user asks about the past.
   - If the request is ambiguous AND context doesn't disambiguate, use kind "chat" with a single clarifying question.
-  - Never invent skills or arguments. Output ONLY the JSON object."""
+  - Never invent skills or arguments. Output ONLY the raw JSON object. Do not wrap in markdown fences or include conversational text."""
 
 PLANNER_JSON_SCHEMA = {
     "type": "object",
@@ -48,7 +53,7 @@ PLANNER_JSON_SCHEMA = {
         },
         "response": {"type": "string"},
     },
-    "required": ["kind", "response"],
+    "required": ["kind"],
 }
 
 CHAT_SYSTEM = """You are WinBrow, a terse Windows desktop agent. Answer in ≤2 short sentences.
@@ -63,7 +68,7 @@ that exist on disk, numbers. If the text is already a sensible command, return i
 RECOVERY_SYSTEM = """You are WinBrow's recovery planner. A previous plan step FAILED.
 You get: the original request, the failed step with its error, and the skills list.
 Decide: retry with different args (kind=action), give up with an honest message (kind=chat).
-Same JSON format as the planner. Output ONLY the JSON object."""
+Same JSON format as the planner. Output ONLY the raw JSON object."""
 
 
 def build_planner_messages(utterance: str, context_block: str, memory_block: str,
@@ -72,7 +77,8 @@ def build_planner_messages(utterance: str, context_block: str, memory_block: str
         f"WINDOWS CONTEXT:\n{context_block}\n\n"
         f"CONVERSATION:\n{memory_block}\n\n"
         f"SKILLS:\n{skills_block}\n\n"
-        f"USER REQUEST: {utterance}"
+        f"USER REQUEST: {utterance}\n\n"
+        f"Output ONLY the JSON object."
     )
     return [
         {"role": "system", "content": PLANNER_SYSTEM},

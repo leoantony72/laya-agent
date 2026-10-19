@@ -122,17 +122,115 @@ def _download_with_progress(url: str, dest: Path) -> None:
         raise
 
 
-def ensure_llama_cpp() -> Optional[Path]:
-    """Ensure llama.cpp server binary is available."""
+def ensure_llama_cpp(download: bool = False) -> Optional[Path]:
+    """Ensure llama.cpp server binary is available.
+
+    With download=True (local-brain mode) the latest Windows x64 release is
+    fetched from GitHub into llama_cpp/. Failures are non-fatal: returns None
+    and callers fall back to cloud providers.
+    """
     if LLAMA_SERVER_BIN.exists():
         return LLAMA_SERVER_BIN
-    
+
     # Check if llama-server is available in system PATH
     path_bin = shutil.which("llama-server") or shutil.which("llama-server.exe")
     if path_bin:
         return Path(path_bin)
 
+    if download and platform.system() == "Windows":
+        try:
+            return _download_llama_server()
+        except Exception as e:
+            log.warning(f"llama-server download failed (non-fatal): {e}")
+            return None
+
     log.info("llama-server binary not found locally. Server will use System 1 Laya decision router.")
+    return None
+
+
+# GitHub releases list (binaries ship on per-build tags, not /releases/latest)
+LLAMA_RELEASES_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=5"
+_GPU_ASSET_MARKERS = ("cuda", "vulkan", "sycl", "hip", "rocm", "opencl", "openvino", "adreno", "arm")
+
+
+def _pick_llama_asset(assets: list[dict]) -> Optional[dict]:
+    """Best Windows x64 server zip: prefer avx2, then cpu; skip GPU variants."""
+    import re
+    candidates = [
+        a for a in assets
+        if re.search(r"bin-win-.*x64\.zip$", a.get("name", ""), re.IGNORECASE)
+        and not any(m in a.get("name", "").lower() for m in _GPU_ASSET_MARKERS)
+    ]
+    if not candidates:
+        return None
+
+    def rank(name: str) -> int:
+        n = name.lower()
+        if "avx2" in n:
+            return 0
+        if "cpu" in n or "noavx" in n:
+            return 1
+        return 2
+
+    candidates.sort(key=lambda a: rank(a["name"]))
+    return candidates[0]
+
+
+def _download_llama_server() -> Optional[Path]:
+    """Download + extract the latest llama.cpp Windows x64 server release."""
+    import json as _json
+    import zipfile
+
+    log.info("llama-server not found; downloading from GitHub releases...")
+    ua = {"User-Agent": "WinBrow/3.0 (Windows NT; x64)"}
+    req = urllib.request.Request(
+        LLAMA_RELEASES_API,
+        headers={**ua, "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        releases = _json.loads(resp.read().decode("utf-8"))
+
+    asset = None
+    for release in releases:
+        if release.get("draft"):
+            continue
+        asset = _pick_llama_asset(release.get("assets") or [])
+        if asset:
+            break
+    if not asset:
+        raise RuntimeError("no Windows x64 asset in recent llama.cpp releases")
+
+    size_mb = int(asset.get("size") or 0) // (1024 * 1024)
+    log.info(f"Downloading {asset['name']} (~{size_mb} MB)...")
+    zip_path = LLAMA_CPP_DIR / asset["name"]
+    dl_req = urllib.request.Request(asset["browser_download_url"], headers=ua)
+    with urllib.request.urlopen(dl_req, timeout=120) as resp, open(zip_path, "wb") as out:
+        shutil.copyfileobj(resp, out)
+
+    extract_dir = LLAMA_CPP_DIR / "_extract"
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(extract_dir)
+
+    exe = next(iter(extract_dir.rglob("llama-server.exe")), None)
+    if exe is None:
+        raise RuntimeError("llama-server.exe not found in release archive")
+
+    # Move the whole bin directory (exe + required DLLs) into llama_cpp/
+    for item in list(exe.parent.iterdir()):
+        target = LLAMA_CPP_DIR / item.name
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                target.unlink()
+        shutil.move(str(item), str(target))
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    zip_path.unlink(missing_ok=True)
+
+    if LLAMA_SERVER_BIN.exists():
+        log.info(f"llama-server ready at {LLAMA_SERVER_BIN}")
+        return LLAMA_SERVER_BIN
     return None
 
 

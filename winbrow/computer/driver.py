@@ -37,8 +37,36 @@ def _set_dpi_awareness() -> None:
         pass
 
 
+
+def _attach_input_desktop() -> None:
+    """Attach the current thread to the interactive user input desktop."""
+    try:
+        hdesk = user32.OpenInputDesktop(0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+    except Exception:
+        pass
+
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+
+# --- 64-bit prototypes: HGLOBAL/HANDLE are pointer-sized; without these
+# ctypes truncates returns to 32-bit ints and clipboard calls fault with
+# "access violation writing 0x0000000000000000" when the truncated handle
+# is 0. (_set_clipboard memmove on a NULL GlobalLock pointer, etc.)
+kernel32.GlobalAlloc.restype = ctypes.c_void_p
+kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+kernel32.GlobalLock.restype = ctypes.c_void_p
+kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+user32.OpenClipboard.argtypes = [ctypes.c_void_p]          # HWND owner (None)
+user32.OpenClipboard.restype = wt.BOOL
+user32.CloseClipboard.restype = wt.BOOL
+user32.SetClipboardData.restype = ctypes.c_void_p
+user32.SetClipboardData.argtypes = [wt.UINT, ctypes.c_void_p]
+user32.GetClipboardData.restype = ctypes.c_void_p
+user32.GetClipboardData.argtypes = [wt.UINT]
 
 VK_MENU = 0x12
 SW_RESTORE = 9
@@ -231,10 +259,17 @@ class ComputerDriver:
         try:
             user32.EmptyClipboard()
             h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not h:
+                return {"success": False, "output": "GlobalAlloc failed"}
             ptr = kernel32.GlobalLock(h)
-            ctypes.memmove(ptr, data, len(data))
-            kernel32.GlobalUnlock(h)
-            user32.SetClipboardData(CF_UNICODETEXT, h)
+            if not ptr:
+                kernel32.GlobalFree(h)
+                return {"success": False, "output": "GlobalLock failed"}
+            try:
+                ctypes.memmove(ptr, data, len(data))
+            finally:
+                kernel32.GlobalUnlock(h)
+                user32.SetClipboardData(CF_UNICODETEXT, h)  # h freed by system on close
             return {"success": True, "output": f"Clipboard set ({len(text)} chars)"}
         finally:
             user32.CloseClipboard()
@@ -242,6 +277,7 @@ class ComputerDriver:
     # ---------------------------------------------------------------- windows
     def list_windows(self, include_titles: bool = True) -> List[WindowInfo]:
         """All visible top-level windows with captions."""
+        _attach_input_desktop()
         wins: List[WindowInfo] = []
         try:
             import psutil
@@ -289,17 +325,38 @@ class ComputerDriver:
     def focus_window(self, hwnd: int) -> dict:
         """Bring a window to the foreground (restore first if minimized)."""
         self._guard("focus window")
+        _attach_input_desktop()
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, SW_RESTORE)
             time.sleep(0.1)
+        else:
+            user32.ShowWindow(hwnd, 5)  # SW_SHOW
         if user32.GetForegroundWindow() != hwnd:
+            cur_tid = kernel32.GetCurrentThreadId()
+            fg_hwnd = user32.GetForegroundWindow()
+            fg_tid = wt.DWORD(0)
+            if fg_hwnd:
+                user32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_tid))
+            attached = False
+            if fg_tid.value and fg_tid.value != cur_tid:
+                try:
+                    user32.AttachThreadInput(cur_tid, fg_tid.value, True)
+                    attached = True
+                except Exception:
+                    pass
             # Foreground-lock workaround: brief ALT tap + SetForegroundWindow
             user32.keybd_event(VK_MENU, 0, 0, 0)
             user32.keybd_event(VK_MENU, 0, 2, 0)
+            user32.BringWindowToTop(hwnd)
             user32.SetForegroundWindow(hwnd)
-            time.sleep(0.05)
+            if attached:
+                try:
+                    user32.AttachThreadInput(cur_tid, fg_tid.value, False)
+                except Exception:
+                    pass
+            time.sleep(0.08)
         ok = user32.GetForegroundWindow() == hwnd
-        time.sleep(0.15)
+        time.sleep(0.1)
         return {"success": True, "output": f"Focused window {hwnd}" + ("" if ok else " (may be partial)")}
 
     def window_action(self, hwnd: int, action: str) -> dict:

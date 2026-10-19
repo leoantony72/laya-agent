@@ -59,6 +59,7 @@ TOOL_TIERS: Dict[str, str] = {
     "laya_ultrafast_browser": T1, "take_screenshot_b64": T0,
     "vscode_open": T1, "vscode_install_extension": T2, "vscode_run_command": T1,
     "notepad_open": T1, "paint_open_image": T1, "office_open_doc": T1,
+    "quick_note": T1,
     # T2 — user-data writes
     "notepad_save_as": T2, "paint_save_copy": T2, "paint_invert_colors": T2,
     "photoshop_save_as": T2, "photoshop_desaturate": T2, "photoshop_open_image": T1,
@@ -79,7 +80,8 @@ def _default_tier(tool_name: str) -> str:
     n = (tool_name or "").lower()
     if any(k in n for k in ("install", "uninstall", "shutdown", "reboot", "registry", "service", "disk")):
         return T3
-    if any(k in n for k in ("save", "write", "export", "delete", "remove", "close", "move", "copy", "paste", "learn")):
+    if any(k in n for k in ("save", "write", "export", "delete", "remove", "close", "move", "copy", "paste", "learn",
+                            "edit", "creat", "commit")):
         return T2
     if any(k in n for k in ("screenshot", "read", "list", "status", "time", "battery", "network", "detect", "show", "get")):
         return T0
@@ -193,8 +195,12 @@ class PermissionManager:
         # 'close window' is T2 per plan; other window actions stay T1
         if tool_name == "window_action" and str((args or {}).get("action", "")).lower() == "close":
             tier = T2
-        # Learned tools run user/agent-authored scripts — never below T2
-        if tool is not None and getattr(tool, "is_learned", False) and TIER_ORDER[tier] < TIER_ORDER[T2]:
+        # Learned tools run user/agent-authored scripts — never below T2.
+        # impl-executed tools (MCP bridge/app native) carry no authored
+        # PowerShell, so the floor does not apply to them.
+        if tool is not None and getattr(tool, "is_learned", False) \
+                and getattr(tool, "impl", None) is None \
+                and TIER_ORDER[tier] < TIER_ORDER[T2]:
             tier = T2
         # Rendered script can raise the tier (system-class content → T3), but
         # only for tools tiered by heuristics/learned/generated work — curated
@@ -206,12 +212,16 @@ class PermissionManager:
             if TIER_ORDER[s_tier] > TIER_ORDER[tier]:
                 tier = s_tier
 
+        akey = action_key(tool_name, args)
+
         if self.bypass:
+            return (True, None, None)
+        if os.environ.get("WINBROW_AUTO_APPROVE_T2", "").lower() in ("1", "true") and tier == T2:
+            self.remember(akey, tier, tool_name)
+            log.info(f"Auto-approved T2 action '{tool_name}' via WINBROW_AUTO_APPROVE_T2")
             return (True, None, None)
         if TIER_ORDER[tier] <= TIER_ORDER[T1]:
             return (True, None, None)
-
-        akey = action_key(tool_name, args)
 
         # T2: remembered approval allows instant replay
         if tier == T2 and akey in self._allowed:

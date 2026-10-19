@@ -23,6 +23,7 @@ _WINBROW_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_WINBROW_ROOT))
 
 os.environ["WINBROW_BYPASS_CONFIRM"] = ""          # ensure the gate is live
+os.environ["WINBROW_AUTO_APPROVE_T2"] = ""         # leak guard: server's .env load sets it in shared pytest runs
 
 from winbrow.permissions import (               # noqa: E402
     T0, T1, T2, T3, PermissionManager, tool_tier, action_key,

@@ -1,1 +1,14 @@
-[]
+[
+  {
+    "name": "open_notepad",
+    "description": "Open Notepad text editor.",
+    "script": "Start-Process notepad; return 'Opened Notepad'",
+    "scope": null,
+    "speak": "done",
+    "examples": [
+      "open notepad",
+      "open text editor"
+    ],
+    "args": []
+  }
+]

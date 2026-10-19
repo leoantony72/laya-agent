@@ -531,38 +531,69 @@ async def open_settings_pane(pane: str) -> dict[str, Any]:
 
 
 async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
-    """Activate window if running, or launch executable."""
+    """Activate window if running, or launch executable and ensure focus."""
+    name_clean = str(app_name or "").strip()
+    if not name_clean:
+        return {"success": False, "output": "Missing application name"}
+
+    # 1. First check if a window for this app is already open
+    try:
+        from .computer.driver import ComputerDriver
+        driver = ComputerDriver(guard_screen=False)
+        wins = driver.list_windows()
+        name_lower = name_clean.lower()
+        match = None
+        for w in wins:
+            pname = (w.process_name or "").lower()
+            title = (w.title or "").lower()
+            if name_lower in pname or (name_lower in title and not any(b in pname for b in ("chrome", "msedge", "brave", "firefox", "opera"))):
+                match = w
+                break
+
+        if match is not None:
+            driver.focus_window(match.hwnd)
+            await asyncio.sleep(0.2)
+            return {"success": True, "output": f"Activated {match.process_name or name_clean}", "window": match.to_dict()}
+    except Exception as e:
+        log.debug(f"Native focus check error: {e}")
+
+    # 2. If not running, launch it
     script = f"""
-    $name = "{app_name}"
-    # Match by process name; only match window titles for non-browser apps so
-    # "youtube" doesn't grab a Brave/Chrome window that happens to show YouTube.
-    $browsers = @('chrome', 'msedge', 'brave', 'firefox', 'iexplore', 'opera')
-    $proc = Get-Process | Where-Object {{
-        ($_.ProcessName -like "*$name*") -or
-        ($_.MainWindowTitle -like "*$name*" -and $browsers -notcontains $_.ProcessName.ToLower())
-    }} | Select-Object -First 1
-    if ($proc -and $proc.MainWindowHandle -ne 0) {{
-        $wshell = New-Object -ComObject WScript.Shell
-        $wshell.AppActivate($proc.Id) | Out-Null
-        return "Activated $($proc.ProcessName)"
-    }} else {{
-        $known = @{{
-            'chrome' = "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe"
-            'edge'   = "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe"
-            'brave'  = "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
-        }}
-        $exe = $known[$name.ToLower()]
-        if (-not $exe -or -not (Test-Path $exe)) {{
-            $exe = (Get-Command $name -ErrorAction SilentlyContinue).Source
-        }}
-        if (-not $exe) {{
-            return "ERROR: Could not find an application named '$name'"
-        }}
-        Start-Process $exe -ErrorAction Stop
-        return "Launched $name"
+    $name = "{name_clean}"
+    $known = @{{
+        'chrome'   = "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe"
+        'edge'     = "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe"
+        'brave'    = "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
+        'notepad'  = "notepad.exe"
+        'calc'     = "calc.exe"
+        'code'     = "code"
     }}
+    $exe = $known[$name.ToLower()]
+    if (-not $exe -or -not (Test-Path $exe)) {{
+        $exe = (Get-Command $name -ErrorAction SilentlyContinue).Source
+    }}
+    if (-not $exe) {{
+        $exe = $name
+    }}
+    Start-Process $exe -ErrorAction SilentlyContinue
+    return "Launched $name"
     """
-    return await run_powershell(script)
+    res = await run_powershell(script)
+
+    # 3. Wait for the window to appear and bring it to the foreground
+    try:
+        from .computer.driver import ComputerDriver
+        driver = ComputerDriver(guard_screen=False)
+        w_res = driver.wait_for_window(name_clean, timeout=3.5)
+        if w_res.get("success") and w_res.get("window"):
+            hwnd = w_res["window"]["hwnd"]
+            driver.focus_window(hwnd)
+            await asyncio.sleep(0.25)
+            return {"success": True, "output": f"Launched and focused {name_clean}", "window": w_res.get("window")}
+    except Exception as e:
+        log.debug(f"Window wait/focus after launch error: {e}")
+
+    return res
 
 
 async def clean_desktop_to_folder() -> dict[str, Any]:

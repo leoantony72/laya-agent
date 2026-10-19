@@ -187,11 +187,15 @@ def _file_dialog_save(args: dict) -> dict:
     try:
         if filename:
             driver.press_key("ctrl+a")   # select dialog name field text (explorer dialogs)
-            time.sleep(0.15)
-            driver.type_text(filename, via_clipboard=True)
             time.sleep(0.25)
+            driver.type_text(filename, via_clipboard=True)
+            time.sleep(0.4)
         driver.press_key("enter")
-        time.sleep(0.5)
+        time.sleep(0.4)
+        # overwrite prompt ("Confirm Save As") when the target already exists
+        if driver.wait_for_window("^Confirm Save As$", timeout=0.8).get("success"):
+            driver.press_key("y")
+            time.sleep(0.4)
         return {"success": True,
                 "output": f"Save dialog handled: '{filename}', confirmed with Enter"}
     except Exception as e:

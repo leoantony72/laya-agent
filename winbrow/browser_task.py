@@ -744,27 +744,25 @@ class BrowserController:
         return {"enabled": False, "method": "ui_automation", "hint": _setup_hint(browser)}
 
     async def ensure_browser_open(self) -> dict[str, Any]:
-        """Make sure a browser window is visible and focused.
-
-        Attaches to remote debugging when it is already on; otherwise focuses
-        (or starts) the browser without forcing the one-time opt-in — the hint
-        is returned in `setup_hint` instead.
-        """
+        """Make sure a browser window is visible, focused, and controllable over CDP."""
         if _cdp_available():
             return {"success": True, "message": "CDP running"}
 
-        # Starts the default browser if nothing is running (no setup nagging).
+        # Attempt 1: check if default profile has CDP or can launch with CDP
         launch_res = await self.launch_with_cdp(guide=False)
-        if launch_res.get("method") != "opt_in_required":
-            for _ in range(6):
-                await asyncio.sleep(0.4)
-                if _cdp_available():
-                    break
-        if _cdp_available():
-            return {"success": True, "message": "Browser ready with CDP (real profile)",
-                    **launch_res}
+        for _ in range(4):
+            await asyncio.sleep(0.3)
+            if _cdp_available():
+                return {"success": True, "message": "Browser ready with CDP (real profile)", **launch_res}
 
-        # CDP still off: focus the user's window (or start the default browser).
+        # Attempt 2: if running browser lacks debug port, launch controlled window with CDP
+        sep_res = await self._launch_separate_profile()
+        for _ in range(8):
+            if _cdp_available():
+                return {"success": True, "message": "Browser ready with CDP (controlled profile)", **sep_res}
+            await asyncio.sleep(0.4)
+
+        # Fallback: focus whatever browser is running
         name = _running_browser() or get_default_browser() or "chrome"
         exe = _find_browser_exe(name)
         script = f"""
@@ -804,7 +802,15 @@ class BrowserController:
             return {"success": True, "method": f"cdp_already_running_{backend}",
                     "cdp_backend": backend,
                     "message": "CDP already available (real profile)"}
-        return await self.launch_with_cdp(url)
+        res = await self.launch_with_cdp(url)
+        if _cdp_available():
+            return res
+        # Fallback to separate profile window with guaranteed CDP debugging port
+        sep_res = await self._launch_separate_profile(url)
+        if _cdp_available():
+            return {"success": True, "method": "separate_profile_cdp",
+                    "cdp_backend": _cdp_backend(), "message": "Browser ready with CDP", **sep_res}
+        return res
 
     # ── CDP Tab Operations ─────────────────────────────────────────────────
 
@@ -1458,31 +1464,67 @@ class BrowserController:
           const isGoogle = window.location.hostname.includes('google');
           if (isGoogle) {
             const cards = [];
-            const resultBlocks = document.querySelectorAll('#rso .g, #rso div[data-hveid]');
+            // Featured snippet / knowledge graph
+            const featured = document.querySelector('.kno-rdesc, [data-attrid], .hgKElc, .LGOjbe, .Z0LcW, .IZ6rdc');
+            if (featured && featured.innerText && featured.innerText.trim().length > 20) {
+              cards.push(featured.innerText.trim());
+            }
+            const resultBlocks = document.querySelectorAll('#rso .g, #rso .MjjYud, #rso div[data-hveid]');
             for (const b of resultBlocks) {
               const h3 = b.querySelector('h3');
               if (h3) {
                 const title = (h3.innerText || '').trim();
-                const snippetEl = b.querySelector('div[style*="-webkit-line-clamp"], .VwiC3b, span[style*="line-height"]');
+                const snippetEl = b.querySelector('div[style*="-webkit-line-clamp"], .VwiC3b, span[style*="line-height"], div.yXK7lf');
                 const snippet = snippetEl ? (snippetEl.innerText || '').trim() : '';
-                if (title) {
-                  cards.push(snippet ? `${title}: ${snippet}` : title);
+                if (title && snippet) {
+                  cards.push(`${title}: ${snippet}`);
+                } else if (title) {
+                  cards.push(title);
                 }
               }
-              if (cards.length >= 6) break;
+              if (cards.length >= 8) break;
             }
             if (cards.length > 0) return cards.join('\\n\\n');
           }
-          return Array.from(document.querySelectorAll('h1,h2,h3,p,li,td,th,span,a'))
-            .map(e => (e.innerText || '').trim())
-            .filter(t => t.length > 15)
-            .slice(0, 40)
-            .join('\\n');
+          const mainEl = document.querySelector('article, main, #content, .content, #main');
+          const sourceText = (mainEl && mainEl.innerText && mainEl.innerText.length > 100)
+            ? mainEl.innerText
+            : (document.body ? document.body.innerText : '');
+          if (sourceText) {
+            return sourceText.split('\\n')
+              .map(t => t.trim())
+              .filter(t => t.length > 20)
+              .slice(0, 35)
+              .join('\\n');
+          }
+          return '';
         })()
         """
         result = await self.execute_js(code)
         if result.get("success"):
             return {"success": True, "text": result.get("value", "") or "", "method": "cdp"}
+
+        # Fallback: Try reading via current URL fetch if http(s)
+        try:
+            curr = await self.get_current_url()
+            curr_url = curr.get("url", "")
+            if curr_url and curr_url.startswith("http"):
+                import urllib.request
+                req = urllib.request.Request(curr_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                loop = asyncio.get_event_loop()
+                def _fetch():
+                    with urllib.request.urlopen(req, timeout=4) as r:
+                        return r.read().decode("utf-8", errors="ignore")
+                html_content = await loop.run_in_executor(None, _fetch)
+                import re
+                clean_html = re.sub(r"<(script|style)[^>]*>.*?</\1>", "", html_content, flags=re.DOTALL)
+                clean_html = re.sub(r"<[^>]+>", " ", clean_html)
+                clean_text = re.sub(r"\s+", " ", clean_html).strip()
+                if clean_text:
+                    return {"success": True, "text": clean_text[:1400], "method": "http_fetch"}
+        except Exception:
+            pass
+
         return {"success": False, "error": result.get("error", "CDP unavailable")}
 
     async def click_element(self, selector: str) -> dict[str, Any]:

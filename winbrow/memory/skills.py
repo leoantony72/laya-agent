@@ -32,7 +32,7 @@ SKILLS_FILENAME = "skills.json"
 DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "tools"
 
 MAX_STEPS = 12                                  # replay hard cap
-MATCH_THRESHOLD = 0.55                          # Jaccard token-overlap gate
+MATCH_THRESHOLD = 0.66                          # Jaccard token-overlap gate
 _LOANWORDS = {"a", "an", "the", "and", "or", "in", "on", "for", "to", "my",
               "it", "its", "that", "this", "those", "some", "please", "then",
               "up", "down", "be", "of", "with", "at", "as", "do", "did", "just"}

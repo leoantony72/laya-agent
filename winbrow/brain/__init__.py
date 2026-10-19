@@ -14,6 +14,8 @@ from .model_gateway import (
     ToolCall,
     get_gateway,
     reset_gateway,
+    uses_builtin_local_server,
+    wants_local_brain,
 )
 from .agent_loop import (
     AgentBrain,
@@ -29,6 +31,8 @@ __all__ = [
     "ToolCall",
     "get_gateway",
     "reset_gateway",
+    "uses_builtin_local_server",
+    "wants_local_brain",
     "AgentBrain",
     "BrainResult",
     "BrainStepResult",

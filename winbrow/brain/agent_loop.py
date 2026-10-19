@@ -38,7 +38,7 @@ log = logging.getLogger("winbrow.brain.loop")
 
 MAX_STEPS_DEFAULT = int(6)
 MAX_REPLANS = 1
-MAX_PLANNER_TOOLS = 80
+MAX_PLANNER_TOOLS = 140
 
 # Meta-skills the brain can call that are not registry tools.
 # Implemented in-process against the memory store.
@@ -62,12 +62,16 @@ class BrainStepResult:
     output: str
     why: str = ""
     elapsed_ms: float = 0.0
+    pending: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "skill": self.skill, "args": self.args, "success": self.success,
             "output": self.output[:400], "why": self.why, "elapsed_ms": self.elapsed_ms,
         }
+        if self.pending:
+            d["pending"] = self.pending
+        return d
 
 
 @dataclass
@@ -79,9 +83,10 @@ class BrainResult:
     provider: str = ""
     model: str = ""
     plan_elapsed_ms: float = 0.0
+    pending: Optional[dict] = None
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "type": "brain",
             "kind": self.kind,
             "success": self.success,
@@ -91,6 +96,9 @@ class BrainResult:
             "model": self.model,
             "plan_elapsed_ms": self.plan_elapsed_ms,
         }
+        if self.pending:
+            d["pending"] = self.pending
+        return d
 
 
 class AgentBrain:
@@ -111,16 +119,40 @@ class AgentBrain:
         self.max_steps = max_steps
 
     # ------------------------------------------------------------------ skills block
-    def _skills_block(self, ctx: Any) -> str:
+    def _skills_block(self, ctx: Any, utterance: str = "") -> str:
         lines = []
         available = self.registry.available(ctx)
-        # Seed tools first; Python-backed atoms/adapters always visible
-        seeded, python_backed = [], []
+        u_low = (utterance or "").lower()
+
+        # Group tools by type
+        python_backed, mcp_priority, mcp_other, seeded = [], [], [], []
         for t in available:
             impl = getattr(t, "impl", None)
-            (python_backed if impl in (COMPUTER_IMPL, ADAPTER_IMPL) else seeded).append(t)
-        budget = max(MAX_PLANNER_TOOLS - len(python_backed), 0)
-        for t in seeded[:budget] + python_backed:
+            if impl in (COMPUTER_IMPL, ADAPTER_IMPL):
+                python_backed.append(t)
+            elif impl == "mcp":
+                name_low = t.name.lower()
+                desc_low = (t.description or "").lower()
+                is_relevant = False
+                for kw in ("wiki", "weather", "search", "fetch", "url", "define", "dictionary",
+                           "book", "country", "currency", "news", "arxiv", "paper", "github", "reddit"):
+                    if kw in u_low and (kw in name_low or kw in desc_low):
+                        is_relevant = True
+                        break
+                if is_relevant or any(k in name_low for k in ("wikipedia", "fetch", "dictionary", "meteo")):
+                    mcp_priority.append(t)
+                else:
+                    mcp_other.append(t)
+            else:
+                seeded.append(t)
+
+        selected = list(python_backed) + list(mcp_priority)
+        remaining_budget = max(MAX_PLANNER_TOOLS - len(selected), 0)
+        selected.extend(seeded[:remaining_budget])
+        remaining_budget2 = max(MAX_PLANNER_TOOLS - len(selected), 0)
+        selected.extend(mcp_other[:remaining_budget2])
+
+        for t in selected:
             args_desc = ", ".join(
                 f"{a.name}({a.kind})" for a in t.args
             ) or "no args"
@@ -148,7 +180,7 @@ class AgentBrain:
                     f"  {h.label[:120]}" for h in hits
                 )
 
-        skills_block = self._skills_block(ctx)
+        skills_block = self._skills_block(ctx, utterance)
         messages = prompts.build_planner_messages(
             utterance, _ctx_block(ctx), memory_block, skills_block,
         )
@@ -171,14 +203,50 @@ class AgentBrain:
             return result
 
         # ---- action: execute steps
+        import json as _json
+        import re as _re
         steps = plan.get("steps", [])[: self.max_steps]
+        last_output_text = ""
         for i, step in enumerate(steps):
             skill = str(step.get("skill", ""))
             args = dict(step.get("args") or {})
             why = str(step.get("why", ""))
 
+            # Data pipelining: substitute placeholders with real output from previous step
+            for k, v in list(args.items()):
+                if isinstance(v, str):
+                    v_str = v.strip()
+                    is_placeholder = (
+                        v_str == "$PREVIOUS_OUTPUT"
+                        or "$output" in v_str.lower()
+                        or "$prev" in v_str.lower()
+                        or (v_str.startswith("<") and v_str.endswith(">"))
+                        or (v_str.startswith("{{") and v_str.endswith("}}"))
+                        or (v_str.startswith("[") and v_str.endswith("]") and "summary" in v_str.lower())
+                    )
+                    if is_placeholder and last_output_text:
+                        args[k] = last_output_text
+
             step_res = await self._run_step(skill, args, why)
             result.steps.append(step_res)
+
+            # Record clean text output for subsequent steps
+            if step_res.success and step_res.output:
+                raw = step_res.output
+                extracted = ""
+                try:
+                    parsed = _json.loads(raw)
+                    if isinstance(parsed, dict):
+                        extracted = (
+                            parsed.get("summary")
+                            or parsed.get("content")
+                            or parsed.get("text")
+                            or parsed.get("output")
+                            or ""
+                        )
+                except Exception:
+                    pass
+                last_output_text = extracted or raw
 
             if emit:
                 try:
@@ -197,6 +265,8 @@ class AgentBrain:
                 if step_res.output.startswith("[permission-required]") or step_res.output.startswith("[denied]"):
                     result.success = False
                     result.response = step_res.output
+                    if step_res.pending:
+                        result.pending = step_res.pending
                     return result
                 # Recovery: one re-plan with the failure in context
                 recovered = await self._try_recover(utterance, step_res, ctx, session, skills_block, emit)
@@ -229,9 +299,25 @@ class AgentBrain:
                 messages,
                 json_schema=prompts.PLANNER_JSON_SCHEMA,
                 temperature=0.1 if attempt == 0 else 0.3,
-                max_tokens=900,
+                max_tokens=2500,
             )
             plan = extract_json_object(resp.content)
+            if plan:
+                if isinstance(plan, list):
+                    plan = {"kind": "action", "steps": plan}
+                elif isinstance(plan, dict):
+                    if "plan" in plan and isinstance(plan["plan"], dict):
+                        plan = plan["plan"]
+                    if "kind" not in plan:
+                        if "steps" in plan and isinstance(plan["steps"], list):
+                            plan["kind"] = "action"
+                        elif "response" in plan:
+                            plan["kind"] = "chat"
+                        elif "action" in plan:
+                            plan["kind"] = "action"
+                            if "steps" not in plan:
+                                plan["steps"] = [{"skill": plan["action"], "args": plan.get("args", {})}]
+
             if plan and "kind" in plan:
                 if emit:
                     try:
@@ -246,7 +332,8 @@ class AgentBrain:
                     except Exception:
                         pass
                 return plan
-            log.warning(f"Plan parse failed (attempt {attempt + 1}); retrying.")
+            snippet = resp.content[:200].replace("\n", " ") if getattr(resp, "content", None) else "<empty>"
+            log.warning(f"Plan parse failed (attempt {attempt + 1}); retrying. Raw snippet: {snippet!r}")
             messages = messages + [
                 {"role": "assistant", "content": resp.content[:500]},
                 {"role": "user", "content": "That was not valid JSON per the schema. Output ONLY the JSON object."},
@@ -318,6 +405,7 @@ class AgentBrain:
                      f"confirmation_id={p.get('confirmation_id')}"),
                     why,
                     round((time.perf_counter() - t0) * 1000, 1),
+                    pending=p,
                 )
             if exec_out.get("type") == "denied":
                 return BrainStepResult(

@@ -30,14 +30,18 @@ class QwenLLM:
         model_path: Optional[Path] = None,
         host: str = "127.0.0.1",
         port: int = 8080,
-        n_ctx: int = 4096,
-        n_threads: int = 4,
+        n_ctx: Optional[int] = None,
+        n_threads: Optional[int] = None,
     ):
         self.model_path = model_path or get_model_path("qwen")
         self.host = host
         self.port = port
-        self.n_ctx = n_ctx
-        self.n_threads = n_threads
+        # Planner prompts (tools + context) run ~6k tokens; 4096 truncates them.
+        self.n_ctx = n_ctx or int(os.environ.get("WINBROW_LOCAL_LLM_CTX", "8192"))
+        # Never oversubscribe cores: llama.cpp is fastest at physical-core count.
+        self.n_threads = n_threads or int(
+            os.environ.get("WINBROW_LOCAL_LLM_THREADS", str(min(os.cpu_count() or 4, 8)))
+        )
         self.server_process: Optional[subprocess.Popen] = None
         self._server_ready = False
         
@@ -46,9 +50,9 @@ class QwenLLM:
         if self._server_ready:
             return
         
-        llama_server = ensure_llama_cpp()
+        llama_server = ensure_llama_cpp(download=True)
         if not llama_server or not llama_server.exists():
-            raise RuntimeError("llama-server binary unavailable. Running in System 1 Laya routing mode.")
+            raise RuntimeError("llama-server binary unavailable (download failed). Running in System 1 Laya routing mode.")
         self.model_path = self.model_path or get_model_path("qwen")
         
         cmd = [
@@ -56,22 +60,31 @@ class QwenLLM:
             "-m", str(self.model_path),
             "--host", "127.0.0.1",
             "--port", str(self.port),
-            "-c", "4096",
+            "-c", str(self.n_ctx),
             "-t", str(self.n_threads),
-            "--mlock",
-            "--no-mmap",
+            "--parallel", "1",
         ]
-        
+
         log.info(f"Starting llama.cpp server on {self.base_url}...")
+        # Write server output to a log file — never a pipe we don't drain
+        # (llama-server logs steadily; an unread pipe eventually blocks it).
+        self.log_path = Path(llama_server).parent / "llama-server.log"
+        log_file = open(self.log_path, "ab")
         self.server_process = subprocess.Popen(
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
         )
+        log_file.close()
         
         # Wait for server to be ready
         for _ in range(30):
             await asyncio.sleep(0.5)
+            if self.server_process.poll() is not None:
+                raise RuntimeError(
+                    f"llama-server exited immediately (port {self.port} already in use?) "
+                    f"— see {self.log_path}"
+                )
             try:
                 import urllib.request
                 with urllib.request.urlopen(f"{self.base_url}/health", timeout=2) as resp:
@@ -82,7 +95,7 @@ class QwenLLM:
             except Exception:
                 pass
         
-        raise RuntimeError("llama.cpp server failed to start")
+        raise RuntimeError(f"llama.cpp server failed to start (see {self.log_path})")
     
     async def stop(self) -> None:
         """Stop the llama.cpp server."""
