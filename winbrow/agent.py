@@ -18,11 +18,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Optional
 
 from .browser_task import BrowserController
+from .browser_tools import BROWSER_IMPL, execute_browser_tool, get_browser_tools
 from .brain import AgentBrain, GatewayUnavailable, ModelGateway
 from .brain.agent_loop import _ctx_block
 from .brain.model_gateway import extract_json_object
@@ -40,7 +42,7 @@ from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
 from .registry import Tool, ToolRegistry
 from .resolvers import resolve_file, resolve_folder
-from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter, _strip_conversational_prefix, autocorrect_utterance, _tokens, _fuzzy_in, _SEARCH_VERBS, _WEB_LOCS, _LOCAL_FIND, _LAUNCH_APPS, _COMMON_APPS
+from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter, _strip_conversational_prefix, autocorrect_utterance, _tokens, _fuzzy_in, _SEARCH_VERBS, _WEB_LOCS, _LOCAL_FIND, _LAUNCH_APPS, _COMMON_APPS, is_multi_step_intent
 from .windows import WindowsContext, get_current_windows_context, run_powershell, set_windows_volume
 
 log = logging.getLogger("winbrow.agent")
@@ -278,7 +280,8 @@ class WinBrowAgent:
         self.registry = registry or ToolRegistry()
         # register Python-backed computer atoms + app adapter ops once
         for _t in (get_computer_tools() + get_adapter_tools()
-                   + get_installer_tools() + get_shell_tools()):
+                   + get_installer_tools() + get_shell_tools()
+                   + get_browser_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -363,6 +366,17 @@ class WinBrowAgent:
                 "output": f"Action denied: {deny_reason or 'blocked by policy'}",
             }
 
+        if tool_name == "create_text_file":
+            from .files import write_named_text_file
+            out = write_named_text_file(args)
+            out.update({
+                "type": "tool_execution",
+                "tool": tool_name,
+                "is_learned": False,
+                "script": "",
+                "elapsed_ms": 1.0,
+            })
+            return out
         if tool_name == "volume_set_level":
             level_arg = str(args.get("level", "50"))
             out_msg = set_windows_volume(level_arg)
@@ -445,6 +459,14 @@ class WinBrowAgent:
                 "tool": tool_name,
             })
             return out
+        # System-2 browser primitives (navigate/read/interact/wait)
+        if getattr(tool, "impl", None) == BROWSER_IMPL:
+            out = await execute_browser_tool(tool_name, args, browser=self.browser)
+            out.update({
+                "type": "browser_tool",
+                "tool": tool_name,
+            })
+            return out
         # v3/M3: installer ops (winget-first, T3-gated above)
         if getattr(tool, "impl", None) == INSTALLER_IMPL:
             op = INSTALL_OPS.get(tool_name)
@@ -477,6 +499,32 @@ class WinBrowAgent:
         messages = build_chat_messages(utterance, _ctx_block(ctx), session.context_block())
         resp = await self.gateway.chat(messages, temperature=0.5, max_tokens=300)
         return resp.content.strip() or "Nothing to say."
+
+    async def handle_browser_task(
+        self, utterance: str, ctx: WindowsContext, session: SessionMemory,
+        emit: Optional[Any] = None,
+    ) -> tuple[Any, dict]:
+        """Run every browser task through the same observe → act → verify loop.
+
+        The loop is the router: simple goals finish in one or two steps, complex
+        ones use more, and no task-type tier can misclassify the request.
+        """
+        contextualized, resolutions = session.resolve_references(utterance)
+        if resolutions:
+            log.info(f"Session resolved references: {resolutions}")
+        try:
+            max_steps = int(
+                os.environ.get(
+                    "WINBROW_BROWSER_MAX_STEPS",
+                    os.environ.get("WINBROW_MAX_STEPS", "20"),
+                )
+            )
+        except ValueError:
+            max_steps = 20
+        result = await self.brain.handle(
+            contextualized, ctx, session, emit=emit, max_steps=max_steps,
+        )
+        return result, resolutions
 
     async def build_new_tool(self, task: str, ctx: Optional[WindowsContext] = None) -> dict[str, Any]:
         """Brain meta-skill 'build_tool': author a NEW PowerShell tool from a
@@ -957,6 +1005,12 @@ class WinBrowAgent:
             replay_hit = self.skills.find_match(utterance)
         except Exception:
             replay_hit = None
+        # Live web state changes between runs. A recorded browser workflow can
+        # land on the wrong page and then "succeed" against stale assumptions,
+        # so browser goals always go through the observe → act → verify loop.
+        if replay_hit is not None and _is_browser_intent(utterance):
+            log.info(f"Skill '{replay_hit[0].id}' skipped for browser task; using the brain loop.")
+            replay_hit = None
         replay_steps: list[dict[str, Any]] = []
         if replay_hit is not None:
             skill, score = replay_hit
@@ -1048,11 +1102,7 @@ class WinBrowAgent:
 
         # Multi-step command check: if the user wants multiple steps (e.g. search + save to desktop),
         # do NOT hijack with browser fast-path; let it route to the multi-step brain planner.
-        is_multi_step = any(kw in utterance_lower for kw in [
-            "save it", "save in", "save to", "save as", "in desktop", "on desktop",
-            "in a .txt", "in a txt", "in notepad", "to notepad", "and then", "and also",
-            "and save", "then save", "write it", "note it", "make a note", "save the"
-        ])
+        is_multi_step = is_multi_step_intent(utterance)
 
         # MCP direct shortcuts for high-confidence lookups and local reads —
         # these MUST run before the browser/is_search fast-path so "search
@@ -1193,8 +1243,47 @@ class WinBrowAgent:
             self.store.record_command(utterance, result["route"], result["execution"], total_ms)
             return result
 
-        # ── ROUTE WEB & BROWSER TASKS DIRECTLY TO LAYA-ULTRAFAST ──
-        if (browser_fast or is_search) and not is_multi_step:
+        # ── ALL BROWSER TASKS USE THE SAME OBSERVE → ACT → VERIFY LOOP ──
+        # No task-type tiers. The brain decides how many steps this specific
+        # goal needs: a simple task finishes in one or two, a complex one uses
+        # more, and a bad earlier step is visible before the next decision.
+        if (browser_fast or is_search) and self.gateway.available:
+            try:
+                brain_res, resolutions = await self.handle_browser_task(
+                    utterance, ctx, session, emit=emit,
+                )
+                total_ms = round((time.perf_counter() - t0) * 1000, 1)
+                result = {
+                    "utterance": utterance,
+                    "route": {
+                        "kind": "browser",
+                        "tool_name": "brain",
+                        "args": {"goal": utterance},
+                        "confidence": 1.0,
+                        "latency_ms": 0,
+                        "probabilities": {},
+                        "tier": "browser_brain",
+                    },
+                    "context": ctx.to_dict(),
+                    "execution": brain_res.to_dict(),
+                    "total_elapsed_ms": total_ms,
+                }
+                if resolutions:
+                    result["session_resolutions"] = resolutions
+                self.history.append(result)
+                if len(self.history) > 100:
+                    self.history = self.history[-100:]
+                session.record_turn(utterance, result["route"], result["execution"])
+                self.store.record_command(
+                    utterance, result["route"], result["execution"], total_ms)
+                return result
+            except GatewayUnavailable:
+                log.warning("Browser brain unavailable; using one-shot fallback.")
+            except Exception as e:
+                log.warning(f"Browser brain failed ({e}); using one-shot fallback.")
+
+        # One-shot fallback only when no model provider is usable.
+        if browser_fast or is_search:
             out = await self.browser.run_ultrafast_task(utterance)
             total_ms = round((time.perf_counter() - t0) * 1000, 1)
             result = {
@@ -1227,9 +1316,6 @@ class WinBrowAgent:
             self.store.record_command(utterance, result["route"], result["execution"], total_ms)
             return result
 
-        # NOTE: multi-step detection now lives in the router (route() 2b
-        # fallback): single-step matches (e.g. the editor recipe) win first,
-        # only unresolvable multi-step phrasing falls to the Brain planner.
         route = await self.router.route(utterance, ctx, memory=self.memory)
         log.info(f"Routed '{utterance}' → {route.kind} (tool: {route.tool.name if route.tool else None}, conf: {route.confidence:.2f})")
 
@@ -1260,19 +1346,6 @@ class WinBrowAgent:
             result["execution"] = await self._dispatch_tool_execution(
                 route, utterance, session_id,
             )
-
-        elif browser_fast and route.kind != "tool":
-            out = await self.browser.run_ultrafast_task(utterance)
-            result["execution"] = {
-                "type": "browser",
-                "tool": "laya_ultrafast_browser",
-                "success": out.get("success", True),
-                "output": out.get("final_answer") or str(out.get("steps", [])),
-                "steps": out.get("steps", []),
-                "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
-                "method": out.get("method", "laya_ultrafast"),
-            }
-            result["route"]["kind"] = "browser"
 
         elif route.kind == NEW_ACTION:
             # Brain first (context-aware multi-step + follow-ups). Falls back to

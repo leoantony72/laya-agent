@@ -32,6 +32,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .model_gateway import (
@@ -45,6 +46,7 @@ from . import prompts
 from ..computer import COMPUTER_IMPL
 from ..adapters.manager import ADAPTER_IMPL
 from ..shell import SHELL_IMPL
+from ..browser_tools import BROWSER_IMPL
 from ..policy import PolicyError, validate_script_safety
 from ..registry import ArgSpec, Tool
 
@@ -234,6 +236,9 @@ class BrainStepResult:
     why: str = ""
     elapsed_ms: float = 0.0
     pending: Optional[dict] = None
+    warning: str = ""
+    url: str = ""
+    title: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -242,6 +247,12 @@ class BrainStepResult:
         }
         if self.pending:
             d["pending"] = self.pending
+        if self.warning:
+            d["warning"] = self.warning
+        if self.url:
+            d["url"] = self.url
+        if self.title:
+            d["title"] = self.title
         return d
 
 
@@ -256,6 +267,7 @@ class BrainResult:
     plan_elapsed_ms: float = 0.0
     pending: Optional[dict] = None
     complete: bool = False          # explicit done/chat after all goal parts
+    evidence: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = {
@@ -271,6 +283,8 @@ class BrainResult:
         }
         if self.pending:
             d["pending"] = self.pending
+        if self.evidence:
+            d["evidence"] = self.evidence
         return d
 
 
@@ -309,7 +323,7 @@ class AgentBrain:
         per_server: Dict[str, List] = {}
         for t in available:
             impl = getattr(t, "impl", None)
-            if impl in (COMPUTER_IMPL, ADAPTER_IMPL, SHELL_IMPL):
+            if impl in (COMPUTER_IMPL, ADAPTER_IMPL, SHELL_IMPL, BROWSER_IMPL):
                 python_backed.append(t)
             elif impl == "mcp":
                 script = getattr(t, "script", "") or ""
@@ -361,6 +375,7 @@ class AgentBrain:
         ctx: Any,
         session: Any,                       # SessionMemory
         emit: Optional[Callable[[dict], Awaitable[None]]] = None,
+        max_steps: Optional[int] = None,
     ) -> BrainResult:
         """Closed-loop Plan → Act → Observe executor.
 
@@ -398,8 +413,9 @@ class AgentBrain:
         coaching = ""
         repeats: Dict[tuple, int] = {}
         done_challenged = False
+        step_budget = max_steps if max_steps is not None else self.max_steps
 
-        while len(result.steps) < self.max_steps:
+        while len(result.steps) < step_budget:
             # Rebuild every turn: build_tool/repair_tool register tools
             # mid-task and the next decision must see them.
             skills_block = self._skills_block(ctx, utterance)
@@ -478,6 +494,10 @@ class AgentBrain:
                     result.kind = "action"
                     result.success = True
                     result.complete = not bool(gap)
+                    result.evidence = (
+                        dict(plan.get("evidence"))
+                        if isinstance(plan.get("evidence"), dict) else {}
+                    )
                     result.response = text or self._history_summary(history) or "Done."
                     return result
                 result.kind = "chat"
@@ -504,6 +524,10 @@ class AgentBrain:
                 result.kind = "action"
                 result.success = True
                 result.complete = not bool(gap)
+                result.evidence = (
+                    dict(plan.get("evidence"))
+                    if isinstance(plan.get("evidence"), dict) else {}
+                )
                 result.response = text or self._history_summary(history) or "Done."
                 return result
 
@@ -520,7 +544,7 @@ class AgentBrain:
                 last_plan_response = text
 
             done_sigs = {_step_signature(s.skill, s.args) for s in history if s.success}
-            remaining = self.max_steps - len(result.steps)
+            remaining = step_budget - len(result.steps)
             for step in steps[:remaining]:
                 skill = str(step.get("skill", ""))
                 args = dict(step.get("args") or {})
@@ -599,7 +623,7 @@ class AgentBrain:
         # Budget exhausted without a terminal decision: say so instead of
         # silently implying the goal finished.
         result = self._finalize(result, history, last_plan_response)
-        if len(result.steps) >= self.max_steps:
+        if len(result.steps) >= step_budget:
             result.response = (
                 f"{result.response} (Stopped after {len(result.steps)} steps — "
                 "step limit reached; the task may be incomplete.)"
@@ -766,7 +790,8 @@ class AgentBrain:
                 return BrainStepResult(
                     skill, args, False,
                     f"Execution timed out after {STEP_TIMEOUT_S:.0f}s.",
-                    why, round((time.perf_counter() - t0) * 1000, 1))
+                    why, round((time.perf_counter() - t0) * 1000, 1),
+                    warning=f"This step timed out after {STEP_TIMEOUT_S:.0f}s.")
             # v3/M3: the permission is a hard stop — no re-plan can bypass it
             if exec_out.get("type") == "permission_required":
                 p = exec_out.get("pending") or {}
@@ -786,14 +811,23 @@ class AgentBrain:
                     why,
                     round((time.perf_counter() - t0) * 1000, 1),
                 )
-            success = bool(exec_out.get("success", False))
-            output = str(exec_out.get("output") or exec_out.get("stdout") or "Done")
-            return BrainStepResult(skill, args, success, output, why,
-                                   round((time.perf_counter() - t0) * 1000, 1))
+            annotated = annotate_result(skill, args, exec_out)
+            success = bool(annotated.get("success", False))
+            output = str(annotated.get("output") or annotated.get("stdout") or "Done")
+            return BrainStepResult(
+                skill, args, success, output, why,
+                round((time.perf_counter() - t0) * 1000, 1),
+                warning=str(annotated.get("_warning") or ""),
+                url=str(annotated.get("url") or ""),
+                title=str(annotated.get("title") or ""),
+            )
         except Exception as e:
             log.warning(f"Brain step '{skill}' raised: {e}")
-            return BrainStepResult(skill, args, False, f"Execution error: {e}", why,
-                                   round((time.perf_counter() - t0) * 1000, 1))
+            return BrainStepResult(
+                skill, args, False, f"Execution error: {e}", why,
+                round((time.perf_counter() - t0) * 1000, 1),
+                warning=f"This step raised: {e}",
+            )
 
     # ------------------------------------------------------------------ self-repair
     async def _repair_tool_step(
@@ -922,6 +956,75 @@ class AgentBrain:
                                    f"Repair error: {e}", why, _ms())
 
 
+def _url_parts(url: str) -> tuple[str, str]:
+    """(host, path) identity for navigation checks; tolerates missing schemes."""
+    raw = str(url or "").strip()
+    if not raw:
+        return "", "/"
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return "", "/"
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = parts.path.rstrip("/") or "/"
+    return host, path
+
+
+def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
+    """Attach explicit verification flags before the brain sees a step result.
+
+    This never blocks execution. It surfaces mismatches in HISTORY so the
+    planner can correct course instead of assuming the action worked.
+    """
+    result = dict(raw_result or {})
+    warnings: List[str] = []
+
+    if skill == "browser_navigate":
+        intended = str((args or {}).get("url") or "")
+        actual = str(result.get("url") or "")
+        if intended and not actual:
+            result["_nav_matched"] = False
+            warnings.append(
+                f"Navigation to {intended!r} returned no URL. "
+                "Verify the page state before proceeding."
+            )
+        if intended and actual:
+            intended_host, intended_path = _url_parts(intended)
+            actual_host, actual_path = _url_parts(actual)
+            path_matches = bool(
+                intended_path == "/"
+                or actual_path == intended_path
+                or actual_path.startswith(intended_path + "/")
+            )
+            matched = bool(
+                actual.lower().startswith(intended.rstrip("/").lower())
+                or (intended_host and intended_host == actual_host and path_matches)
+            )
+            result["_nav_matched"] = matched
+            if not matched:
+                warnings.append(
+                    f"Navigated to {actual!r} but intended {intended!r}. "
+                    "Verify this is the right page before proceeding."
+                )
+
+    if result.get("error"):
+        warnings.append(f"This step failed: {result['error']}")
+    elif result.get("success") is False:
+        detail = (
+            result.get("output") or result.get("stderr")
+            or result.get("error") or "unknown failure"
+        )
+        warnings.append(f"This step failed: {str(detail)[:300]}")
+
+    if warnings:
+        result["_warning"] = " ".join(warnings)
+    return result
+
+
 def _step_signature(skill: str, args: dict) -> tuple:
     """Stable identity for a step, used to detect repeats of completed work."""
     try:
@@ -954,6 +1057,12 @@ def _history_block(history: List[BrainStepResult]) -> str:
     if not history:
         return "(none yet — this is the first action)"
     shown = history[-10:]
+    latest_browser = max(
+        (i for i, s in enumerate(shown) if (s.skill or "").startswith("browser_")),
+        default=-1,
+    )
+    budget = 14_000
+    used = 0
     lines: List[str] = []
     if len(history) > len(shown):
         lines.append(f"({len(history) - len(shown)} earlier steps omitted)")
@@ -962,10 +1071,24 @@ def _history_block(history: List[BrainStepResult]) -> str:
         if len(args) > 240:
             args = args[:237] + "..."
         out = re.sub(r"\s+", " ", s.output or "").strip()
-        if len(out) > 400:
-            out = out[:397] + "..."
+        # Browser page dumps are the planner's primary evidence (repo names,
+        # stars, descriptions). Keep the latest page nearly verbatim, compress
+        # older pages, and cap the whole block so long research loops never
+        # crowd out the task and schema.
+        if (s.skill or "").startswith("browser_"):
+            out_limit = 3500 if i - 1 == latest_browser else 1000
+        else:
+            out_limit = 400
+        out_limit = max(200, min(out_limit, budget - used))
+        if len(out) > out_limit:
+            out = out[:out_limit - 3] + "..."
+        used += len(out)
         status = "OK" if s.success else "FAILED"
         lines.append(f"{i}. {s.skill}({args}) → {status}: {out}")
+        if s.warning:
+            warning = s.warning[:500]
+            used += len(warning)
+            lines.append(f"   _warning: {warning}")
     return "\n".join(lines)
 
 

@@ -9,6 +9,8 @@ sentence. Everything here reads the OS; nothing reads the utterance.
 from __future__ import annotations
 
 import os
+import re
+from pathlib import Path
 from typing import Any, Optional
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
@@ -216,3 +218,57 @@ def installed_apps(limit: int = 40) -> list[str]:
     except ImportError:
         pass
     return found[:limit]
+
+
+_MAX_TEXT_CONTENT_CHARS = 200_000
+_TEXT_EXTENSIONS = r"\.(txt|md|log|csv|json|ps1|py|go|html|css|js|ini)$"
+
+
+def _text_target_folder(value: str) -> Path:
+    home = Path(user_home())
+    key = (value or "Desktop").strip().lower()
+    if key.startswith("download"):
+        return home / "Downloads"
+    if key.startswith("document"):
+        return home / "Documents"
+    if key.startswith(("picture", "image")):
+        return home / "Pictures"
+    if key.startswith("video"):
+        return home / "Videos"
+    return home / "Desktop"
+
+
+def write_named_text_file(args: dict, base_dir: Optional[Path] = None) -> dict[str, Any]:
+    """Create/overwrite a text file in a known folder without PowerShell."""
+    filename = str(args.get("filename") or "").strip().strip("\"'")
+    if not filename:
+        return {"success": False, "output": "No filename provided."}
+    if Path(filename).name != filename:
+        return {"success": False, "output": "Invalid filename: path separators are not allowed."}
+    if not re.search(_TEXT_EXTENSIONS, filename, re.IGNORECASE):
+        filename += ".txt"
+
+    content = str(args.get("content") or "")
+    if len(content) > _MAX_TEXT_CONTENT_CHARS:
+        return {
+            "success": False,
+            "output": f"Content too large ({len(content)} chars; max {_MAX_TEXT_CONTENT_CHARS}).",
+        }
+
+    folder = Path(base_dir) if base_dir is not None else _text_target_folder(
+        str(args.get("folder") or "Desktop"))
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / filename
+        if folder.resolve() not in path.resolve().parents:
+            return {"success": False, "output": "Invalid filename: escapes the target folder."}
+        path.write_text(content, encoding="utf-8", newline="\n")
+    except OSError as exc:
+        return {"success": False, "output": f"Could not create file: {exc}"}
+
+    return {
+        "success": True,
+        "output": f"Created file: {path}",
+        "path": str(path),
+        "bytes": len(content.encode("utf-8")),
+    }

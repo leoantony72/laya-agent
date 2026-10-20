@@ -34,6 +34,32 @@ STOP = "stop"
 MIN_TOOL_CONFIDENCE = 0.35
 NEW_ACTION_MIN_CONFIDENCE = 0.55
 
+# Requests that need more than one observe/act cycle. The first group hands
+# results to an editor or file; the second group is browser/desktop research
+# (collect, filter, compare, then write), which must reach the Brain planner
+# instead of a one-shot tool.
+_MULTI_STEP_CUES = (
+    "save it", "save in", "save to", "save as", "in desktop", "on desktop",
+    "in a .txt", "in a txt", "in notepad", "to notepad", "and then", "and also",
+    "and save", "then save", "write it", "note it", "make a note", "save the",
+    "top 5", "top five", "top 10", "top ten", "each repo", "each repository",
+    "for each", "open each", "visit each", "from each", "all of them",
+    "filter by", "filtered by", "more than", "fewer than", "less than",
+    "at least", "last 7 days", "past week", "last week", "updated since",
+    "check if", "verify that", "compare", "collect", "extract the",
+    "summarize", "summarise", "list the", "find the top", "read the page",
+    "read page", "page and tell", "tell me the", "tell me what", "report the",
+    "star count", "how many stars", "top repository", "top repo",
+    "new file called", "new file named", "to a new file", "into a new file",
+    "in a new file", "write the results", "write results", "watchlist",
+    "step by step", "multi-step",
+)
+
+
+def is_multi_step_intent(text: str) -> bool:
+    low = (text or "").lower()
+    return any(cue in low for cue in _MULTI_STEP_CUES)
+
 # Nicknames the bundled folder tools understand. Kept in one place so the
 # open/close fallback branches agree on what a "folder" can be.
 _SYSTEM_FOLDERS = frozenset({
@@ -844,13 +870,9 @@ class WinBrowRouter:
             log.info(f"Normalized '{text}' → '{corrected}'")
 
         # Multi-step intent (e.g. "search X and save to desktop"): reroute to
-        # the Brain planner — but ONLY when no single-step heuristic matched,
+        # the Brain planner - but ONLY when no single-step heuristic matched,
         # else it shadows the editor recipe ("save it as home.txt").
-        is_multi_step = any(kw in corrected.lower() for kw in [
-            "save it", "save in", "save to", "save as", "in desktop", "on desktop",
-            "in a .txt", "in a txt", "in notepad", "to notepad", "and then", "and also",
-            "and save", "then save", "write it", "note it", "make a note", "save the"
-        ])
+        is_multi_step = is_multi_step_intent(corrected)
 
         # 1. Laya on tools (if enabled and healthy). The kill switch governs
         # WORKER CREATION (init) — an explicitly injected worker still runs.

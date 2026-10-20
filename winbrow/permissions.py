@@ -57,6 +57,8 @@ TOOL_TIERS: Dict[str, str] = {
     "app_focus_or_launch": T1, "open_common_app": T1, "open_file": T1,
     "open_folder": T1, "close_folder_window": T2, "web_search": T1,
     "laya_ultrafast_browser": T1, "take_screenshot_b64": T0,
+    "browser_navigate": T1, "browser_interact": T1, "browser_wait": T1,
+    "browser_read_page": T0,
     "vscode_open": T1, "vscode_install_extension": T2, "vscode_run_command": T1,
     "notepad_open": T1, "paint_open_image": T1, "office_open_doc": T1,
     "quick_note": T1,

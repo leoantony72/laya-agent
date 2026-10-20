@@ -382,6 +382,211 @@ class TestShellTool(unittest.TestCase):
         self.assertTrue(any(tmp.glob("*.exe")), built)
 
 
+class TestFileWrites(unittest.TestCase):
+    def test_write_named_text_file_is_deterministic(self):
+        from winbrow.files import write_named_text_file
+
+        tmp = Path(tempfile.mkdtemp(prefix="winbrow_files_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = write_named_text_file(
+            {"filename": "watchlist.md", "content": "# Watchlist\n"}, base_dir=tmp)
+        self.assertTrue(out["success"], out)
+        self.assertEqual((tmp / "watchlist.md").read_text(encoding="utf-8"),
+                         "# Watchlist\n")
+
+    def test_write_named_text_file_defaults_extension_and_rejects_paths(self):
+        from winbrow.files import write_named_text_file
+
+        tmp = Path(tempfile.mkdtemp(prefix="winbrow_files_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = write_named_text_file({"filename": "note", "content": "hi"}, base_dir=tmp)
+        self.assertTrue(out["success"], out)
+        self.assertTrue((tmp / "note.txt").exists())
+
+        bad = write_named_text_file({"filename": "..\\escape.txt", "content": "x"},
+                                    base_dir=tmp)
+        self.assertFalse(bad["success"])
+        self.assertIn("path separators", bad["output"])
+
+
+class TestBrowserTools(unittest.TestCase):
+    class FakeBrowser:
+        def __init__(self, text="repo one 58,234 stars\nrepo two 3,061 stars"):
+            self.text = text
+            self.navigated = []
+            self.clicked = []
+            self.typed = []
+
+        async def navigate_to(self, url, new_tab=False):
+            self.navigated.append((url, new_tab))
+            return {"success": True, "url": url}
+
+        async def execute_js(self, code):
+            return {
+                "success": True,
+                "value": {
+                    "title": "Trending",
+                    "url": "https://github.com/trending/python",
+                    "text": self.text,
+                    "links": [
+                        {"text": "owner / repo", "href": "https://github.com/owner/repo"},
+                    ],
+                },
+            }
+
+        async def read_page_text(self):
+            return {"success": False}
+
+        async def get_current_url(self):
+            return {"url": "https://github.com/trending/python"}
+
+        async def click_element(self, selector):
+            self.clicked.append(selector)
+            return {"success": True, "output": "clicked"}
+
+        async def type_in_element(self, selector, text):
+            self.typed.append((selector, text))
+            return {"success": True, "output": "typed"}
+
+    def test_tools_registered_with_browser_impl(self):
+        from winbrow.browser_tools import BROWSER_IMPL, get_browser_tools
+        from winbrow.permissions import tool_tier
+
+        tools = {t.name: t for t in get_browser_tools()}
+        self.assertEqual(set(tools), {
+            "browser_navigate", "browser_read_page",
+            "browser_interact", "browser_wait",
+        })
+        self.assertTrue(all(t.impl == BROWSER_IMPL for t in tools.values()))
+        self.assertEqual(tool_tier("browser_read_page"), "t0")
+        self.assertEqual(tool_tier("browser_interact"), "t1")
+
+    def test_navigate_returns_page_state(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        browser = self.FakeBrowser()
+        out = run(execute_browser_tool(
+            "browser_navigate", {"url": "github.com/trending/python"}, browser=browser))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(browser.navigated, [("https://github.com/trending/python", False)])
+        self.assertIn("58,234 stars", out["output"])
+        self.assertIn("owner / repo", out["output"])
+        self.assertLess(out["output"].index("PAGE TEXT"),
+                        out["output"].index("LINKS"))
+        self.assertEqual(out["method"], "cdp")
+
+    def test_read_page_uses_current_page_and_truncates(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        browser = self.FakeBrowser(text="A" * 6000)
+        out = run(execute_browser_tool(
+            "browser_read_page", {"max_chars": "1500"}, browser=browser))
+        self.assertTrue(out["success"], out)
+        self.assertIn("truncated", out["output"])
+        self.assertLess(len(out["output"]), 4000)
+
+    def test_interact_selector_clicks_and_types(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        browser = self.FakeBrowser()
+        clicked = run(execute_browser_tool(
+            "browser_interact", {"selector": "#repo-link"}, browser=browser))
+        self.assertTrue(clicked["success"], clicked)
+        self.assertEqual(browser.clicked, ["#repo-link"])
+        self.assertEqual(clicked["action"], "click")
+
+        typed = run(execute_browser_tool(
+            "browser_interact",
+            {"selector": "#search", "value": "python"}, browser=browser))
+        self.assertTrue(typed["success"], typed)
+        self.assertEqual(browser.typed, [("#search", "python")])
+        self.assertEqual(typed["action"], "type")
+
+    def test_wait_returns_state(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        browser = self.FakeBrowser()
+        out = run(execute_browser_tool(
+            "browser_wait", {"seconds": "0"}, browser=browser))
+        self.assertTrue(out["success"], out)
+        self.assertIn("Trending", out["output"])
+
+    def test_browser_operation_times_out_instead_of_hanging(self):
+        from unittest.mock import patch
+        from winbrow.browser_tools import execute_browser_tool
+
+        class SlowBrowser(self.FakeBrowser):
+            async def navigate_to(self, url, new_tab=False):
+                await asyncio.sleep(1)
+
+        with patch("winbrow.browser_tools._BROWSER_OP_TIMEOUT_S", 0.05):
+            out = run(execute_browser_tool(
+                "browser_navigate", {"url": "https://example.com"},
+                browser=SlowBrowser()))
+        self.assertFalse(out["success"])
+        self.assertTrue(out.get("timeout"))
+        self.assertIn("timed out", out["output"])
+
+    def test_brain_history_keeps_browser_evidence(self):
+        from winbrow.brain.agent_loop import BrainStepResult, _history_block
+
+        block = _history_block([BrainStepResult(
+            "browser_read_page", {}, True, "repo evidence " * 500)])
+        self.assertGreater(len(block), 400)
+        self.assertLessEqual(len(block), 3600)
+        self.assertIn("repo evidence", block)
+
+    def test_brain_history_caps_long_browser_loops(self):
+        from winbrow.brain.agent_loop import BrainStepResult, _history_block
+
+        steps = [BrainStepResult(
+            "browser_read_page", {}, True, f"page {i} " + "x" * 4000)
+            for i in range(10)]
+        block = _history_block(steps)
+        self.assertLessEqual(len(block), 14_500)
+        self.assertIn("page 9", block)
+
+    def test_annotate_navigate_flags_wrong_destination(self):
+        from winbrow.brain.agent_loop import annotate_result
+
+        raw = {"success": True, "url": "https://github.com/dashboard",
+               "title": "GitHub"}
+        out = annotate_result(
+            "browser_navigate",
+            {"url": "https://github.com/trending/python"}, raw)
+        self.assertFalse(out["_nav_matched"])
+        self.assertIn("intended", out["_warning"])
+
+    def test_annotate_navigate_accepts_normalized_url(self):
+        from winbrow.brain.agent_loop import annotate_result
+
+        raw = {"success": True,
+               "url": "http://www.github.com/trending/python/?tab=stars",
+               "title": "Trending"}
+        out = annotate_result(
+            "browser_navigate",
+            {"url": "https://github.com/trending/python"}, raw)
+        self.assertTrue(out["_nav_matched"])
+        self.assertNotIn("_warning", out)
+
+    def test_annotate_failure_is_surfaced(self):
+        from winbrow.brain.agent_loop import annotate_result
+
+        out = annotate_result(
+            "browser_read_page", {},
+            {"success": False, "output": "CDP unavailable"})
+        self.assertIn("This step failed", out["_warning"])
+
+    def test_brain_history_surfaces_verification_warning(self):
+        from winbrow.brain.agent_loop import BrainStepResult, _history_block
+
+        block = _history_block([BrainStepResult(
+            "browser_navigate", {"url": "https://github.com/trending"},
+            True, "Navigated", warning="Landed on the dashboard, not trending.")])
+        self.assertIn("_warning", block)
+        self.assertIn("dashboard", block)
+
+
 class TestAgentWiring(unittest.TestCase):
     def setUp(self):
         from winbrow.memory.skills import reset_skills
@@ -411,6 +616,92 @@ class TestAgentWiring(unittest.TestCase):
             self.assertIn(op.tool_name, names)
         self.assertIn("run_command", names)
         self.assertEqual(self.agent.registry.get("run_command").impl, "shell")
+        for name in ("browser_navigate", "browser_read_page",
+                     "browser_interact", "browser_wait"):
+            self.assertIn(name, names)
+            self.assertEqual(self.agent.registry.get(name).impl, "browser")
+
+    def test_create_text_file_uses_python_writer(self):
+        from unittest.mock import patch
+
+        tmp = Path(tempfile.mkdtemp(prefix="winbrow_agent_files_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.agent.run_skill = self._orig_run_skill
+        with patch("winbrow.files._text_target_folder", return_value=tmp), \
+                patch.dict(os.environ, {"WINBROW_BYPASS_CONFIRM": "1"}):
+            out = run(self.agent.run_skill(
+                "create_text_file",
+                {"filename": "watchlist.md", "content": "# Watchlist\n"},
+            ))
+        self.assertTrue(out["success"], out)
+        self.assertEqual((tmp / "watchlist.md").read_text(encoding="utf-8"),
+                         "# Watchlist\n")
+        self.assertEqual(out["type"], "tool_execution")
+
+    def test_multistep_browser_routes_to_brain(self):
+        from winbrow.brain.agent_loop import BrainResult
+
+        calls = {"brain": 0, "ultrafast": 0}
+
+        async def fake_handle(*args, **kwargs):
+            calls["brain"] += 1
+            return BrainResult(kind="chat", success=True, response="researched")
+
+        async def fake_ultrafast(*args, **kwargs):
+            calls["ultrafast"] += 1
+            return {"success": True, "final_answer": "one-shot"}
+
+        self.agent.brain.handle = fake_handle
+        self.agent.browser.run_ultrafast_task = fake_ultrafast
+        res = run(self.agent.execute(
+            "Go to the GitHub trending page for Python. Look at the top 5 "
+            "repositories. For each repo, check if it has more than 1000 stars "
+            "and was updated in the last 7 days. Add qualifying repos to a new "
+            "file called watchlist.md on my Desktop.",
+            session_id="m2-browser-brain",
+        ))
+        self.assertEqual(calls["brain"], 1)
+        self.assertEqual(calls["ultrafast"], 0)
+        self.assertTrue(res["execution"]["success"], res["execution"])
+        self.assertEqual(res["route"]["tier"], "browser_brain")
+
+    def test_simple_browser_task_also_uses_brain(self):
+        from winbrow.brain.agent_loop import BrainResult
+
+        calls = {"brain": 0, "ultrafast": 0}
+
+        async def fake_handle(*args, **kwargs):
+            calls["brain"] += 1
+            return BrainResult(kind="chat", success=True, response="opened")
+
+        async def fake_ultrafast(*args, **kwargs):
+            calls["ultrafast"] += 1
+            return {"success": True, "final_answer": "one-shot"}
+
+        self.agent.brain.handle = fake_handle
+        self.agent.browser.run_ultrafast_task = fake_ultrafast
+        res = run(self.agent.execute("open youtube", session_id="m2-browser-simple"))
+        self.assertEqual(calls["brain"], 1)
+        self.assertEqual(calls["ultrafast"], 0)
+        self.assertEqual(res["route"]["tier"], "browser_brain")
+
+    def test_browser_task_skips_stale_skill_replay(self):
+        from winbrow.brain.agent_loop import BrainResult
+
+        calls = {"brain": 0}
+
+        async def fake_handle(*args, **kwargs):
+            calls["brain"] += 1
+            return BrainResult(kind="chat", success=True, response="fresh run")
+
+        self.skills.save(
+            "youtube-open", "open youtube",
+            [{"skill": "browser_navigate", "args": {"url": "https://youtube.com"}}],
+            status="approved")
+        self.agent.brain.handle = fake_handle
+        res = run(self.agent.execute("open youtube", session_id="m2-browser-replay"))
+        self.assertEqual(calls["brain"], 1)
+        self.assertEqual(res["execution"]["type"], "brain")
 
     def test_run_skill_shell_dispatch(self):
         import winbrow.agent as A
