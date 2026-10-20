@@ -37,6 +37,28 @@ async def _code_cli(cline: str, timeout: int = 25) -> dict:
     return await run_powershell(cline, timeout=timeout)
 
 
+async def _launch_detached(target: str) -> dict:
+    """Start VS Code without waiting for the CLI process.
+
+    The `code` shim runs Code.exe synchronously and the GUI child inherits
+    stdout/stderr, so capturing the CLI's output can block until VS Code
+    closes. Start-Process detaches it; the window is verified separately.
+    """
+    from ..windows import run_powershell
+    script = (
+        "$cmd = Get-Command code.cmd -ErrorAction SilentlyContinue; "
+        "$exe = $null; "
+        "if ($cmd) { $exe = Join-Path (Split-Path (Split-Path $cmd.Source)) 'Code.exe' }; "
+        "if (-not $exe -or -not (Test-Path $exe)) { "
+        "  $exe = (Get-Command Code.exe -ErrorAction SilentlyContinue).Source }; "
+        f"$target = {_ps_quote(target)}; "
+        "if ($exe) { Start-Process -FilePath $exe -ArgumentList ('\"' + $target + '\"') } "
+        "else { Start-Process -FilePath $target }; "
+        'return "Launched VS Code with $target"'
+    )
+    return await run_powershell(script, timeout=10)
+
+
 async def open_target(args: Dict[str, Any]) -> dict:
     """Open a folder or file in VS Code (launches window when not running)."""
     target = str(args.get("target", "")).strip()
@@ -45,18 +67,20 @@ async def open_target(args: Dict[str, Any]) -> dict:
     import os
     if not (os.path.isdir(target) or os.path.isfile(target)):
         return {"success": False, "output": f"Path not found: {target}"}
-    res = await _code_cli(f"code {_ps_quote(target)}", timeout=20)
+    res = await _launch_detached(target)
     if not res.get("success"):
-        return {"success": False, "output": f"code CLI failed: {res.get('stderr', '')[:180]}"}
-    # Verify: the VS Code window with the basename in title appears.
+        return {"success": False, "output": f"Could not launch VS Code: {res.get('stderr', '')[:180]}"}
+    # Verify the window when possible, but a title mismatch does not mean the
+    # launch failed (fresh windows may still say "Welcome"). The task should
+    # continue to the next step instead of retrying a launch that worked.
     from ..computer.driver import ComputerDriver
     driver = ComputerDriver()
     window = driver.wait_for_window(re.escape(basename(target)), timeout=12.0)
-    ok = bool(window.get("success"))
+    verified = bool(window.get("success"))
     return {
-        "success": ok,
-        "output": (f"Opened in VS Code: {target}" if ok
-                   else "code CLI ran, but the window did not verify (may still be loading)"),
+        "success": True,
+        "output": (f"Opened in VS Code: {target}" if verified
+                   else f"VS Code launched with {target} (window not verified yet)"),
         "window": window.get("window"),
     }
 

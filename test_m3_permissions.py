@@ -58,6 +58,7 @@ class TestTiers(unittest.TestCase):
         self.assertEqual(tool_tier("screen_read_text"), T0)
         self.assertEqual(tool_tier("system_volume"), T1)
         self.assertEqual(tool_tier("notepad_save_as"), T2)
+        self.assertEqual(tool_tier("run_command"), T2)
         self.assertEqual(tool_tier("app_install"), T3)
         self.assertEqual(tool_tier("app_uninstall"), T3)
 
@@ -194,6 +195,28 @@ class TestGate(unittest.TestCase):
         allowed, _, pending = _run(pm.gate("my_custom_thing", {}, tool=tool))
         self.assertFalse(allowed)
         self.assertEqual(pending["tier"], T2)
+
+    def test_run_command_tiered_by_content(self):
+        pm = make_pm(self.tmp)
+
+        # Plain build command: T2 confirm-once.
+        allowed, _, pending = _run(
+            pm.gate("run_command", {"command": "go build ./...", "cwd": "C:\\proj"}))
+        self.assertFalse(allowed)
+        self.assertEqual(pending["tier"], T2)
+
+        # System-class command: T3 every time.
+        allowed, _, pending = _run(
+            pm.gate("run_command", {"command": "Stop-Service Spooler"}))
+        self.assertFalse(allowed)
+        self.assertEqual(pending["tier"], T3)
+
+        # Absolutely blocked pattern: denied outright.
+        allowed, reason, pending = _run(
+            pm.gate("run_command", {"command": "Format-Volume -DriveLetter D"}))
+        self.assertFalse(allowed)
+        self.assertIsNone(pending)
+        self.assertIn("blocked by policy", reason)
 
     def test_close_window_t2(self):
         pm = make_pm(self.tmp)

@@ -64,6 +64,9 @@ TOOL_TIERS: Dict[str, str] = {
     "notepad_save_as": T2, "paint_save_copy": T2, "paint_invert_colors": T2,
     "photoshop_save_as": T2, "photoshop_desaturate": T2, "photoshop_open_image": T1,
     "office_save_as_pdf": T2, "file_dialog_save": T2,
+    "create_text_file": T2, "download_file": T2,
+    # Shell execution — base T2; gate() raises to T3 for system-class commands.
+    "run_command": T2,
     # T3 — system
     "app_install": T3, "app_uninstall": T3, "app_upgrade_all": T3,
     "toggle_dark_mode": T1, "windows_settings": T1,
@@ -195,6 +198,18 @@ class PermissionManager:
         # 'close window' is T2 per plan; other window actions stay T1
         if tool_name == "window_action" and str((args or {}).get("action", "")).lower() == "close":
             tier = T2
+        # Raw shell commands: hard-deny blocked patterns, raise the tier for
+        # system-class content, otherwise stay at the curated T2 baseline.
+        if (tool_name or "").lower() == "run_command":
+            command = str((args or {}).get("command", ""))
+            from .policy import PolicyError, script_tier, validate_script_safety
+            try:
+                validate_script_safety(command)
+            except PolicyError as e:
+                return (False, f"blocked by policy: {e}", None)
+            cmd_tier = script_tier(command)
+            if TIER_ORDER[cmd_tier] > TIER_ORDER[tier]:
+                tier = cmd_tier
         # Learned tools run user/agent-authored scripts — never below T2.
         # impl-executed tools (MCP bridge/app native) carry no authored
         # PowerShell, so the floor does not apply to them.

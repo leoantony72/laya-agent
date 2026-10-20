@@ -515,6 +515,15 @@ async def delete_skill(req: SkillsRequest):
     return JSONResponse({"deleted": ok, "remaining": len(agent.skills)})
 
 
+@app.post("/api/skills/approve")
+async def approve_skill(req: SkillsRequest):
+    """Enable a reviewed skill proposal for replay."""
+    if not req.skill_id:
+        return JSONResponse({"error": "skill_id required"}, status_code=400)
+    ok = agent.skills.approve(req.skill_id)
+    return JSONResponse({"approved": ok, "remaining": len(agent.skills)})
+
+
 # ---------------------------------------------------------------------------
 # Permissions & installer endpoints (v3/M3)
 # ---------------------------------------------------------------------------

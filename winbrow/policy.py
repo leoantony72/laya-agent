@@ -23,6 +23,15 @@ BLOCKED_PATTERNS = [
     re.compile(r"Clear-Disk|Initialize-Disk|Set-Disk", re.I),
     re.compile(r"bcdedit|reg\s+delete\s+HKLM", re.I),
     re.compile(r"(rmdir|rd)\s+/\s*[sq|\s]*\s*.*[C-Z]:\\(Windows|System32|Boot)", re.I),
+    # Mass deletes of the user profile / whole drive roots. Scoped per-item
+    # deletes (temp files, single paths) remain permitted — the permission
+    # tiers (T2/T3) handle those with confirmation instead of hard denial.
+    re.compile(
+        r"(?:Remove-Item|Remove-ItemProperty|del\b|rmdir|rd)\b"
+        r"[^\n]{0,240}(?:\$env:USERPROFILE|\$env:HOME|\$HOME(?![\w.]))", re.I),
+    re.compile(
+        r"(?:Remove-Item|Remove-ItemProperty|del\b|rmdir|rd)\b"
+        r"[^\n]{0,240}[C-Z]:\\(?:\s|['\"]|$)", re.I),
 ]
 
 # Patterns that modify user data and should be confirmed if confidence isn't high

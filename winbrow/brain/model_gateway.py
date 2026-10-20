@@ -29,6 +29,7 @@ API keys are read from env/runtime config and never logged.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -42,6 +43,11 @@ log = logging.getLogger("winbrow.brain.gateway")
 
 OPENROUTER_BASE = os.environ.get("WINBROW_OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 DEFAULT_BRAIN_MODEL = os.environ.get("WINBROW_BRAIN_MODEL", "deepseek/deepseek-v4.1-flash")
+
+# Upstream OpenRouter provider for DeepSeek V4.1 Flash. Set to an empty string
+# to let OpenRouter choose automatically, and allow fallbacks with 1.
+OPENROUTER_ONLY_PROVIDER = os.environ.get("WINBROW_OPENROUTER_PROVIDER", "relace").strip()
+OPENROUTER_ALLOW_FALLBACKS = os.environ.get("WINBROW_OPENROUTER_ALLOW_FALLBACKS", "0") == "1"
 
 REQUEST_TIMEOUT_S = float(os.environ.get("WINBROW_BRAIN_TIMEOUT", "45"))
 
@@ -122,6 +128,43 @@ def _provider_timeout(provider: Provider) -> float:
         except ValueError:
             return DEFAULT_LOCAL_TIMEOUT_S
     return REQUEST_TIMEOUT_S
+
+
+TRANSIENT_HTTP_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def _retry_delay(err: Exception) -> float:
+    """Respect Retry-After when the provider sends one, capped for voice UX."""
+    if isinstance(err, urllib.error.HTTPError):
+        try:
+            after = float(err.headers.get("Retry-After", ""))
+            return min(max(after, 1.0), 8.0)
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return 1.5
+
+
+def _local_ctx_tokens() -> int:
+    try:
+        return int(os.environ.get("WINBROW_LOCAL_LLM_CTX", "8192"))
+    except ValueError:
+        return 8192
+
+
+def _is_transient_error(err: Exception) -> bool:
+    """Rate limits / 5xx / network hiccups are worth a short retry; bad
+    requests (400s) and malformed responses are not."""
+    if isinstance(err, urllib.error.HTTPError):
+        return err.code in TRANSIENT_HTTP_CODES
+    if isinstance(err, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(err, urllib.error.URLError):
+        return True
+    text = str(err).lower()
+    return any(k in text for k in (
+        "timed out", "timeout", "connection reset", "connection aborted",
+        "temporarily unavailable", "rate limit", "overloaded",
+    ))
 
 
 def _post_json(url: str, payload: dict, headers: Dict[str, str], timeout: float) -> dict:
@@ -435,18 +478,30 @@ class ModelGateway:
         last_err: Optional[Exception] = None
         for provider in self.providers:
             t0 = time.perf_counter()
-            try:
-                resp = await self._chat_with_provider(
-                    provider, messages, tools, json_schema, temperature, max_tokens,
-                    timeout or _provider_timeout(provider),
-                )
-                resp.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
-                return resp
-            except GatewayUnavailable:
-                raise
-            except Exception as e:
-                last_err = e
-                log.warning(f"Provider '{provider.name}' failed: {_redact(e)}; trying next.")
+            # One retry for transient failures (HTTP 429 from free tiers,
+            # timeouts, 5xx) — the closed-loop planner calls providers in
+            # quick succession, which makes rate limiting common.
+            for attempt in range(2):
+                try:
+                    resp = await self._chat_with_provider(
+                        provider, messages, tools, json_schema, temperature, max_tokens,
+                        timeout or _provider_timeout(provider),
+                    )
+                    resp.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+                    return resp
+                except GatewayUnavailable:
+                    raise
+                except Exception as e:
+                    last_err = e
+                    if attempt == 0 and _is_transient_error(e):
+                        log.warning(
+                            f"Provider '{provider.name}' transient failure "
+                            f"({_redact(e)}); retrying once."
+                        )
+                        await asyncio.sleep(_retry_delay(e))
+                        continue
+                    log.warning(f"Provider '{provider.name}' failed: {_redact(e)}; trying next.")
+                    break
         raise GatewayError(f"All providers failed; last error: {_redact(last_err)}")
 
     async def _chat_with_provider(
@@ -473,6 +528,33 @@ class ModelGateway:
                 "type": "json_schema",
                 "json_schema": {"name": "winbrow_plan", "strict": False, "schema": json_schema},
             }
+        if (
+            provider.name == "openrouter"
+            and OPENROUTER_ONLY_PROVIDER
+            and "deepseek-v4.1-flash" in provider.model
+        ):
+            payload["provider"] = {
+                "only": [OPENROUTER_ONLY_PROVIDER],
+                "allow_fallbacks": OPENROUTER_ALLOW_FALLBACKS,
+            }
+
+        if provider.name == "local":
+            # Never ask for more completion tokens than remain after the
+            # prompt: the built-in llama.cpp server rejects the whole request
+            # when prompt + max_tokens exceed its context window (the closed
+            # loop re-sends the skills block every turn).
+            est_prompt = sum(len(str(m.get("content", ""))) for m in messages) // 4
+            if json_schema:
+                est_prompt += len(json.dumps(json_schema)) // 4
+            room = _local_ctx_tokens() - est_prompt - 200
+            if max_tokens > room:
+                clamped = max(256, room)
+                log.info(
+                    f"Local context guard: max_tokens {max_tokens} → {clamped} "
+                    f"(prompt ≈{est_prompt} tokens, ctx {_local_ctx_tokens()})"
+                )
+                max_tokens = clamped
+                payload["max_tokens"] = clamped
 
         headers = {"Authorization": f"Bearer {provider.api_key}", **provider.extra_headers}
         loop = asyncio.get_event_loop()

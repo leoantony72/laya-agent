@@ -1,0 +1,142 @@
+- computer_click_text(text(text)): Click a button/menu/text item by description in the focused app window (UIA→OCR grounding).
+- computer_click(x(text), y(text)): Click the mouse at screen coordinates in the focused app (for ungrounded pixels).
+- computer_type(text(text)): Type text into the currently focused app/control (clipboard+paste).
+- computer_key(combo(text)): Press a keyboard shortcut in the focused app, e.g. ctrl+s, alt+f4.
+- computer_scroll(direction(enum)): Scroll the view in the focused app.
+- focus_window(title(text)): Bring an app window to the front by title.
+- wait_for_window(title(text), timeout(text)): Wait until an app window with a title exists, then focus it.
+- minimize_all_except(app(text)): Minimize every window except the named app's windows.
+- screen_read_text(no args): Read the screen/window with OCR and return line texts with click coordinates.
+- file_dialog_save(filename(text)): Complete the focused Save/Save-As dialog with a filename and confirm.
+- vscode_open(target(text)): Open a file or folder in VS Code.
+- vscode_install_extension(extension_id(text)): Install a VS Code extension from the marketplace by id.
+- vscode_run_command(command_id(text)): Run a VS Code command id (command palette action).
+- vscode_list_extensions(no args): List installed VS Code extensions.
+- photoshop_open_image(path(text)): Open an image file in Adobe Photoshop (COM).
+- photoshop_desaturate(percent(text)): Desaturate the active Photoshop document (full graying at percent=100).
+- photoshop_save_as(path(text)): Save a copy of the active Photoshop document to a path.
+- aftereffects_render_comp(project(text), comp(text), output(text)): Render an After Effects comp to a media file via aerender.exe.
+- aftereffects_detect(no args): Check if After Effects is installed (aerender available).
+- office_open_doc(path(text)): Open a Word/Excel/PowerPoint document.
+- office_save_as_pdf(path(text), out_path(text)): Export a Word document to PDF via Word COM.
+- notepad_open(no args): Open Notepad ready for typing.
+- notepad_save_as(filename(text), folder(text)): Save the Notepad text through the Save dialog. With no filename, uses the Notepad window title.
+- paint_open_image(path(text)): Open an image in Paint for quick edits.
+- paint_invert_colors(no args): Invert the colors of the open Paint canvas.
+- paint_save_copy(filename(text)): Save the Paint canvas to a file via its Save-As dialog.
+- mcp_wikipedia_search_wikipedia(query(text), limit(text)): Search Wikipedia for articles matching a query.
+- mcp_wikipedia_wikipedia_search_wikipedia(query(text), limit(text)): Search Wikipedia for articles matching a query.
+- mcp_wikipedia_test_wikipedia_connectivity(no args): Provide diagnostics for Wikipedia API connectivity. Returns the base API URL, language, site information, and response time in milliseconds. If connectivity fails, status will be 'failed' with error details.
+- mcp_wikipedia_wikipedia_test_wikipedia_connectivity(no args): Provide diagnostics for Wikipedia API connectivity. Returns the base API URL, language, site information, and response time in milliseconds. If connectivity fails, status will be 'failed' with error details.
+- mcp_wikipedia_get_article(title(text)): Get the full content of a Wikipedia article. Returns a dictionary containing article details or an error message if retrieval fails.
+- mcp_wikipedia_wikipedia_get_article(title(text)): Get the full content of a Wikipedia article. Returns a dictionary containing article details or an error message if retrieval fails.
+- mcp_wikipedia_get_summary(title(text)): Get a summary of a Wikipedia article. Returns a dictionary with the title and summary string. On error, includes an error message instead of a summary.
+- mcp_wikipedia_wikipedia_get_summary(title(text)): Get a summary of a Wikipedia article. Returns a dictionary with the title and summary string. On error, includes an error message instead of a summary.
+- mcp_wikipedia_summarize_article_for_query(title(text), query(text), max_length(text)): Get a summary of a Wikipedia article tailored to a specific query. The summary is a snippet around the query within the article text or summary. The max_length parameter controls the length of the snippet.
+- mcp_wikipedia_wikipedia_summarize_article_for_query(title(text), query(text), max_length(text)): Get a summary of a Wikipedia article tailored to a specific query. The summary is a snippet around the query within the article text or summary. The max_length parameter controls the length of the snippet.
+- mcp_wikipedia_summarize_article_section(title(text), section_title(text), max_length(text)): Get a summary of a specific section of a Wikipedia article. Returns a dictionary containing the section summary or an error.
+- mcp_wikipedia_wikipedia_summarize_article_section(title(text), section_title(text), max_length(text)): Get a summary of a specific section of a Wikipedia article. Returns a dictionary containing the section summary or an error.
+- mcp_wikipedia_extract_key_facts(title(text), topic_within_article(text), count(text)): Extract key facts from a Wikipedia article, optionally focused on a topic. Returns a dictionary containing a list of facts.
+- mcp_wikipedia_wikipedia_extract_key_facts(title(text), topic_within_article(text), count(text)): Extract key facts from a Wikipedia article, optionally focused on a topic. Returns a dictionary containing a list of facts.
+- mcp_wikipedia_get_related_topics(title(text), limit(text)): Get topics related to a Wikipedia article based on links and categories. Returns a list of related topics up to the specified limit.
+- mcp_wikipedia_wikipedia_get_related_topics(title(text), limit(text)): Get topics related to a Wikipedia article based on links and categories. Returns a list of related topics up to the specified limit.
+- mcp_wikipedia_get_sections(title(text)): Get the sections of a Wikipedia article. Returns a dictionary with the article title and list of sections.
+- mcp_wikipedia_wikipedia_get_sections(title(text)): Get the sections of a Wikipedia article. Returns a dictionary with the article title and list of sections.
+- mcp_wikipedia_get_links(title(text)): Get the links contained within a Wikipedia article. Returns a dictionary with the article title and list of links.
+- mcp_wikipedia_wikipedia_get_links(title(text)): Get the links contained within a Wikipedia article. Returns a dictionary with the article title and list of links.
+- mcp_wikipedia_get_coordinates(title(text)): Get the coordinates of a Wikipedia article. Returns a dictionary containing coordinate information.
+- mcp_wikipedia_wikipedia_get_coordinates(title(text)): Get the coordinates of a Wikipedia article. Returns a dictionary containing coordinate information.
+- mcp_fetch_fetch(url(text), max_length(text), start_index(text), raw(text)): Fetches a URL from the internet and optionally extracts its contents as markdown. Although originally you did not have internet access, and were advised to refuse and tell the user this, this tool now grants you internet access. Now you can fetch the most up-to-date information
+- mcp_open_meteo_openmeteo_search_locations(name(text), country(text), count(text), language(text)): Resolve a place name to ranked coordinate matches with country, region, elevation, timezone, and population. Required prerequisite for name-based queries — all weather tools take latitude/longitude, not place names. Search by a bare place name (city, region, or landmark); never f
+- mcp_open_meteo_openmeteo_get_elevation(latitudes(text), longitudes(text)): Terrain elevation from the Copernicus Digital Elevation Model (~90m resolution) for one or more coordinate pairs. Accepts up to 100 pairs per call. Useful for geographic context, elevation-adjusted weather interpretation, or route planning. A point the DEM has no value for (latit
+- mcp_open_meteo_openmeteo_get_forecast(latitude(text), longitude(text), current_variables(text), hourly_variables(text), daily_variables(text), forecast_days(text), past_days(text), temperature_unit(text), wind_speed_unit(text), precipitation_unit(text), timezone(text), canvas_id(text)): Weather forecast for coordinates: hourly and/or daily variables for up to 16 days ahead, with optional past_days (up to 92) for recent history. Use past_days instead of openmeteo_get_historical for dates within the last 1–5 days, since the archive’s ERA5 components lag by up to ~
+- mcp_open_meteo_openmeteo_get_historical(latitude(text), longitude(text), start_date(text), end_date(text), hourly_variables(text), daily_variables(text), models(text), temperature_unit(text), wind_speed_unit(text), precipitation_unit(text), timezone(text), canvas_id(text)): Historical weather from the Open-Meteo reanalysis archive (1940–present). Requires start_date and end_date (ISO 8601 date, e.g., "2024-07-01"). With models omitted the archive answers from Best Match, which blends IFS HRES, ERA5, and ERA5-Land seamlessly — so the source varies by
+- mcp_open_meteo_openmeteo_get_marine(latitude(text), longitude(text), hourly_variables(text), daily_variables(text), forecast_days(text), past_days(text), start_date(text), end_date(text), timezone(text), canvas_id(text)): Marine wave and ocean conditions for a coastal or ocean coordinate: wave height, wave period, wave direction, wind-wave height, swell height, sea-surface temperature. Forecast horizon up to 8 days, with optional past_days (up to 92) for recent history — or start_date and end_date
+- mcp_open_meteo_openmeteo_get_air_quality(latitude(text), longitude(text), current_variables(text), hourly_variables(text), forecast_days(text), past_days(text), start_date(text), end_date(text), timezone(text), canvas_id(text)): Modeled CAMS (Copernicus Atmosphere Monitoring Service) air quality: PM2.5, PM10, nitrogen dioxide, sulphur dioxide, ozone, carbon monoxide, dust, pollen, and European/US AQI indices. This is modeled grid data, not measured station readings — for measured data, use openaq-mcp-ser
+- mcp_open_meteo_openmeteo_get_ensemble(latitude(text), longitude(text), hourly_variables(text), daily_variables(text), models(text), forecast_days(text), past_days(text), temperature_unit(text), wind_speed_unit(text), precipitation_unit(text), timezone(text), canvas_id(text)): Probabilistic ensemble weather forecast — up to 64 ensemble members, up to 35 days ahead with optional past_days (0–92). Most models end within 16 days; a model's columns are null past its horizon, and the response notice names where its data ends. Each member's values appear as 
+- mcp_open_meteo_openmeteo_get_flood(latitude(text), longitude(text), daily_variables(text), forecast_days(text), start_date(text), end_date(text), timezone(text), canvas_id(text)): GloFAS (Global Flood Awareness System) river discharge forecast and historical reanalysis. Returns daily river discharge (m³/s) for the largest modeled river within 5 km of the given coordinates — no river ID needed. That river is not always the closest one: at 5 km resolution a 
+- mcp_open_meteo_openmeteo_get_climate(latitude(text), longitude(text), start_date(text), end_date(text), daily_variables(text), models(text), temperature_unit(text), wind_speed_unit(text), precipitation_unit(text), timezone(text), canvas_id(text)): Long-range climate projections from bias-corrected daily CMIP6 models, covering 1950-01-01 to 2050-12-31 at any coordinate. Answers "what will conditions look like through 2050?" — the future-projection counterpart to openmeteo_get_historical (the observed archive, what happened)
+- mcp_open_meteo_openmeteo_dataframe_query(canvas_id(text), sql(text)): Run a read-only SQL SELECT against tables staged on a DataCanvas by openmeteo_get_forecast, openmeteo_get_historical, openmeteo_get_marine, openmeteo_get_air_quality, openmeteo_get_ensemble, openmeteo_get_flood, or openmeteo_get_climate. Pass the canvas_id returned when any of th
+- mcp_open_meteo_openmeteo_dataframe_describe(canvas_id(text)): List the tables and their columns on a DataCanvas staged by openmeteo_get_forecast, openmeteo_get_historical, openmeteo_get_marine, openmeteo_get_air_quality, openmeteo_get_ensemble, openmeteo_get_flood, or openmeteo_get_climate. Call this first to discover table names before que
+- mcp_dictionary_define(word(text)): Dictionary meaning and phonetics for an English word (Datamuse).
+- mcp_dictionary_synonyms(word(text)): Synonyms for a word (Datamuse).
+- system_volume(action(enum)): Adjust system audio volume, mute, or unmute speaker sound.
+- media_playback(operation(enum)): Control media playback like play, pause, next track, or previous song.
+- toggle_dark_mode(mode(enum)): Switch Windows system and app appearance between dark theme and light theme.
+- app_focus_or_launch(app_name(text)): Open an application, or bring its window to the front if already open.
+- window_action(action(enum)): Manage the active window: minimize, maximize, snap left/right, show desktop.
+- organize_desktop(no args): Clean and organize loose files on Desktop into a neat dated folder.
+- web_search(query(text)): Search the web using Google or navigate directly to a website.
+- windows_settings(pane(enum)): Open specific Windows 10/11 Settings panes like sound, network, bluetooth, or display.
+- clipboard_inspect(action(enum)): Get, show, or clear the current Windows clipboard contents.
+- get_wifi_password(profile(text)): Retrieve the stored Wi-Fi password/security key for current or saved wireless networks.
+- battery_health(action(enum)): Show battery charge percentage, power status, or generate a full battery health diagnostic report.
+- system_spec_info(no args): Display system specifications: CPU usage, RAM memory, disk space, Windows version, and uptime.
+- clean_temp_files(no args): Safely delete temporary files and cache from Windows Temp directories to free up disk space.
+- kill_unresponsive_process(target(text)): Force terminate a frozen, hung, or specific application process.
+- network_status(no args): Check internet connectivity, ping latency, local IP address, and active network adapters.
+- current_time(no args): Show the current system date, time, timezone, and day of week.
+- find_files(search_term(text)): Search for files by name pattern on the user's common folders (Desktop, Documents, Downloads).
+- open_folder(folder(text)): Open a folder in File Explorer: a system folder (Downloads, Documents, Desktop, Pictures, Music, Videos, Home) or any named folder/absolute path (e.g. 'codee').
+- volume_set_level(level(text)): Set the system master volume to a specific percentage (0-100).
+- screen_brightness(action(enum)): Adjust screen brightness up, down, or to a specific percentage level.
+- screenshot_clipboard(no args): Capture a screenshot and copy it to the clipboard (ready to paste).
+- type_text(text(text)): Type or write text into the currently focused window/app via clipboard paste.
+- open_common_app(app(enum)): Quickly open common Windows applications: Calculator, Paint, Snipping Tool, Terminal, Command Prompt, Notepad, WordPad, Control Panel, Task Manager, or Settings.
+- system_uptime(no args): Show how long the computer has been running since last boot.
+- find_large_files(no args): Find the largest files on the system taking up disk space in user folders.
+- night_light(state(enum)): Toggle Windows Night Light (blue light filter / warm screen) on or off for reduced eye strain.
+- show_running_apps(no args): List all currently running user applications with their window titles and memory usage.
+- quick_note(content(text)): Create a quick text note file on the Desktop and open it in Notepad.
+- bluetooth_settings(no args): Open Windows Bluetooth settings to pair, unpair, or manage Bluetooth devices.
+- shutdown_timer(action(enum)): Set a shutdown or restart timer, or cancel a pending shutdown.
+- open_settings_page(page(enum)): Open a specific Windows Settings page directly: Privacy, Storage, Default Apps, Personalization, About, etc.
+- countdown_timer(no args): Open the Windows Clock/Alarms app for setting timers, alarms, and stopwatch.
+- lock_screen(no args): Lock the Windows screen immediately to secure the computer.
+- public_ip(no args): Fetch and show the public internet IP address of this computer.
+- always_on_top(no args): Toggle the current window to stay always on top of other windows (requires PowerToys or manual WinAPI).
+- clean_downloads(no args): Move old files (30+ days) from Downloads folder to a cleanup archive.
+- set_wallpaper(image(text)): Change the Windows desktop wallpaper/background to a given image file or a searched-for picture.
+- take_screenshot(location(text)): Capture the full screen and save it as a PNG file in Desktop, Downloads, Documents, or Pictures.
+- close_folder_window(folder(text)): Close File Explorer windows showing a specific folder (e.g. Downloads).
+- system_performance(no args): Show CPU and memory usage with the top resource-consuming processes.
+- open_file(target(text), app(text)): Find a file by name in the common user folders and open it (default app, or in Chrome/Edge).
+- laya_ultrafast_browser(goal(text)): Execute open-weight, local-first ultrafast browser tasks using typed decision actions (click, type, scroll, submit, extract).
+- open_notepad(no args): Open Notepad text editor.
+- app_search(package(text)): Search winget packages by name (read-only).
+- app_install(package(text)): Install a package with winget (silent). Needs approval.
+- app_uninstall(package(text)): Uninstall a package with winget. Needs approval.
+- app_upgrade_all(no args): Upgrade all winget-managed packages. Needs approval.
+- mcp_arxiv_search_papers(query(text), max_results(text), start(text), abstract_mode(text), date_from(text), date_to(text), categories(text), sort_by(text)): Search arXiv by query with optional categories, date range, sort, and pagination. Query: prefer quoted phrases; ti:/au:/abs:/cat:; AND/OR/ANDNOT. Unprefixed terms match title+abstract (not authors). Use categories (cs.AI, cs.LG, cs.CL, cs.CV, cs.MA, cs.RO, stat.ML, quant-ph). Ca
+- mcp_arxiv_download_paper(paper_id(text), start(text), max_chars(text), return_full_text(text), force(text)): Download a paper from arXiv and return its text content. Tries the HTML version first for clean extraction; falls back to PDF conversion if HTML is unavailable. Stores the paper locally. Returned text is bounded to roughly 12,000 characters by default so one call cannot return an
+- mcp_arxiv_list_papers(compact(text)): List all papers that have been downloaded and stored locally via download_paper. Returns id, title, authors, published, and arxiv_version/versioned_id from local metadata — no live re-fetch. Set compact=true to return arXiv IDs only. Returns an empty list if no papers have been d
+- mcp_arxiv_read_paper(paper_id(text), start(text), max_chars(text), return_full_text(text)): Read the text content of a paper that was previously downloaded via download_paper. Returns the paper in markdown format, bounded to roughly 12,000 characters by default so one call cannot return an unbounded paper body. When is_truncated is true, call again with start=next_start
+- mcp_arxiv_get_abstract(paper_id(text)): Fetch abstract and metadata by arXiv ID without downloading the paper. Use before download_paper to assess relevance. Returns title, authors, abstract, categories, published date, and PDF URL. After compact search, use for one full abstract; skip if search used abstract_mode=full
+- mcp_arxiv_semantic_search(query(text), paper_id(text), max_results(text)): Semantic similarity search over papers you have already downloaded locally via download_paper. Supports free-text queries (e.g. 'attention mechanisms for long sequences') or finding papers similar to a given paper_id. IMPORTANT: only searches your local downloaded collection — wi
+- mcp_arxiv_reindex(clear_existing(text)): Rebuild the local semantic index for downloaded papers.
+- mcp_arxiv_citation_graph(paper_id(text), max_citations(text)): Return papers citing an arXiv paper and papers that it references using Semantic Scholar's citation graph. Results are bounded (default 50) to stay within the unauthenticated quota. Graphs are cached on disk to reduce repeated API calls. Under load, a free Semantic Scholar API ke
+- mcp_arxiv_export_citations(paper_ids(text)): Export BibTeX citations for one or more arXiv papers using authoritative arXiv metadata (title, authors, year, primary category), never model-generated fields. Version suffixes (e.g. '2401.12345v2') are preserved and citation keys are deterministic. Returns the rendered BibTeX pl
+- mcp_arxiv_watch_topic(topic(text), categories(text), max_results(text)): Save or update a persistent research topic watch. When checked via check_alerts, returns only papers published since the last check — acting as a standing alert for new work on a topic. New watches seed last_checked to creation time so the first check does not dump historical mat
+- mcp_arxiv_check_alerts(topic(text)): Check all saved topic watches for newly published papers since the last check. Omitting the topic parameter runs ALL saved watches and returns new papers for each. Passing a topic string checks only that specific watch. Advances each watch's drain cursor after running: when a pag
+- mcp_arxiv_list_watches(no args): List all saved topic watches without checking for new papers. Returns each watch's topic, categories, last_checked timestamp, and other stored fields. Does not update last_checked — use this to inspect what is saved. Use unwatch_topic to remove a watch, or check_alerts to poll fo
+- mcp_arxiv_unwatch_topic(topic(text)): Delete a saved topic watch by exact topic string. The topic must match the stored watch_topic value exactly. Returns a clear not-found error if no matching watch exists. Use list_watches to inspect saved watches before deleting.
+- mcp_arxiv_get_paper_latex(paper_id(text), start(text), max_chars(text), return_full_text(text)): Download, safely process, cache, and return bounded original LaTeX source. Use section tools for targeted reading.
+- mcp_arxiv_list_paper_latex_sections(paper_id(text), start(text), max_sections(text)): Return a compact outline of headings from original LaTeX source.
+- mcp_arxiv_get_paper_latex_section(paper_id(text), section_id(text), start(text), max_chars(text), return_full_text(text)): Return one bounded LaTeX section by outline ID or title (whitespace/case normalized; macros expanded).
+- mcp_arxiv_get_paper_outline(paper_id(text), start(text), max_sections(text)): Return a paginated heading outline for a downloaded paper (markdown). Stable hierarchical section IDs; use read_paper_section to fetch one.
+- mcp_arxiv_read_paper_section(paper_id(text), section_id(text), start(text), max_chars(text), return_full_text(text)): Return one bounded markdown section by outline ID (or unique title). Does not include sibling or parent sections.
+- mcp_arxiv_search_paper_text(paper_id(text), query(text), max_passages(text), passage_chars(text)): Search a downloaded paper for bounded matching passages with section/source offsets. Suppresses high-overlap near-duplicates and prefers section-diverse hits. Lightweight substring search; no Torch.
+- mcp_crossref_ping(no args): Health check tool: returns the server name and version.
+- mcp_crossref_search_works(query(text), query_bibliographic(text), query_author(text), query_title(text), filter(text), sort(text), order(text), rows(text), offset(text), select(text), cursor(text), raw(text)): Search Crossref works (articles, books, datasets, ...). Use `query` for free-text, or the field-scoped variants (query_bibliographic / query_author / query_title). `filter` accepts Crossref's `key:value,key2:value2` syntax (e.g. "from-pub-date:2020,type:journal-article"). `rows`
+- mcp_crossref_get_work(doi(text), raw(text)): Fetch a single work's metadata by DOI. Accepts a bare DOI or a doi.org URL. Returns simplified fields unless `raw=True`. Returns a structured error if the DOI does not exist.
+- mcp_crossref_get_work_references(doi(text), limit(text), raw(text)): List the reference list of a work (the works it cites), by DOI. `limit` is hard-capped at 50. Reads the `reference` field of the work.
+- mcp_crossref_get_work_quality(doi(text), raw(text)): Look up the registration agency for a DOI (Crossref, DataCite, ...).
+- mcp_crossref_search_members(query(text), filter(text), rows(text), offset(text), cursor(text), raw(text)): Search Crossref members (publishers/societies). Returns id + primary name.
+- mcp_crossref_get_member(member_id(text), raw(text)): Fetch one member (publisher) by numeric Crossref member id.
+- mcp_crossref_get_member_works(member_id(text), query(text), filter(text), sort(text), order(text), rows(text), offset(text), cursor(text), raw(text)): List works published by a given member id.
+- mcp_crossref_search_journals(query(text), rows(text), offset(text), cursor(text), raw(text)): Search journals by title/keyword. Returns title, ISSNs, publisher.
+- mcp_crossref_get_journal(issn(text), raw(text)): Fetch one journal by ISSN (NNNN-NNNN; hyphen optional).
+- mcp_crossref_get_journal_works(issn(text), query(text), filter(text), sort(text), order(text), rows(text), offset(text), cursor(text), raw(text)): List works published in a given journal (by ISSN).
+- mcp_crossref_search_funders(query(text), rows(text), offset(text), cursor(text), raw(text)): Search funding bodies by name. Returns funder id, name, location.
+- remember_fact(fact(text)): Save a durable user preference or environment fact for future commands.
+- recall_memory(query(text)): Search past activity/history. Use when the user asks about something they did before. USER REQUEST: open notepad and type hello Output ONLY the JSON object. ===== RESPONSE_FORMAT (response_format.json_schema) ===== { "type": "json_schema", "json_schema": { "name": "winbrow_plan", "strict": false, "schema": { "type": "object", "properties": { "kind": { "type": "string", "enum": [ "action", "chat", "stop" ] }, "steps": { "type": "array", "items": { "type": "object", "properties": { "skill": { "type": "string" }, "args": { "type": "object" }, "why": { "type": "string" } }, "required": [ "skill", "args" ] } }, "response": { "type": "string" } }, "required": [ "kind" ] } } }

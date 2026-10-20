@@ -20,10 +20,13 @@ from .session import (
     get_session,
 )
 from .skills import (
+    MissingSkillParameters,
     SkillMemory,
+    SkillParam,
     SkillRecord,
     SkillStep,
     get_skills,
+    parameterize_steps,
     reset_skills,
 )
 
@@ -46,8 +49,11 @@ __all__ = [
     "Turn",
     "SemanticMemory",
     "SkillMemory",
+    "SkillParam",
     "SkillRecord",
     "SkillStep",
+    "MissingSkillParameters",
+    "parameterize_steps",
     "get_skills",
     "reset_skills",
 ]

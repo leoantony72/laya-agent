@@ -117,6 +117,8 @@ class TestGatewayChain(unittest.TestCase):
         self.assertIn("HTTP-Referer", captured["headers"])
         self.assertEqual(captured["payload"]["model"], "deepseek/deepseek-v4.1-flash")
         self.assertEqual(captured["payload"]["response_format"]["type"], "json_schema")
+        self.assertEqual(captured["payload"]["provider"]["only"], ["relace"])
+        self.assertFalse(captured["payload"]["provider"]["allow_fallbacks"])
         self.assertEqual(resp.provider, "openrouter")
 
     def test_tool_calls_parsed(self):

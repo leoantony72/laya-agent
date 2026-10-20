@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -440,45 +441,79 @@ async def _run_powershell_once(script: str, timeout: int = 30) -> dict[str, Any]
         return await _run_powershell_sync(wrapped_script, timeout, t0)
 
 
+def _kill_process_tree(pid: int) -> None:
+    try:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
 async def _run_powershell_sync(
     wrapped_script: str, timeout: int, t0: float
 ) -> dict[str, Any]:
-    """Synchronous subprocess.run in an executor — works on any event loop."""
+    """Sync PowerShell in an executor — works on any event loop.
+
+    Output goes to temp files instead of pipes: GUI launchers (VS Code's
+    `code` shim) leave a child holding the inherited pipe open, and
+    subprocess.run() would then wait for EOF forever. Waiting only on the
+    process and reading the files avoids that hang.
+    """
     def _sync() -> dict[str, Any]:
-        try:
-            result = subprocess.run(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy", "Bypass",
-                    "-Command", wrapped_script,
-                ],
-                capture_output=True,
-                timeout=timeout,
-            )
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+            try:
+                proc = subprocess.Popen(
+                    [
+                        "powershell.exe",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass",
+                        "-Command", wrapped_script,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=out_f,
+                    stderr=err_f,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception as e:
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": f"{type(e).__name__}: {e}",
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                }
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc.pid)
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": f"PowerShell command timed out after {timeout} seconds",
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                }
+            except Exception as e:
+                _kill_process_tree(proc.pid)
+                return {
+                    "success": False,
+                    "returncode": -1,
+                    "stdout": "",
+                    "stderr": f"{type(e).__name__}: {e}",
+                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+                }
+            out_f.seek(0)
+            err_f.seek(0)
             return {
-                "success": result.returncode == 0,
-                "returncode": result.returncode,
-                "stdout": result.stdout.decode("utf-8", errors="replace").strip(),
-                "stderr": result.stderr.decode("utf-8", errors="replace").strip(),
-                "elapsed_ms": elapsed_ms,
-            }
-        except subprocess.TimeoutExpired:
-            return {
-                "success": False,
-                "returncode": -1,
-                "stdout": "",
-                "stderr": f"PowerShell command timed out after {timeout} seconds",
-                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "returncode": -1,
-                "stdout": "",
-                "stderr": f"{type(e).__name__}: {e}",
+                "success": proc.returncode == 0,
+                "returncode": proc.returncode,
+                "stdout": out_f.read().decode("utf-8", errors="replace").strip(),
+                "stderr": err_f.read().decode("utf-8", errors="replace").strip(),
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
             }
 
@@ -536,20 +571,34 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
     if not name_clean:
         return {"success": False, "output": "Missing application name"}
 
-    # 1. First check if a window for this app is already open
+    # 1. First check if a window for this app is already open.
+    # Matching is ranked and anchored: an exact process base name wins
+    # ("code" → Code.exe), a prefix match next, then a word-boundary title
+    # hit. "code" must never match OpenCode.exe / barcode-anything —
+    # unanchored substring matching caused exactly that misfire.
     try:
         from .computer.driver import ComputerDriver
         driver = ComputerDriver(guard_screen=False)
         wins = driver.list_windows()
         name_lower = name_clean.lower()
-        match = None
+        base = re.sub(r"\.exe$", "", name_lower)
+        pat = re.compile(rf"\b{re.escape(base)}\b", re.I)
+        match, match_score = None, 0
         for w in wins:
             pname = (w.process_name or "").lower()
+            pbase = re.sub(r"\.exe$", "", pname)
             title = (w.title or "").lower()
-            if name_lower in pname or (name_lower in title and not any(b in pname for b in ("chrome", "msedge", "brave", "firefox", "opera"))):
-                match = w
-                break
-
+            score = 0
+            if pbase == base:
+                score = 4
+            elif pname.startswith(name_lower):
+                score = 3
+            elif title and pat.search(title) and not any(
+                    b in pname for b in ("chrome", "msedge", "brave",
+                                         "firefox", "opera")):
+                score = 2
+            if score > match_score:
+                match, match_score = w, score
         if match is not None:
             driver.focus_window(match.hwnd)
             await asyncio.sleep(0.2)
@@ -584,7 +633,10 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
     try:
         from .computer.driver import ComputerDriver
         driver = ComputerDriver(guard_screen=False)
-        w_res = driver.wait_for_window(name_clean, timeout=3.5)
+        # Word-boundary anchored: "code" matches "… - Visual Studio Code"
+        # but never "OpenCode — …".
+        w_res = driver.wait_for_window(
+            rf"\b{re.escape(name_clean)}\b", timeout=3.5)
         if w_res.get("success") and w_res.get("window"):
             hwnd = w_res["window"]["hwnd"]
             driver.focus_window(hwnd)

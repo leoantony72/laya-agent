@@ -26,9 +26,12 @@ sys.path.insert(0, str(Path(__file__).parent))
 _SKILLS_DIR = tempfile.mkdtemp(prefix="winbrow_skills_m2_")
 os.environ["WINBROW_SKILLS_DIR"] = _SKILLS_DIR
 
-from winbrow.brain.model_gateway import GatewayResponse, ModelGateway
+from winbrow.brain.model_gateway import (GatewayResponse, GatewayUnavailable,
+                                         ModelGateway)
 from winbrow.memory.skills import (MAX_STEPS, MATCH_THRESHOLD, SkillMemory,
-                                   SkillRecord, SkillStep, match_score)
+                                   SkillRecord, SkillStep,
+                                   MissingSkillParameters, match_score,
+                                   parameterize_steps)
 from winbrow.adapters.base import AdapterOp
 from winbrow.adapters.manager import (ADAPTER_IMPL, ADAPTER_TOOLS,
                                       adapter_for_app, execute_adapter_tool,
@@ -131,6 +134,57 @@ class TestSkillMemory(unittest.TestCase):
         self.assertLess(match_score("open code", "import os"), 1.0)
         self.assertEqual(match_score("", "open"), 0.0)
 
+    def test_proposed_skills_need_approval_before_matching(self):
+        rec = self.store.save("vscode flow", "create a go project in vscode",
+                              self.steps(2), status="proposed")
+        self.assertEqual(rec.status, "proposed")
+        self.assertIsNone(self.store.find_match("create a go project in vscode"))
+        self.assertTrue(self.store.approve(rec.id))
+        hit = self.store.find_match("create a go project in vscode")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0].id, rec.id)
+        self.assertEqual(self.store.proposed(), [])
+
+    def test_trigger_phrases_broaden_matching(self):
+        rec = self.store.save(
+            "vscode-go-project", "set up chicken-go",
+            self.steps(2), triggers=["set up a go workspace in vscode"])
+        hit = self.store.find_match("open vscode and set up a go workspace")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0].id, rec.id)
+
+    def test_parameterized_steps_render_from_new_values(self):
+        rec = self.store.save(
+            "vscode-go-project", "create go project at C:\\proj",
+            [{"skill": "vscode_open", "args": {"target": "{{folder_path}}"}},
+             {"skill": "mcp_filesystem_write_file",
+              "args": {"path": "{{folder_path | basename}}\\main.go",
+                       "content": "package main"}}],
+            parameters=[{"name": "folder_path",
+                         "description": "Project folder", "required": True}])
+        steps = rec.render_steps({"folder_path": "D:\\work\\other-go"})
+        self.assertEqual(steps[0]["args"]["target"], "D:\\work\\other-go")
+        self.assertEqual(steps[1]["args"]["path"], "other-go\\main.go")
+        with self.assertRaises(MissingSkillParameters):
+            rec.render_steps({})
+
+    def test_parameterize_steps_only_touches_request_values(self):
+        steps = [
+            {"skill": "vscode_open",
+             "args": {"target": "C:\\Users\\USER\\Desktop\\chicken-go"}},
+            {"skill": "mcp_filesystem_write_file",
+             "args": {"path": "C:\\Users\\USER\\Desktop\\chicken-go\\main.go",
+                      "content": "package main"}},
+            {"skill": "app_focus_or_launch", "args": {"app_name": "code"}},
+        ]
+        out, params = parameterize_steps(
+            steps,
+            "open vscode and create C:\\Users\\USER\\Desktop\\chicken-go with main.go")
+        self.assertEqual(out[0]["args"]["target"], "{{folder_path}}")
+        self.assertEqual(out[1]["args"]["path"], "{{file_path}}")
+        self.assertEqual(out[2]["args"]["app_name"], "code")
+        self.assertEqual([p.name for p in params], ["folder_path", "file_path"])
+
 
 class TestAdapterOps(unittest.TestCase):
     def test_sixteen_ops_unique_names(self):
@@ -179,6 +233,154 @@ class TestAdapterOps(unittest.TestCase):
         res = run(execute_adapter_tool("vscode_open", {"target": "D:\\definitely\\not\\here\\x"}))
         self.assertFalse(res["success"])
 
+    def test_vscode_open_uses_detached_start(self):
+        """Never block on the `code` shim: GUI children hold its pipes open."""
+        from unittest.mock import patch
+        from winbrow.adapters import vscode as vscode_adapter
+
+        captured = {}
+
+        async def fake_run_powershell(script, timeout=30):
+            captured["script"] = script
+            return {"success": True, "stdout": "Launched VS Code", "stderr": ""}
+
+        with patch("winbrow.windows.run_powershell", side_effect=fake_run_powershell):
+            res = run(vscode_adapter._launch_detached(
+                "C:\\Users\\USER\\Desktop\\proj"))
+        self.assertTrue(res["success"])
+        self.assertIn("Start-Process", captured["script"])
+        self.assertIn("Code.exe", captured["script"])
+        self.assertIn("Desktop\\proj", captured["script"])
+
+    def test_sync_powershell_captures_output(self):
+        from winbrow.windows import _run_powershell_sync
+        import time as _time
+        t0 = _time.perf_counter()
+        res = run(_run_powershell_sync("Write-Output 'hello-sync'", 15, t0))
+        self.assertTrue(res["success"], res)
+        self.assertIn("hello-sync", res["stdout"])
+
+    def test_sync_powershell_timeout_returns(self):
+        from winbrow.windows import _run_powershell_sync
+        import time as _time
+        t0 = _time.perf_counter()
+        res = run(_run_powershell_sync("Start-Sleep -Seconds 30", 1, t0))
+        self.assertFalse(res["success"])
+        self.assertIn("timed out", res["stderr"])
+        self.assertLess(_time.perf_counter() - t0, 20)
+
+
+class TestShellTool(unittest.TestCase):
+    def test_execute_parses_output_and_exit_code(self):
+        from unittest.mock import patch
+        from winbrow.shell import execute_shell_tool
+
+        captured = {}
+
+        async def fake_run(script, timeout=30, t0=0.0):
+            captured["script"] = script
+            captured["timeout"] = timeout
+            return {
+                "success": True,
+                "stdout": "main.go: ok\n__WINBROW_EXIT__:0\n",
+                "stderr": "",
+                "elapsed_ms": 12.5,
+            }
+
+        with patch("winbrow.shell._run_powershell_sync", side_effect=fake_run):
+            out = run(execute_shell_tool(
+                "run_command",
+                {"command": "go build ./...", "cwd": str(Path.cwd()), "timeout": "30"},
+            ))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["exit_code"], 0)
+        self.assertIn("main.go: ok", out["output"])
+        self.assertIn("go build ./...", captured["script"])
+        self.assertIn("Push-Location", captured["script"])
+        self.assertEqual(captured["timeout"], 30)
+
+    def test_execute_reports_nonzero_exit(self):
+        from unittest.mock import patch
+        from winbrow.shell import execute_shell_tool
+
+        async def fake_run(script, timeout=30, t0=0.0):
+            return {
+                "success": True,
+                "stdout": "compile error\n__WINBROW_EXIT__:2\n",
+                "stderr": "",
+                "elapsed_ms": 9.0,
+            }
+
+        with patch("winbrow.shell._run_powershell_sync", side_effect=fake_run):
+            out = run(execute_shell_tool(
+                "run_command",
+                {"command": "go build ./...", "cwd": str(Path.cwd())},
+            ))
+        self.assertFalse(out["success"])
+        self.assertEqual(out["exit_code"], 2)
+        self.assertIn("compile error", out["output"])
+
+    def test_execute_real_command(self):
+        from winbrow.shell import execute_shell_tool
+
+        out = run(execute_shell_tool(
+            "run_command",
+            {"command": "Write-Output 'shell-live'", "cwd": str(Path.cwd())},
+        ))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["exit_code"], 0)
+        self.assertIn("shell-live", out["output"])
+
+    def test_execute_blocks_policy_violation(self):
+        from winbrow.shell import execute_shell_tool
+
+        out = run(execute_shell_tool(
+            "run_command", {"command": "Format-Volume -DriveLetter D"},
+        ))
+        self.assertFalse(out["success"])
+        self.assertIn("blocked by policy", out["output"])
+
+    def test_real_go_build(self):
+        """The live failure case: compile a Go web server in its folder."""
+        if not shutil.which("go"):
+            self.skipTest("Go toolchain not installed")
+        from winbrow.shell import execute_shell_tool
+
+        tmp = Path(tempfile.mkdtemp(prefix="winbrow_go_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "main.go").write_text(
+            'package main\n\nimport (\n\t"fmt"\n\t"net/http"\n)\n\n'
+            'func main() {\n'
+            '\thttp.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {\n'
+            '\t\tfmt.Fprintln(w, "hello")\n'
+            '\t})\n'
+            '\thttp.ListenAndServe(":8080", nil)\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        # No go.mod yet: `go build ./...` fails until the module is initialized.
+        failed = run(execute_shell_tool(
+            "run_command",
+            {"command": "go build ./...", "cwd": str(tmp), "timeout": "60"},
+        ))
+        self.assertFalse(failed["success"])
+        self.assertNotEqual(failed["exit_code"], 0)
+
+        init = run(execute_shell_tool(
+            "run_command",
+            {"command": "go mod init example.com/webserver",
+             "cwd": str(tmp), "timeout": "60"},
+        ))
+        self.assertTrue(init["success"], init)
+
+        built = run(execute_shell_tool(
+            "run_command",
+            {"command": "go build ./...", "cwd": str(tmp), "timeout": "60"},
+        ))
+        self.assertTrue(built["success"], built)
+        self.assertEqual(built["exit_code"], 0)
+        self.assertTrue(any(tmp.glob("*.exe")), built)
+
 
 class TestAgentWiring(unittest.TestCase):
     def setUp(self):
@@ -207,6 +409,30 @@ class TestAgentWiring(unittest.TestCase):
         names = {t.name for t in self.agent.registry.all_tools()}
         for op in ADAPTER_TOOLS:
             self.assertIn(op.tool_name, names)
+        self.assertIn("run_command", names)
+        self.assertEqual(self.agent.registry.get("run_command").impl, "shell")
+
+    def test_run_skill_shell_dispatch(self):
+        import winbrow.agent as A
+        from unittest.mock import patch
+
+        async def fake(name, args):
+            return {"success": True, "output": "shell-ok"}
+
+        original = A.execute_shell_tool
+        self.agent.run_skill = self._orig_run_skill
+        A.execute_shell_tool = fake
+        try:
+            with patch.dict(os.environ, {"WINBROW_BYPASS_CONFIRM": "1"}):
+                out = run(self.agent.run_skill(
+                    "run_command",
+                    {"command": "go build ./...", "cwd": "."},
+                ))
+        finally:
+            A.execute_shell_tool = original
+        self.assertEqual(out["type"], "shell")
+        self.assertTrue(out["success"])
+        self.assertEqual(out["output"], "shell-ok")
 
     def test_run_skill_adapter_dispatch(self):
         import winbrow.agent as A
@@ -254,16 +480,14 @@ class TestAgentWiring(unittest.TestCase):
         res = run(self.agent.execute("what time is it", session_id="m2t"))
         self.assertNotEqual(res["execution"].get("type"), "replayed_skill")
 
-    def test_capture_after_brain_success(self):
+    def test_capture_after_brain_success_is_proposed(self):
         plan = {"kind": "action", "steps": [
             {"skill": "vscode_open", "args": {"target": "D:\\x"}},
             {"skill": "computer_scroll", "args": {"direction": "down"}},
         ], "response": "done"}
-        gw = FakeGateway([plan])
+        done = {"kind": "done", "summary": "Opened the project and scrolled."}
+        gw = FakeGateway([plan, done])
         self.agent.gateway = gw
-        from winbrow.brain import AgentBrain
-        from winbrow.brain.agent_loop import BrainResult
-        # feed the brain the plan + fake executor already stubbed
         self.agent.brain.gateway = gw
         self.agent.brain.max_steps = 3
         res = run(self.agent.execute(
@@ -273,6 +497,25 @@ class TestAgentWiring(unittest.TestCase):
         self.assertIsNotNone(rec)
         self.assertEqual(len(rec.steps), 2)
         self.assertEqual(rec.source, "brain")
+        self.assertEqual(rec.status, "proposed")
+        # Proposals never replay until a human approves them.
+        self.assertIsNone(self.skills.find_match(
+            "open project x in-vscode and prepare"))
+
+    def test_partial_brain_run_is_not_captured(self):
+        plan = {"kind": "action", "steps": [
+            {"skill": "vscode_open", "args": {"target": "D:\\x"}},
+            {"skill": "computer_scroll", "args": {"direction": "down"}},
+        ], "response": "done"}
+        # No done turn: the planner drops out, so the run is partial.
+        gw = FakeGateway([plan, GatewayUnavailable("offline")])
+        self.agent.gateway = gw
+        self.agent.brain.gateway = gw
+        self.agent.brain.max_steps = 3
+        run(self.agent.execute(
+            "open project x in-vscode and prepare", session_id="m2t2b"))
+        rec = self.skills.get("open-project-x-in-vscode-and-prepare".replace('_', '-')[:60])
+        self.assertIsNone(rec)
 
     def test_capture_skips_meta_skills(self):
         plan = {"kind": "action", "steps": [
@@ -309,6 +552,13 @@ class TestServerSkillsEndpoints(unittest.TestCase):
         r = self.client.post("/api/skills/delete", json={"skill_id": "nah"})
         self.assertEqual(r.status_code, 200)
         self.assertFalse(r.json()["deleted"])
+
+        # approve without id → 400; unknown id → approved False
+        r = self.client.post("/api/skills/approve", json={})
+        self.assertEqual(r.status_code, 400)
+        r = self.client.post("/api/skills/approve", json={"skill_id": "nah"})
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["approved"])
 
     def test_skill_roundtrip_on_store(self):
         self.client.app  # server context

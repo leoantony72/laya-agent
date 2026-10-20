@@ -25,13 +25,16 @@ from typing import Any, Optional
 from .browser_task import BrowserController
 from .brain import AgentBrain, GatewayUnavailable, ModelGateway
 from .brain.agent_loop import _ctx_block
+from .brain.model_gateway import extract_json_object
 from .brain.prompts import build_chat_messages
+from .memory.skills import MissingSkillParameters, parameterize_steps
 from .computer import COMPUTER_IMPL, get_computer_tools
 from .computer.tools import execute_computer_tool
 from .adapters import ADAPTER_IMPL, get_adapter_tools
 from .adapters.manager import execute_adapter_tool
 from .installer import INSTALLER_IMPL, INSTALL_OPS, get_installer_tools
 from .mcp import MCP_IMPL, get_mcp_tools, execute_mcp_tool, get_mcp_hub
+from .shell import SHELL_IMPL, execute_shell_tool, get_shell_tools
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
@@ -274,7 +277,8 @@ class WinBrowAgent:
     ):
         self.registry = registry or ToolRegistry()
         # register Python-backed computer atoms + app adapter ops once
-        for _t in get_computer_tools() + get_adapter_tools() + get_installer_tools():
+        for _t in (get_computer_tools() + get_adapter_tools()
+                   + get_installer_tools() + get_shell_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -300,6 +304,7 @@ class WinBrowAgent:
             registry=self.registry,
             store=self.store,
             executor=self.run_skill,
+            tool_builder=self.build_new_tool,
         )
 
     def get_context(self) -> WindowsContext:
@@ -316,6 +321,7 @@ class WinBrowAgent:
             registry=self.registry,
             store=self.store,
             executor=self.run_skill,
+            tool_builder=self.build_new_tool,
         )
 
     # ------------------------------------------------------------------ shared skill executor
@@ -431,6 +437,14 @@ class WinBrowAgent:
                 "tool": tool_name,
             })
             return out
+        # build/test/verify commands in a project folder
+        if getattr(tool, "impl", None) == SHELL_IMPL:
+            out = await execute_shell_tool(tool_name, args)
+            out.update({
+                "type": "shell",
+                "tool": tool_name,
+            })
+            return out
         # v3/M3: installer ops (winget-first, T3-gated above)
         if getattr(tool, "impl", None) == INSTALLER_IMPL:
             op = INSTALL_OPS.get(tool_name)
@@ -464,6 +478,36 @@ class WinBrowAgent:
         resp = await self.gateway.chat(messages, temperature=0.5, max_tokens=300)
         return resp.content.strip() or "Nothing to say."
 
+    async def build_new_tool(self, task: str, ctx: Optional[WindowsContext] = None) -> dict[str, Any]:
+        """Brain meta-skill 'build_tool': author a NEW PowerShell tool from a
+        plain-language spec, run it once through the tiered permission gate,
+        and persist it to tools/learned.json on success. Returns a dict whose
+        'output' is fed to the brain as the step result."""
+        try:
+            gen = await self.generator.generate_and_execute(
+                task, ctx or self.get_context(), tiered=True,
+            )
+        except Exception as e:
+            return {"success": False, "output": f"Tool build failed: {e}"}
+        tool = gen.get("tool")
+        tool_name = getattr(tool, "name", "custom_action") if tool else "custom_action"
+        if gen.get("success"):
+            stdout = str(gen.get("stdout") or gen.get("stderr") or "ran cleanly")
+            return {
+                "success": True,
+                "tool_name": tool_name,
+                "output": f"Built and saved new tool '{tool_name}'. Run result: {stdout[:200]}",
+            }
+        if gen.get("permission") is not None:               # pending approval
+            p = gen["permission"]
+            return {
+                "success": False,
+                "output": (f"[permission-required] Built tool '{tool_name}' needs approval "
+                           f"(tier {p.get('tier', '?')}). confirmation_id={p.get('confirmation_id')}"),
+            }
+        reason = gen.get("reason") or gen.get("error") or "generationfailed"
+        return {"success": False, "output": f"Could not build tool: {reason}"}
+
     async def _generator_fallback(
         self, utterance: str, ctx: WindowsContext,
         api_key: Optional[str], provider: str,
@@ -490,13 +534,27 @@ class WinBrowAgent:
         }
 
     def _capture_skill_candidate(self, utterance: str, brain_res: Any) -> None:
-        """v3/M2: turn a successful brain plan into a replayable skill (non-fatal)."""
+        """Turn a fully verified brain plan into a skill proposal (non-fatal).
+
+        Only a run that ended with an explicit done/chat after all steps
+        succeeded is eligible. Partial runs (budget exhausted, planner lost,
+        a failed step, or a goal the loop knows is still missing) are never
+        promoted. Captures start as "proposed" and must be approved before
+        they can replay.
+        """
         try:
             NON_CAPTURE_SKILLS = {
                 "remember_fact", "recall_memory", "type_text", "computer_type",
                 "computer_paste", "paste", "quick_note", "file_dialog_save",
+                "build_tool", "repair_tool",
             }
             all_steps = getattr(brain_res, "steps", [])
+            if not getattr(brain_res, "complete", False):
+                log.debug("Skill capture skipped: run did not complete cleanly")
+                return
+            if len(all_steps) < 2 or not all(getattr(s, "success", False) for s in all_steps):
+                log.debug("Skill capture skipped: partial or unsuccessful plan")
+                return
             # If the plan contains transient text/payload steps, do not capture as static replayable macro
             if any(getattr(s, "skill", "") in NON_CAPTURE_SKILLS for s in all_steps):
                 log.debug("Skill capture skipped: plan contains dynamic payload skill")
@@ -504,13 +562,70 @@ class WinBrowAgent:
             steps = [
                 {"skill": s.skill, "args": dict(getattr(s, "args", {}) or {})}
                 for s in all_steps
-                if getattr(s, "success", False) and s.skill not in NON_CAPTURE_SKILLS
             ]
-            if steps and len(steps) >= 2:
-                self.skills.save(name=utterance[:60], utterance=utterance,
-                                 steps=steps, source="brain")
+            steps, params = parameterize_steps(steps, utterance)
+            description = (
+                "Replays a verified workflow: "
+                + " -> ".join(s["skill"] for s in steps)
+                + f". Use when the request resembles: {utterance[:160]}"
+            )
+            self.skills.save(
+                name=utterance[:60], utterance=utterance, steps=steps,
+                source="brain", description=description,
+                parameters=[p.to_dict() for p in params],
+                status="proposed",
+            )
         except Exception as e:
             log.debug(f"Skill capture skipped ({e})")
+
+    async def _fill_skill_parameters(self, skill: Any, utterance: str) -> dict[str, str]:
+        """Map a new request onto a parameterized skill's placeholders.
+
+        Parameterized skills cost one small LLM call; fully literal skills
+        still replay with no model. Defaults fill anything the request leaves
+        out. On gateway failure we keep defaults and let render_steps decide
+        whether the skill is safe to run.
+        """
+        params = list(getattr(skill, "parameters", []) or [])
+        values: dict[str, str] = {}
+        if not params:
+            return values
+        for p in params:
+            if p.default:
+                values[p.name] = p.default
+        if not self.gateway.available:
+            return values
+
+        specs = "\n".join(
+            f"- {p.name}: {p.description or 'value from the new request'}"
+            f"{' (required)' if p.required else ''}"
+            f"{f' (default: {p.default})' if p.default else ''}"
+            for p in params
+        )
+        messages = [
+            {"role": "system", "content": (
+                "Extract parameter values for a saved desktop workflow from a "
+                "new request. Output ONLY one raw JSON object mapping each "
+                "parameter name to a string value. Omit a parameter only when "
+                "the request does not mention it and it has a default."
+            )},
+            {"role": "user", "content": (
+                f"NEW REQUEST: {utterance}\n\n"
+                f"WORKFLOW: {getattr(skill, 'description', '') or skill.name}\n"
+                f"ORIGINAL REQUEST: {skill.utterance}\n\n"
+                f"PARAMETERS:\n{specs}\n\nJSON:"
+            )},
+        ]
+        try:
+            resp = await self.gateway.chat(messages, temperature=0.0, max_tokens=400)
+            data = extract_json_object(resp.content) or {}
+            for p in params:
+                value = data.get(p.name)
+                if value is not None and str(value).strip():
+                    values[p.name] = str(value).strip()
+        except Exception as e:
+            log.debug(f"Parameter fill failed for skill '{skill.id}': {e}")
+        return values
 
     def _canned_chat(self) -> dict[str, Any]:
         return {
@@ -842,23 +957,32 @@ class WinBrowAgent:
             replay_hit = self.skills.find_match(utterance)
         except Exception:
             replay_hit = None
+        replay_steps: list[dict[str, Any]] = []
+        if replay_hit is not None:
+            skill, score = replay_hit
+            try:
+                values = await self._fill_skill_parameters(skill, utterance)
+                replay_steps = skill.render_steps(values)
+            except MissingSkillParameters as e:
+                log.info(f"Skill '{skill.id}' not replayed: {e}; planning instead.")
+                replay_hit = None
         if replay_hit is not None:
             skill, score = replay_hit
             from .memory.skills import MAX_STEPS as _SKILL_MAX
             started = time.perf_counter()
             steps_out: list[dict[str, Any]] = []
             all_ok = True
-            for step in skill.steps[:_SKILL_MAX]:
+            for step in replay_steps[:_SKILL_MAX]:
                 try:
-                    r = await self.run_skill(step.skill, step.args,
+                    r = await self.run_skill(step["skill"], step["args"],
                                              utterance=utterance, session_id=session_id)
                 except Exception as e:
                     r = {"success": False, "output": str(e)}
                 ok = bool(r.get("success"))
                 all_ok = all_ok and ok
                 steps_out.append({
-                    "skill": step.skill,
-                    "args": step.args,
+                    "skill": step["skill"],
+                    "args": step["args"],
                     "success": ok,
                     "output": str(r.get("output"))[:300],
                 })

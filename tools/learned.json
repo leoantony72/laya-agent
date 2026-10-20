@@ -10,5 +10,16 @@
       "open text editor"
     ],
     "args": []
+  },
+  {
+    "name": "create_folder_papers",
+    "description": "Create a new folder named 'papers' on the Desktop.",
+    "script": "\n                $path = Join-Path ([Environment]::GetFolderPath('Desktop')) \"papers\"\n                New-Item -ItemType Directory -Path $path -Force | Out-Null\n                return \"Created folder: $path\"\n                ",
+    "scope": null,
+    "speak": "done",
+    "examples": [
+      "create folder named papers"
+    ],
+    "args": []
   }
 ]

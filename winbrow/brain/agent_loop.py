@@ -1,15 +1,22 @@
 """
-Agent Brain — Plan → Execute → Verify → Recover Loop (System 2)
-================================================================
+Agent Brain — Closed-Loop Plan → Act → Observe → Decide Executor (System 2)
+==========================================================================
 Handles everything the fast-path router can't:
   • contextual follow-ups ("make it louder", "and close it after")
   • multi-step tasks ("open photoshop, desaturate the image, save a copy")
+  • dependent tasks (find a file, then move the path it returned)
   • questions about past activity ("what did I open yesterday?")
   • fact capture ("remember my exports folder is D:\\Exports")
 
-The loop asks the ModelGateway for a JSON plan (action/chat/stop), executes
-steps through the shared skill executor, verifies each step, and can re-plan
-once with the failure context before giving up honestly.
+Unlike a one-shot planner, the brain is called once per action: each call
+receives the original goal plus the full history of steps and their results,
+and emits EXACTLY ONE next step (or done/clarify/chat/stop). The executor runs
+that step, appends the result to history, and loops. Values discovered by one
+step (a file path, a search result) are therefore available verbatim to later
+steps instead of both steps being planned blind up front.
+
+Termination: done, clarify/chat, hard permission/policy stops, the same skill
+failing twice in a row, provider loss mid-task, or the max_steps action budget.
 
 The gateway is optional: without any provider configured the brain raises
 GatewayUnavailable and the orchestrator falls back to the generator tier.
@@ -18,7 +25,11 @@ GatewayUnavailable and the orchestrator falls back to the generator tier.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -33,12 +44,57 @@ from .model_gateway import (
 from . import prompts
 from ..computer import COMPUTER_IMPL
 from ..adapters.manager import ADAPTER_IMPL
+from ..shell import SHELL_IMPL
+from ..policy import PolicyError, validate_script_safety
+from ..registry import ArgSpec, Tool
 
 log = logging.getLogger("winbrow.brain.loop")
 
-MAX_STEPS_DEFAULT = int(6)
-MAX_REPLANS = 1
+# 6 was too tight for real multi-step work (create folder → open editor →
+# write file → run/verify). Env-tunable for latency-sensitive setups.
+MAX_STEPS_DEFAULT = int(os.environ.get("WINBROW_MAX_STEPS", "10"))
 MAX_PLANNER_TOOLS = 140
+# Backstop: one hung tool must never freeze the whole closed loop.
+STEP_TIMEOUT_S = float(os.environ.get("WINBROW_STEP_TIMEOUT", "120"))
+# The local Qwen brain runs with an 8192-token context. The planner prompt
+# must leave room for the reply (max_tokens), so tool descriptions are clipped
+# to one short line; arg names carry the actual calling contract.
+TOOL_DESC_LIMIT = 100
+META_DESC_LIMIT = 160
+
+# MCP skills-block ranking: the full catalog is 200+ tools but the planner
+# only sees MAX_PLANNER_TOOLS lines. Without intent ranking, niche servers
+# (arxiv/crossref) crowd out core ones (filesystem) and the planner concludes
+# "no skill can move a file". Servers are ranked by keyword intent.
+MCP_PRIORITY_PER_SERVER = 8          # max tools any one server contributes
+MCP_ALWAYS_SERVERS = ("wikipedia", "fetch", "dictionary", "open-meteo")
+_FILE_INTENT_WORDS = ("file", "folder", "directory", "directories", "move",
+                      "copy", "copies", "rename", "delete", "desktop",
+                      "documents", "downloads", "path")
+MCP_SERVER_KEYWORDS: Dict[str, tuple] = {
+    "filesystem": _FILE_INTENT_WORDS,
+    "wikipedia": ("wiki", "wikipedia", "tell me about"),
+    "dictionary": ("define", "definition", "meaning", "dictionary", "spell"),
+    "fetch": ("url", "link", "webpage", "website", "http"),
+    "open-meteo": ("weather", "forecast", "temperature", "rain", "wind"),
+    "arxiv": ("arxiv", "paper"),
+    "crossref": ("citation", "doi", "journal", "paper"),
+    "open-library": ("book", "author", "isbn"),
+    "nominatim": ("map", "location", "address", "coordinates"),
+    "rest-countries": ("country", "countries", "capital", "population"),
+    "frankfurter": ("currency", "exchange rate", "exchange", "convert money"),
+    "usgs-earthquake": ("earthquake", "seismic"),
+    "hacker-news": ("hacker news",),
+    "github-public": ("github",),
+    "mdn-compat": ("mdn", "browser compatibility"),
+    "gdelt-news": ("news", "headlines"),
+    "reddit": ("reddit",),
+    "git": ("git", "commit", "branch", "repository", "repo"),
+    "time": ("time", "date", "clock", "timezone", "today", "tomorrow", "yesterday"),
+    "memory": ("remember", "memory", "knowledge graph"),
+    "pdf": ("pdf",),
+    "sequential-thinking": ("reason", "analyze", "think step"),
+}
 
 # Meta-skills the brain can call that are not registry tools.
 # Implemented in-process against the memory store.
@@ -51,7 +107,122 @@ META_SKILLS: dict[str, dict] = {
         "description": "Search past activity/history. Use when the user asks about something they did before.",
         "args": {"query": "What to search for in past activity."},
     },
+    "build_tool": {
+        "description": (
+            "Author a brand-new, small, atomic PowerShell tool for a request that NO listed "
+            "skill can do, run it once to verify, and save it for reuse. After it is built "
+            "you get a follow-up planning turn to use it on the original request, so do NOT "
+            "cram a whole multi-step goal into one build task."
+        ),
+        "args": {"task": "Plain-language spec of the ONE tool to build: what it must do, inputs, outputs."},
+    },
+    "repair_tool": {
+        "description": (
+            "Diagnose a tool that just failed, rewrite its script, register the fix, "
+            "and verify it by running it once."
+        ),
+        "args": {
+            "skill_name": "Name of the broken tool/skill.",
+            "failure": "What went wrong (error text, wrong result).",
+            "task": "Optional restatement of what the user wants the tool to accomplish.",
+        },
+    },
 }
+
+
+_ACTION_VERBS = (
+    "open", "create", "make", "write", "save", "move", "copy", "rename",
+    "delete", "remove", "download", "upload", "launch", "start", "type",
+    "set", "close", "send", "install", "uninstall", "print", "search",
+    "find", "organize", "edit", "add", "change", "turn", "play", "pause",
+    "extract", "zip", "unzip", "convert", "run",
+)
+
+
+def _looks_multi_part(utterance: str) -> bool:
+    """Cheap guard for 'open X, create Y and write Z' style requests."""
+    low = (utterance or "").lower()
+    hits = {
+        v for v in _ACTION_VERBS
+        if re.search(rf"\b{v}(?:s|es|ed|ing)?\b", low)
+    }
+    return len(hits) >= 2
+
+
+_CODE_ARTIFACT_RE = re.compile(
+    r"\b[\w.-]+\.(?:go|py|js|ts|tsx|jsx|html|css|java|c|cpp|cs|rs|sh|ps1|rb|"
+    r"php|swift|kt|txt|md|json|csv)\b", re.I)
+_CODE_WORD_RE = re.compile(
+    r"\b(?:program|code|script|source file|go file|python file|"
+    r"javascript file|html file|css file)\b", re.I)
+_OUTPUT_WORD_RE = re.compile(
+    r"\b(?:run|execute|compile|prints?|output|test|verify)\b", re.I)
+_WRITE_SKILL_WORDS = {"write", "save", "type", "paste", "note"}
+_WRITE_SKILL_NAMES = {"create_text_file", "create_file", "file_dialog_save"}
+_RUN_SKILL_WORDS = {"run", "exec", "execute", "compile", "test", "verify",
+                    "terminal", "powershell", "shell"}
+
+
+def _skill_tokens(name: str) -> set[str]:
+    return {t for t in re.split(r"[\W_]+", (name or "").lower()) if t}
+
+
+def _needs_code_work(utterance: str) -> bool:
+    return bool(_CODE_ARTIFACT_RE.search(utterance or "")
+                or _CODE_WORD_RE.search(utterance or ""))
+
+
+def _did_write(history: List[BrainStepResult]) -> bool:
+    for step in history:
+        if not step.success:
+            continue
+        if step.skill in _WRITE_SKILL_NAMES:
+            return True
+        if _skill_tokens(step.skill) & _WRITE_SKILL_WORDS:
+            return True
+    return False
+
+
+def _did_run_or_verify(history: List[BrainStepResult]) -> bool:
+    return any(step.success and (_skill_tokens(step.skill) & _RUN_SKILL_WORDS)
+               for step in history)
+
+
+def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
+    """Return why a done/chat wrap-up is not yet backed by HISTORY."""
+    ok_steps = [s for s in history if s.success]
+    if not ok_steps:
+        return ""
+    if _looks_multi_part(utterance) and len(ok_steps) == 1:
+        return (
+            "GOAL asks for several things, but HISTORY shows only one "
+            "completed step. Re-check EVERY part of GOAL. If anything is "
+            "still missing, emit the NEXT required action; only emit done/chat "
+            "when all parts are shown complete."
+        )
+    if _needs_code_work(utterance) and not _did_write(history):
+        return (
+            "GOAL asks for a code or text artifact, but HISTORY shows no file "
+            "written. Create the file with the requested content, then emit the "
+            "next action or done."
+        )
+    if _OUTPUT_WORD_RE.search(utterance or "") and not _did_run_or_verify(history):
+        return (
+            "GOAL specifies program output. Run or verify the program and "
+            "confirm HISTORY shows the expected result before emitting done."
+        )
+    return ""
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse whitespace and clip to a token budget at a word boundary."""
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    if len(text) <= limit:
+        return text
+    cut = text[:limit].rstrip()
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut + "…"
 
 
 @dataclass
@@ -84,12 +255,14 @@ class BrainResult:
     model: str = ""
     plan_elapsed_ms: float = 0.0
     pending: Optional[dict] = None
+    complete: bool = False          # explicit done/chat after all goal parts
 
     def to_dict(self) -> dict:
         d = {
             "type": "brain",
             "kind": self.kind,
             "success": self.success,
+            "complete": self.complete,
             "output": self.response,
             "steps": [s.to_dict() for s in self.steps],
             "provider": self.provider,
@@ -111,12 +284,14 @@ class AgentBrain:
         store: Any,                        # MemoryStore
         executor: Callable[[str, dict], Awaitable[dict]],
         max_steps: int = MAX_STEPS_DEFAULT,
+        tool_builder: Optional[Callable[[str, Any], Awaitable[dict]]] = None,
     ):
         self.gateway = gateway
         self.registry = registry
         self.store = store
         self.executor = executor           # async (tool_name, args) -> execution dict
         self.max_steps = max_steps
+        self.tool_builder = tool_builder   # async (task, ctx) -> build result | None
 
     # ------------------------------------------------------------------ skills block
     def _skills_block(self, ctx: Any, utterance: str = "") -> str:
@@ -124,27 +299,42 @@ class AgentBrain:
         available = self.registry.available(ctx)
         u_low = (utterance or "").lower()
 
+        def _kw_hit(kw: str) -> bool:
+            if " " in kw:
+                return kw in u_low
+            return re.search(rf"\b{re.escape(kw)}(?:s|es)?\b", u_low) is not None
+
         # Group tools by type
-        python_backed, mcp_priority, mcp_other, seeded = [], [], [], []
+        python_backed, mcp_priority, seeded = [], [], []
+        per_server: Dict[str, List] = {}
         for t in available:
             impl = getattr(t, "impl", None)
-            if impl in (COMPUTER_IMPL, ADAPTER_IMPL):
+            if impl in (COMPUTER_IMPL, ADAPTER_IMPL, SHELL_IMPL):
                 python_backed.append(t)
             elif impl == "mcp":
-                name_low = t.name.lower()
-                desc_low = (t.description or "").lower()
-                is_relevant = False
-                for kw in ("wiki", "weather", "search", "fetch", "url", "define", "dictionary",
-                           "book", "country", "currency", "news", "arxiv", "paper", "github", "reddit"):
-                    if kw in u_low and (kw in name_low or kw in desc_low):
-                        is_relevant = True
-                        break
-                if is_relevant or any(k in name_low for k in ("wikipedia", "fetch", "dictionary", "meteo")):
-                    mcp_priority.append(t)
-                else:
-                    mcp_other.append(t)
+                script = getattr(t, "script", "") or ""
+                srv = script[len("mcp://"):].split("/", 1)[0] if script.startswith("mcp://") else ""
+                per_server.setdefault(srv, []).append(t)
             else:
                 seeded.append(t)
+
+        # Intent-ranked MCP selection: relevant servers first (filesystem for
+        # file/folder verbs etc.), capped per server; the rest overflow to the
+        # general budget so nothing starves the tail of the catalog entirely.
+        mcp_other: List = []
+        for srv, tools in per_server.items():
+            srv_key = srv.replace("_", "-")
+            kws = MCP_SERVER_KEYWORDS.get(srv_key, ())
+            relevant = bool(kws) and any(_kw_hit(kw) for kw in kws)
+            if relevant or srv_key in MCP_ALWAYS_SERVERS:
+                # filesystem matches on file intent → show it whole (14 tools,
+                # they cover move/create/list/read/write which the planner needs)
+                keep = tools if (relevant and srv_key == "filesystem") \
+                    else tools[:MCP_PRIORITY_PER_SERVER]
+                mcp_priority.extend(keep)
+                mcp_other.extend(tools[len(keep):])
+            else:
+                mcp_other.extend(tools)
 
         selected = list(python_backed) + list(mcp_priority)
         remaining_budget = max(MAX_PLANNER_TOOLS - len(selected), 0)
@@ -156,10 +346,12 @@ class AgentBrain:
             args_desc = ", ".join(
                 f"{a.name}({a.kind})" for a in t.args
             ) or "no args"
-            lines.append(f"- {t.name}({args_desc}): {t.description}")
+            desc = _one_line(t.description, TOOL_DESC_LIMIT)
+            lines.append(f"- {t.name}({args_desc}): {desc}")
         for name, meta in META_SKILLS.items():
             args_desc = ", ".join(f"{k}(text)" for k in meta["args"])
-            lines.append(f"- {name}({args_desc}): {meta['description']}")
+            desc = _one_line(meta["description"], META_DESC_LIMIT)
+            lines.append(f"- {name}({args_desc}): {desc}")
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ main entry
@@ -170,7 +362,21 @@ class AgentBrain:
         session: Any,                       # SessionMemory
         emit: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> BrainResult:
-        """Plan and execute. Raises GatewayUnavailable when no provider exists."""
+        """Closed-loop Plan → Act → Observe executor.
+
+        Each iteration asks the planner for exactly ONE next action with the
+        full step history in context, executes it, appends the result, and
+        repeats. This lets later steps consume values discovered by earlier
+        ones (e.g. a path found by list_directory feeds move_file) instead of
+        planning everything blindly up front.
+
+        Terminates on done/chat/stop/clarify, permission or policy hard stop,
+        the same skill failing twice in a row, provider loss mid-task, or the
+        max_steps action budget.
+
+        Raises GatewayUnavailable when no provider responds on the first call
+        (the orchestrator then falls back to the generator tier).
+        """
         memory_block = session.context_block()
         # enrich with episodic hits when the user asks about the past
         if any(w in utterance.lower() for w in ("yesterday", "earlier", "last time", "before", "history", "did i")):
@@ -180,86 +386,187 @@ class AgentBrain:
                     f"  {h.label[:120]}" for h in hits
                 )
 
-        skills_block = self._skills_block(ctx, utterance)
-        messages = prompts.build_planner_messages(
-            utterance, _ctx_block(ctx), memory_block, skills_block,
-        )
-
-        plan = await self._ask_plan(messages, emit)
         result = BrainResult(
-            kind=str(plan.get("kind", "chat")),
-            response=str(plan.get("response", "")),
+            kind="action",
             provider=self.gateway.providers[0].name if self.gateway.providers else "",
             model=self.gateway.providers[0].model if self.gateway.providers else "",
         )
+        history: List[BrainStepResult] = []
+        last_failed_skill = ""
+        consecutive_failures = 0
+        last_plan_response = ""
+        coaching = ""
+        repeats: Dict[tuple, int] = {}
+        done_challenged = False
 
-        if result.kind == "stop":
-            result.success = True
-            result.response = result.response or "Standing by."
-            return result
-
-        if result.kind == "chat":
-            result.success = True
-            return result
-
-        # ---- action: execute steps
-        import json as _json
-        import re as _re
-        steps = plan.get("steps", [])[: self.max_steps]
-        last_output_text = ""
-        for i, step in enumerate(steps):
-            skill = str(step.get("skill", ""))
-            args = dict(step.get("args") or {})
-            why = str(step.get("why", ""))
-
-            # Data pipelining: substitute placeholders with real output from previous step
-            for k, v in list(args.items()):
-                if isinstance(v, str):
-                    v_str = v.strip()
-                    is_placeholder = (
-                        v_str == "$PREVIOUS_OUTPUT"
-                        or "$output" in v_str.lower()
-                        or "$prev" in v_str.lower()
-                        or (v_str.startswith("<") and v_str.endswith(">"))
-                        or (v_str.startswith("{{") and v_str.endswith("}}"))
-                        or (v_str.startswith("[") and v_str.endswith("]") and "summary" in v_str.lower())
+        while len(result.steps) < self.max_steps:
+            # Rebuild every turn: build_tool/repair_tool register tools
+            # mid-task and the next decision must see them.
+            skills_block = self._skills_block(ctx, utterance)
+            turn_memory = memory_block
+            if coaching:
+                turn_memory += f"\nPLANNER FEEDBACK: {coaching}"
+                coaching = ""
+            messages = prompts.build_loop_messages(
+                utterance, _history_block(history), _ctx_block(ctx),
+                turn_memory, skills_block,
+            )
+            try:
+                plan = await self._ask_plan(messages, emit)
+            except GatewayUnavailable as e:
+                if not history:
+                    raise
+                log.warning(f"Planner unavailable mid-task ({e}); finalizing.")
+                return self._partial_finalize(
+                    result, history, last_plan_response, "planner unavailable",
+                )
+            except GatewayError as e:
+                if not history:
+                    raise
+                # One extra planning attempt rides out transient provider
+                # failures (429s, timeouts) instead of silently ending the task.
+                log.warning(f"Planner error mid-task ({e}); retrying once.")
+                await asyncio.sleep(1.5)
+                try:
+                    plan = await self._ask_plan(messages, emit)
+                except (GatewayUnavailable, GatewayError) as e2:
+                    log.warning(f"Planner error mid-task after retry ({e2}); finalizing.")
+                    return self._partial_finalize(
+                        result, history, last_plan_response, "planner unavailable",
                     )
-                    if is_placeholder and last_output_text:
-                        args[k] = last_output_text
 
-            step_res = await self._run_step(skill, args, why)
-            result.steps.append(step_res)
+            kind = str(plan.get("kind", "chat"))
+            text = str(plan.get("response") or plan.get("summary")
+                       or plan.get("question") or "").strip()
+            log.info(f"brain turn {len(result.steps) + 1}: kind={kind}")
 
-            # Record clean text output for subsequent steps
-            if step_res.success and step_res.output:
-                raw = step_res.output
-                extracted = ""
-                try:
-                    parsed = _json.loads(raw)
-                    if isinstance(parsed, dict):
-                        extracted = (
-                            parsed.get("summary")
-                            or parsed.get("content")
-                            or parsed.get("text")
-                            or parsed.get("output")
-                            or ""
-                        )
-                except Exception:
-                    pass
-                last_output_text = extracted or raw
+            if kind == "stop":
+                result.kind = "stop"
+                result.success = True
+                result.response = text or "Standing by."
+                return result
 
-            if emit:
-                try:
-                    await emit({
-                        "type": "brain_step",
-                        "index": i + 1,
-                        "total": len(steps),
-                        **step_res.to_dict(),
-                    })
-                except Exception:
-                    pass
+            if kind == "chat":
+                if plan.get("_parse_failed"):
+                    # Both parse attempts failed. Do not pretend the model
+                    # wrapped up successfully — surface the partial outcome.
+                    log.warning("Planner returned an unusable response mid-task; stopping honestly.")
+                    result.kind = "action"
+                    result.success = False
+                    result.response = (
+                        "The planner returned an unusable response"
+                        + (f" after {len(result.steps)} step(s): "
+                           f"{self._history_summary(history)}" if history else "")
+                        + ". Try rephrasing the request."
+                    )
+                    return result
+                if history:
+                    # A model may call a request finished before the goal is
+                    # actually evidenced in HISTORY (the reported chicken-go
+                    # case). Ask it to verify once; if it still cannot show
+                    # the missing artifact/run, finish honestly but mark the
+                    # run incomplete so it is never captured as a skill.
+                    gap = _completion_gap(utterance, history)
+                    if gap and not done_challenged:
+                        done_challenged = True
+                        coaching = gap
+                        log.info("Planner tried to finish early; asking it to verify.")
+                        continue
+                    # A chat reply AFTER executed steps is the model wrapping
+                    # up (some models answer "…done" instead of kind=done).
+                    # Keep it an action result so capture/UI stay consistent.
+                    result.kind = "action"
+                    result.success = True
+                    result.complete = not bool(gap)
+                    result.response = text or self._history_summary(history) or "Done."
+                    return result
+                result.kind = "chat"
+                result.success = True
+                result.response = text
+                return result
 
-            if not step_res.success:
+            if kind == "clarify":
+                # One utterance per turn: surface the question and let the
+                # user's next reply arrive as a new request (this turn is in
+                # session memory by then).
+                result.kind = "chat"
+                result.success = True
+                result.response = text or "Could you clarify what you want me to do?"
+                return result
+
+            if kind == "done":
+                gap = _completion_gap(utterance, history)
+                if gap and not done_challenged:
+                    done_challenged = True
+                    coaching = gap
+                    log.info("Planner tried to finish early; asking it to verify.")
+                    continue
+                result.kind = "action"
+                result.success = True
+                result.complete = not bool(gap)
+                result.response = text or self._history_summary(history) or "Done."
+                return result
+
+            steps = _extract_steps(plan)
+            if not steps:
+                result.kind = "chat"
+                result.success = True
+                result.response = text or "I couldn't plan that. Try rephrasing."
+                return result
+
+            log.info(f"brain step chosen: {steps[0].get('skill', '?')}")
+
+            if text:
+                last_plan_response = text
+
+            done_sigs = {_step_signature(s.skill, s.args) for s in history if s.success}
+            remaining = self.max_steps - len(result.steps)
+            for step in steps[:remaining]:
+                skill = str(step.get("skill", ""))
+                args = dict(step.get("args") or {})
+                why = str(step.get("why", ""))
+                sig = _step_signature(skill, args)
+
+                # A small model sometimes re-emits a step that already
+                # succeeded (e.g. create_directory). Re-running it wastes the
+                # budget and hides the rest of the task; nudge it forward.
+                if sig in done_sigs:
+                    repeats[sig] = repeats.get(sig, 0) + 1
+                    if repeats[sig] >= 3:
+                        result.kind = "action"
+                        result.success = False
+                        result.response = (
+                            f"Stopped: the planner kept repeating '{skill}' even after it "
+                            f"succeeded. {self._history_summary(history)}"
+                        ).strip()
+                        return result
+                    coaching = (
+                        f"'{skill}' with those exact arguments ALREADY SUCCEEDED — "
+                        "it is in HISTORY. Do NOT repeat it. Emit the NEXT action needed, "
+                        "or done only if every part of GOAL is complete."
+                    )
+                    log.info(f"Planner repeated completed step '{skill}'; re-planning with feedback.")
+                    break
+
+                step_res = await self._run_step(skill, args, why, ctx=ctx)
+                result.steps.append(step_res)
+                history.append(step_res)
+                log.info(
+                    f"brain step result: {skill} success={step_res.success} "
+                    f"output={step_res.output[:140]!r}"
+                )
+
+                if emit:
+                    try:
+                        await emit({
+                            "type": "brain_step",
+                            "index": len(result.steps),
+                            "total": len(result.steps),
+                            **step_res.to_dict(),
+                        })
+                    except Exception:
+                        pass
+
                 # Hard stops: approval gates / policy denials — re-planning
                 # cannot change the outcome, so surface them immediately.
                 if step_res.output.startswith("[permission-required]") or step_res.output.startswith("[denied]"):
@@ -268,27 +575,70 @@ class AgentBrain:
                     if step_res.pending:
                         result.pending = step_res.pending
                     return result
-                # Recovery: one re-plan with the failure in context
-                recovered = await self._try_recover(utterance, step_res, ctx, session, skills_block, emit)
-                if recovered is not None:
-                    result.steps.extend(recovered.steps)
-                    if recovered.success:
-                        result.response = recovered.response or result.response
-                        result.success = True
-                        return result
-                    result.response = recovered.response or result.response
-                result.success = False
-                result.response = (
-                    result.response
-                    or f"Couldn't complete: {step_res.skill} failed. {step_res.output[:200]}"
-                )
-                return result
 
-        result.success = True
-        if not result.response:
-            done = [s for s in result.steps if s.success]
-            result.response = "; ".join(s.output[:80] for s in done[-2:]) or "Done."
+                if step_res.success:
+                    done_sigs.add(sig)
+                    consecutive_failures = 0
+                    last_failed_skill = ""
+                    continue
+
+                consecutive_failures = (
+                    consecutive_failures + 1 if skill == last_failed_skill else 1
+                )
+                last_failed_skill = skill
+                if consecutive_failures >= 2:
+                    result.success = False
+                    result.response = (
+                        f"Couldn't complete: {skill} failed twice. "
+                        f"{step_res.output[:200]}"
+                    )
+                    return result
+                # Failure is in HISTORY now — the next turn re-plans with it.
+                break
+
+        # Budget exhausted without a terminal decision: say so instead of
+        # silently implying the goal finished.
+        result = self._finalize(result, history, last_plan_response)
+        if len(result.steps) >= self.max_steps:
+            result.response = (
+                f"{result.response} (Stopped after {len(result.steps)} steps — "
+                "step limit reached; the task may be incomplete.)"
+            ).strip()
         return result
+
+    def _finalize(self, result: BrainResult, history: List[BrainStepResult],
+                  plan_response: str = "") -> BrainResult:
+        """Stop the loop and report honestly from what actually ran."""
+        if not history:
+            result.success = False
+            result.response = plan_response or "I couldn't plan that. Try rephrasing."
+            return result
+        last = history[-1]
+        if not last.success:
+            result.success = False
+            result.response = (
+                f"Couldn't complete: {last.skill} failed. {last.output[:200]}"
+            )
+            return result
+        result.success = True
+        result.response = plan_response or self._history_summary(history) or "Done."
+        return result
+
+    def _partial_finalize(self, result: BrainResult, history: List[BrainStepResult],
+                          plan_response: str, reason: str) -> BrainResult:
+        """End mid-task but say why, instead of silently reporting success."""
+        res = self._finalize(result, history, plan_response)
+        note = f"Stopped early: {reason}."
+        res.response = f"{res.response} {note}".strip() if res.response else note
+        return res
+
+    @staticmethod
+    def _history_summary(history: List[BrainStepResult]) -> str:
+        done = [s for s in history if s.success]
+        return "; ".join(
+            re.sub(r"\s+", " ", s.output or "").strip()[:100]
+            for s in done[-2:]
+        ) or ""
 
     # ------------------------------------------------------------------ planning
     async def _ask_plan(self, messages: list, emit: Optional[Callable]) -> dict:
@@ -299,7 +649,9 @@ class AgentBrain:
                 messages,
                 json_schema=prompts.PLANNER_JSON_SCHEMA,
                 temperature=0.1 if attempt == 0 else 0.3,
-                max_tokens=2500,
+                # One step + a short rationale. 2500 tokens overflowed the
+                # local 8192-token context once HISTORY was added on turn 2.
+                max_tokens=1200,
             )
             plan = extract_json_object(resp.content)
             if plan:
@@ -309,22 +661,34 @@ class AgentBrain:
                     if "plan" in plan and isinstance(plan["plan"], dict):
                         plan = plan["plan"]
                     if "kind" not in plan:
-                        if "steps" in plan and isinstance(plan["steps"], list):
+                        if isinstance(plan.get("step"), dict):
                             plan["kind"] = "action"
+                        elif isinstance(plan.get("steps"), list):
+                            plan["kind"] = "action"
+                        elif "summary" in plan:
+                            plan["kind"] = "done"
+                        elif "question" in plan:
+                            plan["kind"] = "clarify"
                         elif "response" in plan:
                             plan["kind"] = "chat"
-                        elif "action" in plan:
+                        elif isinstance(plan.get("action"), str):
                             plan["kind"] = "action"
-                            if "steps" not in plan:
-                                plan["steps"] = [{"skill": plan["action"], "args": plan.get("args", {})}]
+                            plan.setdefault(
+                                "step",
+                                {"skill": plan["action"],
+                                 "args": plan.get("args", {})},
+                            )
 
             if plan and "kind" in plan:
                 if emit:
                     try:
+                        n_steps = len(plan.get("steps", []) or [])
+                        if not n_steps and plan.get("step"):
+                            n_steps = 1
                         await emit({
                             "type": "brain_plan",
                             "kind": plan.get("kind"),
-                            "steps": len(plan.get("steps", []) or []),
+                            "steps": n_steps,
                             "provider": resp.provider,
                             "model": resp.model,
                             "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
@@ -338,63 +702,71 @@ class AgentBrain:
                 {"role": "assistant", "content": resp.content[:500]},
                 {"role": "user", "content": "That was not valid JSON per the schema. Output ONLY the JSON object."},
             ]
-        # last resort: treat as chat with empty response
-        return {"kind": "chat", "response": "I couldn't plan that. Try rephrasing."}
-
-    async def _try_recover(
-        self, utterance: str, failed: BrainStepResult, ctx: Any, session: Any,
-        skills_block: str, emit: Optional[Callable],
-    ) -> Optional[BrainResult]:
-        try:
-            messages = prompts.build_recovery_messages(
-                utterance, failed.to_dict(), failed.output,
-                _ctx_block(ctx), session.context_block(), skills_block,
-            )
-            plan = await self._ask_plan(messages, emit)
-            if plan.get("kind") != "action":
-                return BrainResult(kind="chat", response=str(plan.get("response", "")))
-            result = BrainResult(kind="action")
-            for step in (plan.get("steps") or [])[:2]:
-                step_res = await self._run_step(
-                    str(step.get("skill", "")), dict(step.get("args") or {}), str(step.get("why", "")),
-                )
-                result.steps.append(step_res)
-                if not step_res.success:
-                    return result
-            result.success = True
-            result.response = str(plan.get("response", "")) or "Done."
-            return result
-        except (GatewayUnavailable, GatewayError) as e:
-            log.warning(f"Recovery plan failed: {e}")
-            return None
+        # Last resort: surface as an unusable response, not a successful wrap-up.
+        return {"kind": "chat", "_parse_failed": True,
+                "response": "I couldn't plan that. Try rephrasing."}
 
     # ------------------------------------------------------------------ step execution
-    async def _run_step(self, skill: str, args: dict, why: str = "") -> BrainStepResult:
+    async def _run_step(self, skill: str, args: dict, why: str = "", ctx: Any = None) -> BrainStepResult:
         t0 = time.perf_counter()
+
+        def _ms() -> float:
+            return round((time.perf_counter() - t0) * 1000, 1)
+
         try:
             if skill == "remember_fact":
                 fact = str(args.get("fact", "")).strip()
                 if fact:
                     self.store.add_fact(fact)
-                    return BrainStepResult(skill, args, True, f"Remembered: {fact}", why,
-                                           round((time.perf_counter() - t0) * 1000, 1))
-                return BrainStepResult(skill, args, False, "No fact provided", why)
+                    return BrainStepResult(skill, args, True, f"Remembered: {fact}", why, _ms())
+                return BrainStepResult(skill, args, False, "No fact provided", why, _ms())
 
             if skill == "recall_memory":
                 query = str(args.get("query", "")).strip()
                 hits = self.store.search_episodic(query or "recent", limit=5)
                 if hits:
                     lines = "\n".join(f"- {h.label} ({_fmt_ts(h.timestamp)})" for h in hits)
-                    return BrainStepResult(skill, args, True, lines, why,
-                                           round((time.perf_counter() - t0) * 1000, 1))
-                return BrainStepResult(skill, args, True, "No matching past activity found.", why,
-                                       round((time.perf_counter() - t0) * 1000, 1))
+                    return BrainStepResult(skill, args, True, lines, why, _ms())
+                return BrainStepResult(skill, args, True, "No matching past activity found.", why, _ms())
+
+            if skill == "build_tool":
+                task = str(args.get("task", args.get("goal", ""))).strip()
+                if not task:
+                    return BrainStepResult(skill, args, False,
+                                           "No task description provided for build_tool.", why, _ms())
+                if self.tool_builder is None:
+                    return BrainStepResult(skill, args, False,
+                                           "Tool building is not available in this session.", why, _ms())
+                out = await self.tool_builder(task, ctx)
+                return BrainStepResult(
+                    skill, args, bool(out.get("success", False)),
+                    str(out.get("output") or "Tool build failed."), why, _ms(),
+                )
+
+            if skill == "repair_tool":
+                sname = str(
+                    args.get("skill_name") or args.get("tool_name") or args.get("skill") or ""
+                ).strip()
+                if not sname:
+                    return BrainStepResult(skill, args, False,
+                                           "repair_tool needs the name of the tool to fix.", why, _ms())
+                failure = str(
+                    args.get("failure") or args.get("error") or args.get("problem") or ""
+                ).strip()
+                return await self._repair_tool_step(sname, dict(args), failure, why)
 
             tool = self.registry.get(skill)
             if tool is None:
                 return BrainStepResult(skill, args, False, f"Unknown skill '{skill}'", why)
 
-            exec_out = await self.executor(skill, args)
+            try:
+                exec_out = await asyncio.wait_for(
+                    self.executor(skill, args), timeout=STEP_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                return BrainStepResult(
+                    skill, args, False,
+                    f"Execution timed out after {STEP_TIMEOUT_S:.0f}s.",
+                    why, round((time.perf_counter() - t0) * 1000, 1))
             # v3/M3: the permission is a hard stop — no re-plan can bypass it
             if exec_out.get("type") == "permission_required":
                 p = exec_out.get("pending") or {}
@@ -422,6 +794,179 @@ class AgentBrain:
             log.warning(f"Brain step '{skill}' raised: {e}")
             return BrainStepResult(skill, args, False, f"Execution error: {e}", why,
                                    round((time.perf_counter() - t0) * 1000, 1))
+
+    # ------------------------------------------------------------------ self-repair
+    async def _repair_tool_step(
+        self, sname: str, args: dict, failure: str, why: str,
+    ) -> BrainStepResult:
+        """Rewrite a broken tool's PowerShell script via the fixer prompt,
+        register the fix in memory, verify with one run, then persist."""
+        t0 = time.perf_counter()
+
+        def _ms() -> float:
+            return round((time.perf_counter() - t0) * 1000, 1)
+
+        try:
+            tool = self.registry.get(sname)
+            if tool is None:
+                return BrainStepResult("repair_tool", args, False,
+                                       f"No tool named '{sname}' to repair — build a new tool instead.",
+                                       why, _ms())
+            script = getattr(tool, "script", "") or ""
+            if not script:
+                return BrainStepResult("repair_tool", args, False,
+                                       f"Tool '{sname}' is implemented in code, not a script — nothing to rewrite.",
+                                       why, _ms())
+            if not self.gateway.providers:
+                return BrainStepResult("repair_tool", args, False,
+                                       "No model provider configured for script repair.",
+                                       why, _ms())
+
+            args_block = ", ".join(f"{a.name}({a.kind})" for a in tool.args) or "no args"
+            user_task = str(args.get("task", "")).strip()
+            messages = prompts.build_tool_repair_messages(
+                tool.name, tool.description, script, args_block,
+                failure or user_task or
+                "The tool ran but produced a wrong or empty result.",
+            )
+            resp = await self.gateway.chat(
+                messages,
+                json_schema=prompts.TOOL_FIXER_JSON_SCHEMA,
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            fix = extract_json_object(resp.content) or {}
+            new_script = str(fix.get("script", "")).strip()
+            if not new_script:
+                log.warning(f"repair_tool: fixer returned no script for '{sname}'")
+                return BrainStepResult(
+                    "repair_tool", args, False,
+                    f"Attempted repair produced no new script for '{sname}'.",
+                    why, _ms(),
+                )
+            try:
+                validate_script_safety(new_script)
+            except PolicyError as e:
+                return BrainStepResult("repair_tool", args, False,
+                                       f"Rejected repaired script by safety policy: {e}",
+                                       why, _ms())
+
+            fixed = Tool(
+                name=str(fix.get("tool_name") or tool.name),
+                description=str(fix.get("description") or tool.description),
+                script=new_script,
+                scope=fix.get("scope") or getattr(tool, "scope", None),
+                args=[ArgSpec(
+                    name=a["name"],
+                    kind=a.get("kind", "text"),
+                    instructions=a.get("instructions", ""),
+                    criteria=a.get("criteria", {}),
+                    default=a.get("default"),
+                ) for a in (fix.get("args") or [])] or list(tool.args),
+                examples=[str(e) for e in (fix.get("examples") or [])][:3] or list(tool.examples),
+                is_learned=True,
+            )
+
+            # Register the fix in memory first so the executor can run it;
+            # roll back to the original tool if verification fails.
+            self.registry.register(fixed)
+
+            defaults = {a.name: (a.default or "") for a in fixed.args}
+            extras = {
+                k: (str(v) if isinstance(v, (int, float)) else v)
+                for k, v in args.items()
+                if k in defaults and k not in ("skill_name", "tool_name", "skill",
+                                               "failure", "error", "problem", "task")
+            }
+            verify_args = {**defaults, **extras}
+            try:
+                exec_out = await asyncio.wait_for(
+                    self.executor(fixed.name, verify_args), timeout=STEP_TIMEOUT_S)
+            except Exception as e:
+                self.registry.register(tool)
+                return BrainStepResult("repair_tool", args, False,
+                                       f"Repaired '{sname}' errored while verifying: {e}",
+                                       why, _ms())
+            if not exec_out.get("success", False):
+                self.registry.register(tool)
+                out_txt = str(exec_out.get("output") or exec_out.get("stderr") or "")
+                return BrainStepResult("repair_tool", args, False,
+                                       f"Repaired '{sname}' still fails: {out_txt[:200]}",
+                                       why, _ms())
+
+            # Persist: learned tools overwrite in place; seed tools get a
+            # '<name>_fixed' sibling so the fix survives restarts (learned
+            # entries are never allowed to shadow built-ins, by registry
+            # policy).
+            persisted = fixed.name
+            try:
+                if tool.is_learned:
+                    self.registry.save_learned(fixed)
+                else:
+                    seed_copy = dataclasses.replace(fixed, name=f"{tool.name}_fixed")
+                    self.registry.save_learned(seed_copy)
+                    persisted = seed_copy.name
+            except Exception as e:
+                log.warning(f"repair_tool: could not persist fixed '{sname}': {e}")
+
+            out_txt = str(exec_out.get("output") or exec_out.get("stdout") or "Done")
+            return BrainStepResult(
+                "repair_tool", args, True,
+                (f"Repaired and verified '{fixed.name}' (saved as '{persisted}'). "
+                 f"Run result: {out_txt[:160]}"),
+                why, _ms(),
+            )
+        except Exception as e:
+            log.warning(f"repair_tool failed for '{sname}': {e}")
+            return BrainStepResult("repair_tool", args, False,
+                                   f"Repair error: {e}", why, _ms())
+
+
+def _step_signature(skill: str, args: dict) -> tuple:
+    """Stable identity for a step, used to detect repeats of completed work."""
+    try:
+        args_key = json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        args_key = str(args)
+    return (skill, args_key)
+
+
+def _extract_steps(plan: dict) -> List[dict]:
+    """Closed-loop plans carry ONE `step`; legacy plans carry a `steps` array."""
+    step = plan.get("step")
+    if isinstance(step, dict) and step.get("skill"):
+        return [step]
+    steps = plan.get("steps")
+    if isinstance(steps, list):
+        return [s for s in steps if isinstance(s, dict) and s.get("skill")]
+    action = plan.get("action")
+    if isinstance(action, str) and action:
+        return [{"skill": action, "args": dict(plan.get("args") or {})}]
+    return []
+
+
+def _history_block(history: List[BrainStepResult]) -> str:
+    """Compact, token-bounded rendering of every step taken so far.
+
+    This is the loop's working memory: values discovered by one step (file
+    paths, search results) are visible verbatim to every later decision.
+    """
+    if not history:
+        return "(none yet — this is the first action)"
+    shown = history[-10:]
+    lines: List[str] = []
+    if len(history) > len(shown):
+        lines.append(f"({len(history) - len(shown)} earlier steps omitted)")
+    for i, s in enumerate(shown, 1):
+        args = json.dumps(s.args or {}, ensure_ascii=False, default=str)
+        if len(args) > 240:
+            args = args[:237] + "..."
+        out = re.sub(r"\s+", " ", s.output or "").strip()
+        if len(out) > 400:
+            out = out[:397] + "..."
+        status = "OK" if s.success else "FAILED"
+        lines.append(f"{i}. {s.skill}({args}) → {status}: {out}")
+    return "\n".join(lines)
 
 
 def _ctx_block(ctx: Any) -> str:

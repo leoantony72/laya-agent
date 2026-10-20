@@ -321,6 +321,67 @@ _SAVE_DEST_RE = re.compile(
     r"(?:\s+folder)?(?:\s*[.!])?\s*$", re.I
 )
 
+# ── Direct file creation ("create a text file called logo.txt on the
+# desktop", "write hello.txt in downloads", "make logo.txt") — runs with no
+# app needed, so it routes before/independent of the notepad recipe. Any
+# 'folder' destination word in the utterance maps to the seed tool's folder
+# enum; default is Desktop. Composite requests ("open vscode and create a
+# new file named chicken.go") carry an app-open or code-composition clause;
+# those become NEW_ACTION so the brain plans launch + create + type as
+# separate steps — a single tool call would drop the file step.
+_CREATE_FILE_NAME_RE = re.compile(
+    r"\b([\w\-]+\.(?:txt|md|log|csv|json|ps1|py|go|html|css|js|ini))\b", re.I
+)
+_CREATE_FILE_FOLDER_RE = re.compile(
+    r"\b(downloads?|documents?|desktop|pics?|pictures?|images?|videos?)\b", re.I
+)
+_CREATE_FILE_FOLDER_ENUM = {
+    "downloads": "Downloads", "download": "Downloads",
+    "documents": "Documents", "document": "Documents",
+    "desktop": "Desktop", "pics": "Pictures", "pictures": "Pictures",
+    "images": "Pictures", "videos": "Videos",
+}
+_CREATE_FILE_CONTENT_RE = re.compile(
+    r"\b(?:with(?:\s+the\s+)?(?:text|content|contents|words)?\s+"
+    r"|containing\s+|that\s+says\s+|saying\s+|which\s+says\s+"
+    r"|and\s+writes?\s+|and\s+make[sd]?\s+(?:it|the\s+file)\s+)(.+)$", re.I
+)
+
+
+def _parse_create_file(cleaned: str) -> tuple[str, str, str, bool]:
+    """'create a text file called logo.txt on the desktop' → parse tuple.
+
+    Returns (filename, folder_enum, content, composite).
+    ("", "", "", False) when no "<name>.<ext>" filename is present.
+    composite=True when the utterance also wants an app opened or a program/
+    code/script composed — multi-step territory handled by the brain.
+    """
+    m = _CREATE_FILE_NAME_RE.search(cleaned)
+    if not m:
+        return "", "", "", False
+    filename, content = m.group(1), ""
+    cm = _CREATE_FILE_CONTENT_RE.search(cleaned)
+    if cm:
+        content = cm.group(1)
+        # Drop a trailing destination clause from the content, not the file body.
+        dest = re.search(
+            r"\s+(?:in|to|into|on)\s+(?:the\s+|my\s+|a\s+)?[\w\-]+\s*folder?\s*$",
+            content, re.I)
+        if dest:
+            content = content[: dest.start()]
+        content = content.strip().strip(".,!").strip()
+    composite = bool(
+        re.match(r"^(?:open|launch|switch to|focus|bring up|start)\b", cleaned, re.I)
+        or re.search(r"\b(?:and|then)\s+(?:open|launch|switch to|bring up)\b",
+                     cleaned, re.I)
+        or re.search(r"\b(?:program|code|script)\b", cleaned, re.I))
+    if composite:
+        return "", "", "", True
+    fm = _CREATE_FILE_FOLDER_RE.search(cleaned)
+    folder = _CREATE_FILE_FOLDER_ENUM.get(fm.group(1).lower(), "") if fm else ""
+    return filename, folder, content, False
+
+
 
 def _parse_save_utterance(lower: str) -> tuple[str, str]:
     """'save it as home.txt in the downloads folder' → ('home.txt', 'downloads').
@@ -1139,6 +1200,48 @@ class WinBrowRouter:
                                  args={"filename": name, "folder": folder},
                                  confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
 
+        # --- NEW FILE CREATION ("create a text file called logo.txt on the
+        # desktop") — no focused app required. Composite requests ("open
+        # vscode and create a new file named chicken.go and write a program
+        # ...") must NOT hijack into a single tool; they go to the brain so
+        # launch + create + type execute as separate steps.
+        fname, folder_enum, file_content, composite = _parse_create_file(cleaned)
+        if composite:
+            return Route(kind=NEW_ACTION, confidence=0.6,
+                         latency_ms=elapsed_ms, tier="heuristic")
+        if fname and not (_editable_focused(ctx)
+                          and re.match(r"^(?:write|type)\b", lower)):
+            t = self.registry.get("create_text_file")
+            if t:
+                return Route(kind="tool", tool=t,
+                             args={"filename": fname, "content": file_content,
+                                   "folder": folder_enum or "Desktop"},
+                             confidence=0.85, latency_ms=elapsed_ms,
+                             tier="heuristic")
+
+        # --- DOWNLOAD ("download <url> … desktop/downloads/documents") — a
+        # URL in the utterance makes this a single deterministic call. Search
+        # + download flows without a URL stay with the brain (it can resolve
+        # arXiv-style paper IDs through download_file/build_tool).
+        url_m = re.search(r"https?://\S+", lower)
+        if url_m and re.search(r"\bdownload\b|\bsave (?:it )?(?:as|in|into|to)\b", lower):
+            t = self.registry.get("download_file")
+            if t:
+                url = url_m.group(0).rstrip(".,;)")
+                fname = os.path.basename(url.split("?", 1)[0]) if "?" in url \
+                    else url.rstrip("/").split("/")[-1]
+                if not re.search(r"\.[a-z0-9]{1,5}$", fname, re.I):
+                    # e.g. arxiv /pdf/<id> — save as <id>.pdf
+                    fname = fname + ".pdf" if re.search(r"/pdf/|\.pdf", url) else ""
+                fm = _SAVE_DEST_RE.search(lower)
+                folder_arg = _CREATE_FILE_FOLDER_ENUM.get(
+                    fm.group("folder").lower(), "Downloads") if fm else "Downloads"
+                return Route(kind="tool", tool=t,
+                             args={"url": url, "filename": fname,
+                                   "folder": folder_arg},
+                             confidence=0.9, latency_ms=elapsed_ms,
+                             tier="heuristic")
+
         # --- INSTALLER (winget): T3 confirmed by the permission gate ---
         _inst = _installer_route(lower, self.registry, Route, elapsed_ms)
         if _inst is not None:
@@ -1263,6 +1366,14 @@ class WinBrowRouter:
         for prefix in launch_prefixes:
             if lower.startswith(prefix):
                 remainder = lower[len(prefix):].strip()
+                # Compound request ("open vscode and create a new file …",
+                # "open project x in code and prepare") — launching is ONE
+                # step of a multi-step plan; a single tool call would drop
+                # everything after the conjunction, so hand the whole task
+                # to the brain instead.
+                if re.search(r"\b(?:and|then)\b|\s[,;]\s", remainder):
+                    return Route(kind=NEW_ACTION, confidence=0.6,
+                                 latency_ms=elapsed_ms, tier="heuristic")
                 # Fuzzy match against known apps
                 for app_key, app_exe in _LAUNCH_APPS.items():
                     if _closest_word(app_key, {remainder}) or remainder.startswith(app_key):
@@ -1439,6 +1550,21 @@ class WinBrowRouter:
                     return Route(kind="tool", tool=t,
                                  args={"filename": name, "folder": folder},
                                  confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- NEW FILE CREATION (restricted layer: same branch, same args) ---
+        fname, folder_enum, file_content, composite = _parse_create_file(cleaned)
+        if composite:
+            return Route(kind=NEW_ACTION, confidence=0.6,
+                         latency_ms=elapsed_ms, tier="heuristic")
+        if fname and not (_editable_focused(ctx)
+                          and re.match(r"^(?:write|type)\b", lower)):
+            t = self.registry.get("create_text_file")
+            if t:
+                return Route(kind="tool", tool=t,
+                             args={"filename": fname, "content": file_content,
+                                   "folder": folder_enum or "Desktop"},
+                             confidence=0.85, latency_ms=elapsed_ms,
+                             tier="heuristic")
 
         # --- INSTALLER (winget): T3 confirmed by the permission gate ---
         _inst = _installer_route(lower, self.registry, Route, elapsed_ms)

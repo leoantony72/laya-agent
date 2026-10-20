@@ -1,17 +1,22 @@
 """
 Procedural Memory — Capture Plans, Replay Skills (M2)
 ======================================================
-When the brain successfully completes a multi-step task, the whole plan is
-captured as a named skill (JSON in tools/skills.json, human-editable).
-The next similar utterance replays the exact steps locally — no LLM, no
-planning latency (<2s for CLI/atom flows).
+When the brain completes a multi-step task cleanly, the whole plan becomes a
+proposed skill (JSON in tools/skills.json, human-editable). After review it
+can replay without the planner; a parameterized skill makes one small
+extraction call to map the new request onto its placeholders.
 
 Storage format (tools/skills.json):
-  [{ "id", "name", "utterance", "steps": [{"skill","args"}], "created",
-     "uses", "last_used", "source" }]
+  [{ "id", "name", "utterance", "description", "triggers", "parameters",
+     "steps": [{"skill","args"}], "status", "created", "uses", "last_used",
+     "source" }]
 
 Matching: token-overlap (Jaccard) on informative tokens, threshold-gated.
+          Only approved skills are replayable; brain captures start as
+          "proposed" so a human reviews them first.
 Replay:   step["skill"] → shared executor (agent.run_skill) with stored args.
+          Steps may contain {{parameter}} placeholders; callers resolve them
+          with render_steps() before replay.
 """
 
 from __future__ import annotations
@@ -36,6 +41,18 @@ MATCH_THRESHOLD = 0.66                          # Jaccard token-overlap gate
 _LOANWORDS = {"a", "an", "the", "and", "or", "in", "on", "for", "to", "my",
               "it", "its", "that", "this", "those", "some", "please", "then",
               "up", "down", "be", "of", "with", "at", "as", "do", "did", "just"}
+_PLACEHOLDER_RE = re.compile(
+    r"\{\{\s*([A-Za-z_][\w.-]*)\s*(?:\|\s*([A-Za-z_]+)\s*)?\}\}"
+)
+_VALID_STATUSES = {"proposed", "approved"}
+
+
+class MissingSkillParameters(ValueError):
+    """Replay was attempted without values for required placeholders."""
+
+    def __init__(self, names: List[str]):
+        self.names = list(names)
+        super().__init__("missing skill parameter(s): " + ", ".join(self.names))
 
 
 def _canon_tokens(text: str) -> set[str]:
@@ -59,11 +76,38 @@ class SkillStep:
 
 
 @dataclass
+class SkillParam:
+    name: str
+    description: str = ""
+    required: bool = False
+    default: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(item: Any) -> "SkillParam":
+        if isinstance(item, str):
+            return SkillParam(name=item)
+        data = item or {}
+        return SkillParam(
+            name=str(data.get("name", "")),
+            description=str(data.get("description", "")),
+            required=bool(data.get("required", False)),
+            default=str(data.get("default", "")),
+        )
+
+
+@dataclass
 class SkillRecord:
     id: str
-    name: str                      # human-facing name (from planner/utterance)
-    utterance: str                 # matching phrase (what the user said)
-    steps: List[SkillStep]         # replay: exact tools + args
+    name: str                      # human-facing label
+    utterance: str                 # original request (matching example)
+    steps: List[SkillStep]         # replay: tools + args (may hold {{params}})
+    description: str = ""          # purpose + when to use it
+    triggers: List[str] = field(default_factory=list)   # extra match phrases
+    parameters: List[SkillParam] = field(default_factory=list)
+    status: str = "approved"       # "proposed" (needs review) | "approved"
     created: float = 0.0
     uses: int = 0
     last_used: float = 0.0
@@ -72,20 +116,149 @@ class SkillRecord:
     def to_dict(self) -> dict:
         d = asdict(self)
         d["steps"] = [{"skill": s.skill, "args": s.args} for s in self.steps]
+        d["parameters"] = [p.to_dict() for p in self.parameters]
         return d
 
     @staticmethod
     def from_dict(item: dict) -> "SkillRecord":
         steps = [SkillStep(skill=s["skill"], args={k: str(v) for k, v in (s.get("args") or {}).items()})
                  for s in (item.get("steps") or [])]
+        status = str(item.get("status") or "approved")
+        if status not in _VALID_STATUSES:
+            status = "proposed"
         return SkillRecord(
             id=item["id"], name=item.get("name", item["id"]),
             utterance=item.get("utterance", ""), steps=steps,
+            description=str(item.get("description", "")),
+            triggers=[str(t) for t in (item.get("triggers") or []) if str(t).strip()],
+            parameters=[SkillParam.from_dict(p) for p in (item.get("parameters") or [])],
+            status=status,
             created=float(item.get("created", 0.0)),
             uses=int(item.get("uses", 0)),
             last_used=float(item.get("last_used", 0.0)),
             source=item.get("source", "brain"),
         )
+
+    def placeholder_names(self) -> set[str]:
+        names: set[str] = set()
+        for step in self.steps:
+            for value in step.args.values():
+                names.update(m.group(1) for m in _PLACEHOLDER_RE.finditer(str(value)))
+        return names
+
+    def render_steps(self, values: Optional[Dict[str, Any]] = None) -> List[dict]:
+        """Resolve {{placeholders}} for one replay.
+
+        Values come from the new request; parameter defaults fill gaps. Raises
+        MissingSkillParameters instead of replaying literal {{...}} text.
+        """
+        supplied = {str(k): "" if v is None else str(v) for k, v in (values or {}).items()}
+        resolved: Dict[str, str] = {}
+        for p in self.parameters:
+            value = supplied.get(p.name)
+            if value is None or not value.strip():
+                value = p.default
+            resolved[p.name] = value or ""
+
+        missing = [p.name for p in self.parameters
+                   if p.required and not resolved.get(p.name)]
+        missing.extend(n for n in self.placeholder_names() if n not in resolved)
+        missing = list(dict.fromkeys(missing))
+        if missing:
+            raise MissingSkillParameters(missing)
+
+        def _sub(value: Any) -> str:
+            def repl(m: re.Match) -> str:
+                key = m.group(1)
+                filt = (m.group(2) or "").lower()
+                out = resolved[key]
+                if filt in ("basename", "filename"):
+                    out = re.split(r"[\\/]", out.rstrip("\\/"))[-1]
+                elif filt == "lower":
+                    out = out.lower()
+                elif filt == "upper":
+                    out = out.upper()
+                return out
+
+            return _PLACEHOLDER_RE.sub(repl, str(value))
+
+        return [
+            {"skill": s.skill, "args": {k: _sub(v) for k, v in s.args.items()}}
+            for s in self.steps
+        ]
+
+
+_WIN_ABS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+_BARE_FILENAME_RE = re.compile(r"^[^\\/\s]+\.[A-Za-z0-9]{1,8}$")
+_PATH_ARG_KEYS = {"path", "folder", "destination", "source", "target",
+                  "file", "filename", "name", "dir", "directory"}
+
+
+def _param_description(key: str, is_file: bool) -> str:
+    if is_file:
+        return f"File path for '{key}' from the new request."
+    return f"Folder path for '{key}' from the new request."
+
+
+def parameterize_steps(
+    steps: List[dict], utterance: str
+) -> Tuple[List[dict], List[SkillParam]]:
+    """Turn request-specific paths/filenames into {{placeholders}}.
+
+    Conservative: only values that appeared in the original request and look
+    like an absolute path or a filename are parameterized. Everything else is
+    left literal so a reviewed skill cannot silently change behaviour.
+    """
+    low_utterance = (utterance or "").lower().replace("/", "\\")
+    params: List[SkillParam] = []
+    used: Dict[str, str] = {}
+    out: List[dict] = []
+
+    def _name_for(key: str, value: str, is_file: bool, is_abs: bool) -> str:
+        if key.lower() in ("filename", "file"):
+            base = "filename"
+        elif is_abs and is_file:
+            base = "file_path"
+        elif is_abs:
+            base = "folder_path"
+        else:
+            base = "filename"
+        n = 1
+        candidate = base
+        while candidate in used and used[candidate] != value:
+            n += 1
+            candidate = f"{base}_{n}"
+        used[candidate] = value
+        return candidate
+
+    for step in steps:
+        args = dict(step.get("args") or {})
+        for key, raw in list(args.items()):
+            value = str(raw)
+            if not value or _PLACEHOLDER_RE.search(value):
+                continue
+            if key.lower() not in _PATH_ARG_KEYS:
+                continue
+            is_abs = bool(_WIN_ABS_PATH_RE.match(value))
+            is_file = bool(_BARE_FILENAME_RE.match(value))
+            if not (is_abs or is_file):
+                continue
+            haystack = value.lower().replace("/", "\\")
+            basename = re.split(r"[\\/]", haystack.rstrip("\\"))[-1]
+            basename_hit = len(basename) >= 4 and basename in low_utterance
+            if haystack not in low_utterance and not basename_hit:
+                continue
+            file_like = is_file or bool(re.search(r"\.[A-Za-z0-9]{1,8}$", basename))
+            name = _name_for(key, value, file_like, is_abs)
+            args[key] = "{{" + name + "}}"
+            if not any(p.name == name for p in params):
+                params.append(SkillParam(
+                    name=name,
+                    description=_param_description(key, file_like),
+                    required=True,
+                ))
+        out.append({**step, "args": args})
+    return out, params
 
 
 def match_score(utterance: str, stored: str) -> float:
@@ -134,7 +307,7 @@ class SkillMemory:
     def __len__(self) -> int:
         return len(self._records)
 
-    def list(self) -> List[str]:
+    def list(self) -> List[dict]:
         return [r.to_dict() for r in self._records]
 
     def get(self, skill_id: str) -> Optional[SkillRecord]:
@@ -142,9 +315,21 @@ class SkillMemory:
         return next((r for r in self._records if r.id.lower() == low), None)
 
     def save(
-        self, name: str, utterance: str, steps: List[dict], source: str = "brain"
+        self,
+        name: str,
+        utterance: str,
+        steps: List[dict],
+        source: str = "brain",
+        description: str = "",
+        triggers: Optional[List[str]] = None,
+        parameters: Optional[List[dict]] = None,
+        status: str = "approved",
     ) -> Optional[SkillRecord]:
-        """Capture a successful plan. Dedups by id; truncated to MAX_STEPS."""
+        """Capture a successful plan. Dedups by id; truncated to MAX_STEPS.
+
+        Brain-initiated captures pass status="proposed" so they are reviewed
+        before becoming replayable. Manual saves default to approved.
+        """
         plan = []
         for s in steps[:MAX_STEPS]:
             name_ok = (s.get("skill") or "").strip()
@@ -154,34 +339,47 @@ class SkillMemory:
                                   args={str(k): str(v) for k, v in (s.get("args") or {}).items()}))
         if not plan:
             return None
+        if status not in _VALID_STATUSES:
+            status = "proposed"
+        params = [SkillParam.from_dict(p) for p in (parameters or [])]
         rid = _slugify(name or utterance)
         now = time.time()
         rec = self.get(rid)
         if rec is not None:
             rec.utterance = utterance or rec.utterance
             rec.steps = plan
+            rec.description = description or rec.description
+            if triggers is not None:
+                rec.triggers = [str(t) for t in triggers if str(t).strip()]
+            rec.parameters = params
+            rec.status = status
             rec.source = source
             rec.last_used = now
-            log.info(f"Skill '{rid}' updated ({len(plan)} steps)")
+            log.info(f"Skill '{rid}' updated ({len(plan)} steps, status={status})")
         else:
             rec = SkillRecord(id=rid, name=name or rid, utterance=utterance or name,
-                              steps=plan, created=now, last_used=now, source=source)
+                              steps=plan, description=description,
+                              triggers=[str(t) for t in (triggers or []) if str(t).strip()],
+                              parameters=params, status=status,
+                              created=now, last_used=now, source=source)
             self._records.append(rec)
-            log.info(f"Skill '{rid}' captured ({len(plan)} steps) from '{utterance[:60]}'")
+            log.info(f"Skill '{rid}' captured ({len(plan)} steps, status={status}) "
+                     f"from '{utterance[:60]}'")
         self._save()
         return rec
 
     def find_match(self, utterance: str, threshold: float = MATCH_THRESHOLD
                    ) -> Optional[Tuple[SkillRecord, float]]:
-        """Best matching skill for an utterance (≥ threshold) or None."""
+        """Best approved skill for an utterance (≥ threshold) or None."""
         if not self._records or not utterance:
             return None
         best = None
         best_score = 0.0
-        key = _canon_tokens(utterance)
         for rec in self._records:
-            stored = rec.utterance or rec.name
-            score = match_score(utterance, stored)
+            if rec.status != "approved":
+                continue
+            phrases = [rec.utterance or rec.name, rec.description, *rec.triggers]
+            score = max((match_score(utterance, p) for p in phrases if p), default=0.0)
             if score > best_score or (best is None and score >= threshold):
                 if score > best_score:
                     best, best_score = rec, score
@@ -190,6 +388,19 @@ class SkillMemory:
         if best_score >= threshold:
             return (best, round(best_score, 3))
         return None
+
+    def approve(self, skill_id: str) -> bool:
+        """Enable a proposed skill after human review."""
+        rec = self.get(skill_id)
+        if rec is None:
+            return False
+        rec.status = "approved"
+        self._save()
+        return True
+
+    def proposed(self) -> List[dict]:
+        """Skills awaiting review (not replayable yet)."""
+        return [r.to_dict() for r in self._records if r.status == "proposed"]
 
     def mark_used(self, skill_id: str) -> None:
         rec = self.get(skill_id)

@@ -1,1 +1,125 @@
-[]
+[
+  {
+    "id": "could-you-move-the-attention-is-all-you-need-paper-to-the-pa",
+    "name": "could you move the attention is all you need paper to the pa",
+    "utterance": "could you move the attention is all you need paper to the papers folder in the desktop",
+    "steps": [
+      {
+        "skill": "find_files",
+        "args": {
+          "search_term": "attention"
+        }
+      },
+      {
+        "skill": "mcp_filesystem_create_directory",
+        "args": {
+          "path": "C:\\Users\\USER\\Desktop\\papers"
+        }
+      },
+      {
+        "skill": "mcp_filesystem_move_file",
+        "args": {
+          "source": "C:\\Users\\USER\\Desktop\\attention_is_all_you_need.pdf",
+          "destination": "C:\\Users\\USER\\Desktop\\papers\\attention_is_all_you_need.pdf"
+        }
+      }
+    ],
+    "description": "",
+    "triggers": [],
+    "parameters": [],
+    "status": "approved",
+    "created": 1792468724.729932,
+    "uses": 0,
+    "last_used": 1792468724.729932,
+    "source": "brain"
+  },
+  {
+    "id": "can-you-download-the-original-diffusion-model-paper-and-plac",
+    "name": "can you download the original diffusion model paper and plac",
+    "utterance": "can you download the original diffusion model paper and place it in the papers folder",
+    "steps": [
+      {
+        "skill": "download_file",
+        "args": {
+          "url": "https://arxiv.org/pdf/2006.11239",
+          "filename": "Denoising_Diffusion_Probabilistic_Models.pdf",
+          "folder": "Desktop"
+        }
+      },
+      {
+        "skill": "mcp_filesystem_move_file",
+        "args": {
+          "source": "C:\\Users\\USER\\Desktop\\Denoising_Diffusion_Probabilistic_Models.pdf",
+          "destination": "C:\\Users\\USER\\Desktop\\papers\\Denoising_Diffusion_Probabilistic_Models.pdf"
+        }
+      }
+    ],
+    "description": "",
+    "triggers": [],
+    "parameters": [],
+    "status": "approved",
+    "created": 1792468808.8224156,
+    "uses": 0,
+    "last_used": 1792468808.8224156,
+    "source": "brain"
+  },
+  {
+    "id": "move-all-the-pdf-files-in-the-downloads-folder-to-a-new-fold",
+    "name": "move all the pdf files in the downloads folder to a new fold",
+    "utterance": "move all the pdf files in the downloads folder to a new folder name pdf tests inside the downloads folder itself",
+    "steps": [
+      {
+        "skill": "mcp_filesystem_list_allowed_directories",
+        "args": {}
+      },
+      {
+        "skill": "mcp_filesystem_list_directory",
+        "args": {
+          "path": "{{folder_path}}"
+        }
+      },
+      {
+        "skill": "mcp_filesystem_create_directory",
+        "args": {
+          "path": "{{folder_path_2}}"
+        }
+      },
+      {
+        "skill": "mcp_filesystem_search_files",
+        "args": {
+          "path": "{{folder_path}}",
+          "pattern": "*.pdf"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "Get-ChildItem -Path 'C:\\Users\\USER\\Downloads' -Filter *.pdf -File | Move-Item -Destination 'C:\\Users\\USER\\Downloads\\pdf tests' -Force; Get-ChildItem -Path 'C:\\Users\\USER\\Downloads\\pdf tests' -Filter *.pdf -File | Select-Object -ExpandProperty Name",
+          "cwd": "C:\\Users\\USER\\Downloads",
+          "timeout": "60"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: mcp_filesystem_list_allowed_directories -> mcp_filesystem_list_directory -> mcp_filesystem_create_directory -> mcp_filesystem_search_files -> run_command. Use when the request resembles: move all the pdf files in the downloads folder to a new folder name pdf tests inside the downloads folder itself",
+    "triggers": [],
+    "parameters": [
+      {
+        "name": "folder_path",
+        "description": "Folder path for 'path' from the new request.",
+        "required": true,
+        "default": ""
+      },
+      {
+        "name": "folder_path_2",
+        "description": "Folder path for 'path' from the new request.",
+        "required": true,
+        "default": ""
+      }
+    ],
+    "status": "proposed",
+    "created": 1792478244.8610046,
+    "uses": 0,
+    "last_used": 1792478244.8610046,
+    "source": "brain"
+  }
+]

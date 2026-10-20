@@ -1,0 +1,44 @@
+{"request": "open notepad and type hello", "expected": ["app_focus_or_launch", "type_text"]}
+{"request": "make it louder", "expected": ["volume_set_level"]}
+{"request": "mute", "expected": ["volume_set_level"]}
+{"request": "what's the weather in Thrissur", "expected": ["mcp_open_meteo_openmeteo_search_locations", "mcp_open_meteo_openmeteo_get_forecast"]}
+{"request": "define serendipity", "expected": ["mcp_dictionary_define"]}
+{"request": "who is Ada Lovelace", "expected": ["mcp_wikipedia_get_summary"]}
+{"request": "find papers on diffusion models", "expected": ["mcp_arxiv_search_papers"]}
+{"request": "DOI lookup 10.1000/xyz", "expected": ["mcp_crossref_get_work"]}
+{"request": "take a screenshot", "expected": ["take_screenshot"]}
+{"request": "open downloads", "expected": ["open_folder"]}
+{"request": "open settings bluetooth", "expected": ["bluetooth_settings"]}
+{"request": "what's my battery", "expected": ["battery_health"]}
+{"request": "install vlc", "expected": ["app_install"]}
+{"request": "lock my computer", "expected": ["lock_screen"]}
+{"request": "play a youtube video of lofi music", "expected": ["laya_ultrafast_browser"]}
+{"request": "remember my exports folder is D:\\exports", "expected": ["remember_fact"]}
+{"request": "what did I do yesterday", "expected": ["recall_memory"]}
+{"request": "minimize everything", "expected": ["minimize_all_except"]}
+{"request": "dark mode on", "expected": ["toggle_dark_mode"]}
+{"request": "set brightness to 40", "expected": ["screen_brightness"]}
+{"request": "kill chrome", "expected": ["kill_unresponsive_process"]}
+{"request": "what time is it", "expected": ["current_time"]}
+{"request": "clean temp files", "expected": ["clean_temp_files"]}
+{"request": "show my wifi password", "expected": ["get_wifi_password"]}
+{"request": "open a file called resume", "expected": ["open_file"]}
+{"request": "write a note saying buy milk", "expected": ["quick_note"]}
+{"request": "set volume to 30", "expected": ["volume_set_level"]}
+{"request": "search wikipedia for python", "expected": ["mcp_wikipedia_search_wikipedia"]}
+{"request": "fetch https://example.com", "expected": ["mcp_fetch_fetch"]}
+{"request": "desaturate the image in photoshop", "expected": ["photoshop_desaturate"]}
+{"request": "open this project in vscode", "expected": ["vscode_open"]}
+{"request": "check clipboard", "expected": ["clipboard_inspect"]}
+{"request": "what is my public ip", "expected": ["public_ip"]}
+{"request": "network status", "expected": ["network_status"]}
+{"request": "system specs", "expected": ["system_spec_info"]}
+{"request": "system uptime", "expected": ["system_uptime"]}
+{"request": "turn on night light", "expected": ["night_light"]}
+{"request": "keep window always on top", "expected": ["always_on_top"]}
+{"request": "find large files", "expected": ["find_large_files"]}
+{"request": "close folder window", "expected": ["close_folder_window"]}
+{"request": "system performance", "expected": ["system_performance"]}
+{"request": "countdown 5 minutes", "expected": ["countdown_timer"]}
+{"request": "bluetooth settings", "expected": ["bluetooth_settings"]}
+{"request": "open settings page", "expected": ["open_settings_page"]}

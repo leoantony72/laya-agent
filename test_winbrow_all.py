@@ -64,8 +64,9 @@ class TestWinBrowRegistryAndRouter(unittest.TestCase):
     # -- registry ----------------------------------------------------
     def test_registered_tools_count(self):
         tools = self.registry.all_tools()
-        print(f"Total registered tools: {len(tools)}")
-        self.assertEqual(len(tools), 42)
+        seed = sum(1 for t in tools if not getattr(t, "is_learned", False))
+        print(f"Total registered tools: {len(tools)} (seed={seed}, learned={len(tools) - seed})")
+        self.assertEqual(seed, 44)
 
     def test_open_file_tool_exists(self):
         tool = self.registry.get("open_file")
