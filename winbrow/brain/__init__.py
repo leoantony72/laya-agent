@@ -1,9 +1,10 @@
 """
 winbrow.brain — System 2 planning/execution package.
 
-  model_gateway — provider-agnostic LLM access (OpenRouter/DeepSeek default)
-  prompts       — planner/chat/normalizer prompt templates
-  agent_loop    — plan → execute → verify → recover loop
+  model_gateway  — provider-agnostic LLM access (OpenRouter/DeepSeek default)
+  prompt         — cached system blocks + planner/chat/normalizer templates
+  skill_registry — SKILL.md discovery, metadata, and on-demand bodies
+  agent_loop     — plan → execute → verify → recover loop
 """
 
 from .model_gateway import (

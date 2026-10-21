@@ -49,6 +49,7 @@ TOOL_TIERS: Dict[str, str] = {
     "screen_read_text": T0, "current_time": T0, "network_status": T0,
     "battery_health": T0, "clipboard_inspect": T0, "vscode_list_extensions": T0,
     "aftereffects_detect": T0, "take_screenshot": T0, "app_search": T0,
+    "read_document": T0,
     # T1 — reversible
     "computer_click": T1, "computer_click_text": T1, "computer_type": T1,
     "computer_key": T1, "computer_scroll": T1, "computer_paste": T1,

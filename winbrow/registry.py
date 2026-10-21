@@ -191,6 +191,18 @@ class ToolRegistry:
             tool.name = f"{tool.name}_custom"
         tool.is_learned = True
         self.register(tool)
+        # Progressive disclosure: persist a SKILL.md so the learned tool is
+        # discoverable on the next startup without editing prompt.py. Skip
+        # registries pointed at throwaway files (tests) so they never write
+        # into the installed skills folder.
+        try:
+            if self.learned_path.resolve() == LEARNED_TOOLS_PATH.resolve():
+                from .brain.skill_registry import write_learned_skill
+                write_learned_skill(
+                    tool, os.environ.get("WINBROW_SKILLS_DIR") or None
+                )
+        except Exception as e:
+            log.debug(f"Could not write learned SKILL.md for '{tool.name}': {e}")
         self.learned_path.parent.mkdir(parents=True, exist_ok=True)
 
         existing = []

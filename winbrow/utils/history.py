@@ -8,12 +8,22 @@ recent stuck warnings so the loop can force a clarify instead of spinning.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 from urllib.parse import urlsplit
 
 FULL_WINDOW = 5
 OUTCOME_LIMIT = 120
 RECENT_OUTPUT_LIMIT = 400
+# Document text must survive the history window long enough for the planner to
+# summarize it. Normal tool output stays terse; document reads get a larger,
+# newest-first budget so a full read or a few chunks remain visible.
+DOCUMENT_READ_SKILLS = frozenset({
+    "read_document",
+    "mcp_filesystem_read_text_file",
+})
+DOCUMENT_STEP_LIMIT = 30_000
+DOCUMENT_TOTAL_BUDGET = 60_000
 
 
 def _skill_of(entry: Any) -> str:
@@ -32,6 +42,48 @@ def _args_of(entry: Any) -> dict:
             return dict(step.get("args") or {})
         return dict(entry.get("args") or {})
     return dict(getattr(entry, "args", {}) or {})
+
+
+_ARG_VALUE_LIMIT = 160
+_ARG_TOTAL_LIMIT = 600
+_LARGE_TEXT_KEYS = frozenset({
+    "content", "text", "body", "data", "oldtext", "newtext",
+    "old_text", "new_text",
+})
+
+
+def _format_args(args: Dict[str, Any]) -> str:
+    """Keep history args readable without echoing whole file payloads."""
+    if not args:
+        return "{}"
+    parts: List[str] = []
+    for key, value in args.items():
+        name = str(key)
+        if isinstance(value, str):
+            if len(value) <= _ARG_VALUE_LIMIT:
+                parts.append(f"{name}={value!r}")
+            elif name.lower() in _LARGE_TEXT_KEYS:
+                parts.append(f"{name}=<{len(value)} chars>")
+            else:
+                parts.append(
+                    f"{name}={value[:_ARG_VALUE_LIMIT]!r}..."
+                    f"<{len(value)} chars>"
+                )
+        elif isinstance(value, (dict, list)):
+            try:
+                blob = json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                blob = str(value)
+            if len(blob) <= _ARG_VALUE_LIMIT:
+                parts.append(f"{name}={blob}")
+            else:
+                parts.append(f"{name}=<{len(blob)} chars JSON>")
+        else:
+            parts.append(f"{name}={value!r}")
+    text = ", ".join(parts)
+    if len(text) > _ARG_TOTAL_LIMIT:
+        text = text[:_ARG_TOTAL_LIMIT] + f"...<{len(text)} chars>"
+    return "{" + text + "}"
 
 
 def _output_of(entry: Any) -> str:
@@ -140,18 +192,33 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
     if older_count:
         lines.append(f"  --- last {full_window} steps in full ---")
 
-    for i, entry in enumerate(history[-full_window:], start=older_count):
+    recent = history[-full_window:]
+    limits = _recent_output_limits(recent)
+    for idx, entry in enumerate(recent):
+        i = older_count + idx
         warning = _warning_of(entry)
         warning_text = f"\n     ⚠ _warning: {warning}" if warning else ""
-        args = _args_of(entry)
+        args = _format_args(_args_of(entry))
         lines.append(
             f"  Step {i + 1}: {_skill_of(entry)}({args}) → "
             f"success={_success_of(entry)} "
-            f"output={_output_of(entry)[:RECENT_OUTPUT_LIMIT]}"
+            f"output={_output_of(entry)[:limits[idx]]}"
             f"{warning_text}"
         )
 
     return "\n".join(lines)
+
+
+def _recent_output_limits(recent: List[Any]) -> List[int]:
+    """Per-step output caps, giving document reads a newest-first budget."""
+    limits = [RECENT_OUTPUT_LIMIT] * len(recent)
+    remaining = DOCUMENT_TOTAL_BUDGET
+    for idx in range(len(recent) - 1, -1, -1):
+        if _skill_of(recent[idx]) not in DOCUMENT_READ_SKILLS or remaining <= 0:
+            continue
+        limits[idx] = min(DOCUMENT_STEP_LIMIT, remaining)
+        remaining -= limits[idx]
+    return limits
 
 
 def extract_tried_services(history: List[Any]) -> str:

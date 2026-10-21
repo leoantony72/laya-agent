@@ -4,7 +4,7 @@ uvicorn[standard]
 pyautogui
 mss>=9.0.0
 psutil
-Pillow>=10.0.0
+Pillow>=10.0.0,<13
 # OCR: pytesseract is the primary engine; Windows OCR is the fallback
 pytesseract>=0.3.13
 jinja2
@@ -15,3 +15,5 @@ comtypes
 sounddevice
 onnxruntime
 pyyaml
+# Document reading: PDF, PPTX, DOCX, XLSX/XLS, CSV, Markdown, HTML, JSON, EPUB
+markitdown[pdf,docx,pptx,xlsx,xls]>=0.1.5

@@ -53,7 +53,8 @@ PROTOCOL_VERSION = "2025-06-18"          # announced; the server's own choice wi
 DEFAULT_TIMEOUT_S = 30.0
 CONNECT_TIMEOUT_S = 25.0
 MAX_OUTPUT_CHARS = 32_000
-MAX_ARGS_JSON = 8_000                    # serialized args cap
+MAX_ARGS_JSON = 200_000                  # serialized args cap
+MAX_ARG_CHARS = 100_000                  # single arg cap (file contents)
 MAX_TOOLS_PER_SERVER = 64                # catalog cap
 
 # Cold-start flake healers: freshly-spawned stdio servers often fail their
@@ -614,8 +615,14 @@ class McpHub:
         if last_err is not None:
             return {"success": False, "output": last_err}
         if isinstance(res, dict) and res.get("isError"):
-            return {"success": False,
-                    "output": _extract_text(res) or "MCP tool reported an error"}
+            output = _extract_text(res) or "MCP tool reported an error"
+            if tool == "edit_file" and "exact match" in output.lower():
+                output += (
+                    "\nHINT: oldText must match the file byte-for-byte. "
+                    "For a whole-file rewrite, call mcp_filesystem_write_file "
+                    "once with the complete content instead."
+                )
+            return {"success": False, "output": output}
         return {"success": True,
                 "output": _extract_text(res) or "(empty result)"}
 
@@ -801,15 +808,39 @@ async def execute_mcp_tool(tool_name: str, tool, args: dict) -> dict:
 
 # --------------------------------------------------------------------------- payload helpers
 def _clamp_args(args: dict) -> dict:
-    """Round-trip every value through JSON with a per-arg and total cap."""
+    """Bound MCP args without corrupting file contents or structured values.
+
+    The old implementation truncated every serialized value at 4,000 chars and
+    then ``json.loads`` the result. That silently cut write_file content to
+    4,000 chars and made edit_file's ``edits`` array invalid JSON. Reject
+    oversized values with a clear error instead.
+    """
     out: Dict[str, Any] = {}
     for k, v in (args or {}).items():
-        blob = v if isinstance(v, str) else json.dumps(v)
-        if len(blob) > 4000:
-            blob = blob[:4000]
-        out[str(k)] = blob if isinstance(v, str) else json.loads(blob)
-    if len(json.dumps(out)) > MAX_ARGS_JSON:
-        raise ValueError("MCP arguments too large")
+        key = str(k)
+        if isinstance(v, str):
+            if len(v) > MAX_ARG_CHARS:
+                raise ValueError(
+                    f"argument '{key}' is too large ({len(v)} chars; "
+                    f"max {MAX_ARG_CHARS}). Split the file or write a smaller chunk."
+                )
+            out[key] = v
+            continue
+        try:
+            blob = json.dumps(v, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"argument '{key}' is not JSON-serializable: {exc}") from exc
+        if len(blob) > MAX_ARG_CHARS:
+            raise ValueError(
+                f"argument '{key}' is too large ({len(blob)} chars; "
+                f"max {MAX_ARG_CHARS}). Split the file or write a smaller chunk."
+            )
+        out[key] = v
+    if len(json.dumps(out, ensure_ascii=False)) > MAX_ARGS_JSON:
+        raise ValueError(
+            f"MCP arguments too large (max {MAX_ARGS_JSON} chars). "
+            "Write a smaller chunk."
+        )
     return out
 
 

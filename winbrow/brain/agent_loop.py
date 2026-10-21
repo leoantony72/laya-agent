@@ -34,6 +34,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlsplit
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -45,12 +46,17 @@ from .model_gateway import (
     ModelGateway,
     extract_json_object,
 )
-from . import prompts
-from ..computer import COMPUTER_IMPL
+from . import prompt as prompts
+from .skill_registry import (
+    SkillMeta,
+    build_skills_metadata,
+    build_tool_detail,
+    build_tool_index,
+    load_skill_body,
+    load_skill_registry,
+    resolve_skill_key,
+)
 from ..computer.tools import screen_read_text
-from ..adapters.manager import ADAPTER_IMPL
-from ..shell import SHELL_IMPL
-from ..browser_tools import BROWSER_IMPL
 from ..policy import PolicyError, validate_script_safety
 from ..registry import ArgSpec, Tool
 from ..utils.history import (
@@ -64,54 +70,26 @@ from ..utils.history import (
 
 log = logging.getLogger("winbrow.brain.loop")
 
+# Progressive-disclosure skills: metadata loads once at startup, full bodies
+# load only after the planner picks a skill. WINBROW_SKILLS_DIR overrides the
+# bundled folder for development/testing.
+SKILLS_DIR = os.environ.get("WINBROW_SKILLS_DIR") or str(
+    Path(__file__).resolve().parent.parent / "skills"
+)
+SKILL_REGISTRY: dict[str, SkillMeta] = load_skill_registry(SKILLS_DIR)
+SKILLS_METADATA: str = build_skills_metadata(SKILL_REGISTRY)
+
 # 10 was too tight for real multi-step work (find a file → open a site →
 # upload → verify). Env-tunable for latency-sensitive setups.
 MAX_STEPS_DEFAULT = int(os.environ.get("WINBROW_MAX_STEPS", "20"))
 # Warn the planner when the action budget is nearly exhausted so it can finish
 # or ask the user instead of silently hitting the hard stop.
 STEP_WARN_REMAINING = max(1, int(os.environ.get("WINBROW_STEP_WARN", "5")))
+# Kept for callers/tests that used the old per-turn cap. The compact tool
+# index no longer needs a hard cap, but the name remains part of the API.
 MAX_PLANNER_TOOLS = 140
 # Backstop: one hung tool must never freeze the whole closed loop.
 STEP_TIMEOUT_S = float(os.environ.get("WINBROW_STEP_TIMEOUT", "120"))
-# The local Qwen brain runs with an 8192-token context. The planner prompt
-# must leave room for the reply (max_tokens), so tool descriptions are clipped
-# to one short line; arg names carry the actual calling contract.
-TOOL_DESC_LIMIT = 100
-META_DESC_LIMIT = 160
-
-# MCP skills-block ranking: the full catalog is 200+ tools but the planner
-# only sees MAX_PLANNER_TOOLS lines. Without intent ranking, niche servers
-# (arxiv/crossref) crowd out core ones (filesystem) and the planner concludes
-# "no skill can move a file". Servers are ranked by keyword intent.
-MCP_PRIORITY_PER_SERVER = 8          # max tools any one server contributes
-MCP_ALWAYS_SERVERS = ("wikipedia", "fetch", "dictionary", "open-meteo")
-_FILE_INTENT_WORDS = ("file", "folder", "directory", "directories", "move",
-                      "copy", "copies", "rename", "delete", "desktop",
-                      "documents", "downloads", "path")
-MCP_SERVER_KEYWORDS: Dict[str, tuple] = {
-    "filesystem": _FILE_INTENT_WORDS,
-    "wikipedia": ("wiki", "wikipedia", "tell me about"),
-    "dictionary": ("define", "definition", "meaning", "dictionary", "spell"),
-    "fetch": ("url", "link", "webpage", "website", "http"),
-    "open-meteo": ("weather", "forecast", "temperature", "rain", "wind"),
-    "arxiv": ("arxiv", "paper"),
-    "crossref": ("citation", "doi", "journal", "paper"),
-    "open-library": ("book", "author", "isbn"),
-    "nominatim": ("map", "location", "address", "coordinates"),
-    "rest-countries": ("country", "countries", "capital", "population"),
-    "frankfurter": ("currency", "exchange rate", "exchange", "convert money"),
-    "usgs-earthquake": ("earthquake", "seismic"),
-    "hacker-news": ("hacker news",),
-    "github-public": ("github",),
-    "mdn-compat": ("mdn", "browser compatibility"),
-    "gdelt-news": ("news", "headlines"),
-    "reddit": ("reddit",),
-    "git": ("git", "commit", "branch", "repository", "repo"),
-    "time": ("time", "date", "clock", "timezone", "today", "tomorrow", "yesterday"),
-    "memory": ("remember", "memory", "knowledge graph"),
-    "pdf": ("pdf",),
-    "sequential-thinking": ("reason", "analyze", "think step"),
-}
 
 # Meta-skills the brain can call that are not registry tools.
 # Implemented in-process against the memory store.
@@ -334,15 +312,6 @@ def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
     return ""
 
 
-def _one_line(text: str, limit: int) -> str:
-    """Collapse whitespace and clip to a token budget at a word boundary."""
-    text = re.sub(r"\s+", " ", (text or "").strip())
-    if len(text) <= limit:
-        return text
-    cut = text[:limit].rstrip()
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut + "…"
 
 
 @dataclass
@@ -445,67 +414,51 @@ class AgentBrain:
         # Optional interactive pause: receives a clarify question and returns
         # the user's answer. Without it, clarify is surfaced as needs_input.
         self.ask_user_fn = ask_user_fn
+        # Load after .env so WINBROW_SKILLS_DIR is honored even when the
+        # server imports this module before loading environment variables.
+        self.skills_dir = os.environ.get("WINBROW_SKILLS_DIR") or SKILLS_DIR
+        self.skill_registry: dict[str, SkillMeta] = load_skill_registry(
+            self.skills_dir
+        )
+        self.skills_metadata = build_skills_metadata(self.skill_registry)
+        self._tool_index = ""
+        self._tool_index_key: tuple = ()
 
-    # ------------------------------------------------------------------ skills block
+    # ------------------------------------------------------------------ tool index
+    def _registry_tools(self, ctx: Any) -> list:
+        """Every registered tool, including ones scoped to an inactive app."""
+        all_tools = getattr(self.registry, "all_tools", None)
+        if callable(all_tools):
+            try:
+                return list(all_tools())
+            except Exception:
+                pass
+        try:
+            return list(self.registry.available(ctx))
+        except Exception:
+            return []
+
+    def _tool_catalog(self, ctx: Any) -> str:
+        """Name-only index of non-skill tools, cached until the registry grows.
+
+        MCP, native and learned tools stay discoverable without paying their
+        full descriptions every turn. The chosen tool's schema is injected as
+        SKILL DETAIL on the next planning turn.
+        """
+        tools = self._registry_tools(ctx)
+        key = tuple(sorted(str(getattr(tool, "name", "")) for tool in tools))
+        if key != self._tool_index_key:
+            self._tool_index = build_tool_index(
+                tools, exclude=set(self.skill_registry)
+            )
+            self._tool_index_key = key
+        return self._tool_index
+
     def _skills_block(self, ctx: Any, utterance: str = "") -> str:
-        lines = []
-        available = self.registry.available(ctx)
-        u_low = (utterance or "").lower()
-
-        def _kw_hit(kw: str) -> bool:
-            if " " in kw:
-                return kw in u_low
-            return re.search(rf"\b{re.escape(kw)}(?:s|es)?\b", u_low) is not None
-
-        # Group tools by type
-        python_backed, mcp_priority, seeded = [], [], []
-        per_server: Dict[str, List] = {}
-        for t in available:
-            impl = getattr(t, "impl", None)
-            if impl in (COMPUTER_IMPL, ADAPTER_IMPL, SHELL_IMPL, BROWSER_IMPL):
-                python_backed.append(t)
-            elif impl == "mcp":
-                script = getattr(t, "script", "") or ""
-                srv = script[len("mcp://"):].split("/", 1)[0] if script.startswith("mcp://") else ""
-                per_server.setdefault(srv, []).append(t)
-            else:
-                seeded.append(t)
-
-        # Intent-ranked MCP selection: relevant servers first (filesystem for
-        # file/folder verbs etc.), capped per server; the rest overflow to the
-        # general budget so nothing starves the tail of the catalog entirely.
-        mcp_other: List = []
-        for srv, tools in per_server.items():
-            srv_key = srv.replace("_", "-")
-            kws = MCP_SERVER_KEYWORDS.get(srv_key, ())
-            relevant = bool(kws) and any(_kw_hit(kw) for kw in kws)
-            if relevant or srv_key in MCP_ALWAYS_SERVERS:
-                # filesystem matches on file intent → show it whole (14 tools,
-                # they cover move/create/list/read/write which the planner needs)
-                keep = tools if (relevant and srv_key == "filesystem") \
-                    else tools[:MCP_PRIORITY_PER_SERVER]
-                mcp_priority.extend(keep)
-                mcp_other.extend(tools[len(keep):])
-            else:
-                mcp_other.extend(tools)
-
-        selected = list(python_backed) + list(mcp_priority)
-        remaining_budget = max(MAX_PLANNER_TOOLS - len(selected), 0)
-        selected.extend(seeded[:remaining_budget])
-        remaining_budget2 = max(MAX_PLANNER_TOOLS - len(selected), 0)
-        selected.extend(mcp_other[:remaining_budget2])
-
-        for t in selected:
-            args_desc = ", ".join(
-                f"{a.name}({a.kind})" for a in t.args
-            ) or "no args"
-            desc = _one_line(t.description, TOOL_DESC_LIMIT)
-            lines.append(f"- {t.name}({args_desc}): {desc}")
-        for name, meta in META_SKILLS.items():
-            args_desc = ", ".join(f"{k}(text)" for k in meta["args"])
-            desc = _one_line(meta["description"], META_DESC_LIMIT)
-            lines.append(f"- {name}({args_desc}): {desc}")
-        return "\n".join(lines)
+        """Legacy full name index (kept for older callers/tests)."""
+        return build_tool_index(
+            self._registry_tools(ctx), full_mcp_names=True
+        )
 
     # ------------------------------------------------------------------ main entry
     async def handle(
@@ -555,11 +508,17 @@ class AgentBrain:
         done_challenged = False
         clarify_rounds = 0
         step_budget = max_steps if max_steps is not None else self.max_steps
+        skill_detail: str = ""
 
         while len(result.steps) < step_budget:
-            # Rebuild every turn: build_tool/repair_tool register tools
-            # mid-task and the next decision must see them.
-            skills_block = self._skills_block(ctx, utterance)
+            # The tool index is rebuilt only when the registry grows (e.g. a
+            # build_tool step succeeds), so the cached system blocks stay
+            # byte-identical turn to turn.
+            tool_catalog = self._tool_catalog(ctx)
+            system_catalog = (
+                f"{self.skills_metadata}\n\n{tool_catalog}"
+                if tool_catalog else self.skills_metadata
+            )
             turn_memory = memory_block
             if coaching:
                 turn_memory += f"\nPLANNER FEEDBACK: {coaching}"
@@ -574,9 +533,11 @@ class AgentBrain:
                 )
             messages = prompts.build_loop_messages(
                 utterance, format_history(history), _ctx_block(ctx),
-                turn_memory, skills_block,
+                turn_memory, "",
                 tried_block=extract_tried_services(history),
                 steps_remaining=remaining,
+                skills_metadata=system_catalog,
+                skill_detail=skill_detail,
             )
             try:
                 plan = await self._ask_plan(messages, emit)
@@ -717,6 +678,19 @@ class AgentBrain:
                 return result
 
             log.info(f"brain step chosen: {steps[0].get('skill', '?')}")
+
+            # Progressive disclosure: the turn that CHOSE the skill had only
+            # metadata. Load the full body now so the NEXT planning turn sees
+            # SKILL DETAIL and can execute with complete instructions.
+            detail = inject_skill_detail(
+                plan, self.skill_registry, self.registry
+            )
+            if detail:
+                skill_detail = detail
+                log.info(
+                    f"skill detail loaded for '{steps[0].get('skill', '')}' "
+                    f"({len(detail)} chars)"
+                )
 
             if text:
                 last_plan_response = text
@@ -978,6 +952,7 @@ class AgentBrain:
             return round((time.perf_counter() - t0) * 1000, 1)
 
         try:
+            skill = resolve_skill_key(skill, self.skill_registry)
             if skill == "remember_fact":
                 fact = str(args.get("fact", "")).strip()
                 if fact:
@@ -1277,6 +1252,45 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
     if warnings:
         result["_warning"] = " ".join(warnings)
     return result
+
+
+def inject_skill_detail(
+    response: Any,
+    registry: dict[str, SkillMeta],
+    tool_registry: Any = None,
+) -> Optional[str]:
+    """Return the full body for the skill chosen in ``response``.
+
+    Handles both the dict plan produced by the loop and an object with a
+    ``step``/``steps`` attribute. Folder skills use their SKILL.md body;
+    MCP/native/learned tools get a synthesized schema from the registry.
+    Returns None when the response is not an action or the skill is unknown.
+    """
+    if isinstance(response, dict):
+        steps = _extract_steps(response)
+    else:
+        step = getattr(response, "step", None)
+        steps = [step] if isinstance(step, dict) and step.get("skill") else []
+        if not steps:
+            raw_steps = getattr(response, "steps", None)
+            if isinstance(raw_steps, list):
+                steps = [s for s in raw_steps if isinstance(s, dict) and s.get("skill")]
+    if not steps:
+        return None
+    skill = resolve_skill_key(str(steps[0].get("skill", "")), registry)
+    meta = registry.get(skill)
+    if meta is not None:
+        body = load_skill_body(meta)
+        if body:
+            return body
+    if tool_registry is not None:
+        try:
+            tool = tool_registry.get(skill)
+        except Exception:
+            tool = None
+        if tool is not None:
+            return build_tool_detail(tool)
+    return None
 
 
 def _step_signature(skill: str, args: dict) -> tuple:

@@ -19,6 +19,7 @@ os.environ["WINBROW_TTS"] = "0"
 os.environ["WINBROW_NORMALIZE"] = "0"
 
 from winbrow.mcp import (McpHub, McpServerSpec, McpConnection, MCP_IMPL,
+                         MAX_ARG_CHARS, MAX_ARGS_JSON,
                          _StdioTransport, _parse_sse, _clamp_args,
                          _coerce_schema_args,
                          _extract_text, _slug, _mcp_parse, execute_mcp_tool,
@@ -108,7 +109,12 @@ class TestStdioTransport(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         if cls.fake_path.exists():
-            cls.fake_path.unlink()
+            for _ in range(10):
+                try:
+                    cls.fake_path.unlink()
+                    break
+                except PermissionError:
+                    time.sleep(0.2)
 
     def test_handshake_list_and_call(self):
         tx = _StdioTransport("fake", [sys.executable, str(self.fake_path)])
@@ -166,12 +172,18 @@ class TestJsonHelpers(unittest.TestCase):
 
     def test_clamp_args(self):
         self.assertEqual(_clamp_args({"query": "hi"}), {"query": "hi"})
-        # a single giant string is TRUNCATED to 4000 chars, not fatal
+        # File content must not be silently truncated: write_file/edit_file
+        # depend on the exact text the planner sent.
         out = _clamp_args({"blob": "x" * 9000})
-        self.assertLessEqual(len(out["blob"]), 4000)
-        # total payload above the cap is fatal
+        self.assertEqual(len(out["blob"]), 9000)
+        edits = {"edits": [{"oldText": "a" * 5000, "newText": "b" * 5000}]}
+        self.assertEqual(_clamp_args(edits), edits)
+        # Oversized values are rejected clearly instead of becoming invalid JSON.
         with self.assertRaises(ValueError):
-            _clamp_args({f"a{i}": "y" * 3900 for i in range(4)})
+            _clamp_args({"blob": "x" * (MAX_ARG_CHARS + 1)})
+        with self.assertRaises(ValueError):
+            _clamp_args({f"a{i}": "y" * 70_000 for i in range(4)})
+        self.assertGreater(MAX_ARGS_JSON, 70_000)
 
     def test_extract_text(self):
         res = {"content": [{"type": "text", "text": "abc def"},

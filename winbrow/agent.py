@@ -37,6 +37,7 @@ from .adapters.manager import execute_adapter_tool
 from .installer import INSTALLER_IMPL, INSTALL_OPS, get_installer_tools
 from .mcp import MCP_IMPL, get_mcp_tools, execute_mcp_tool, get_mcp_hub
 from .shell import SHELL_IMPL, execute_shell_tool, get_shell_tools
+from .document_tools import DOCUMENT_IMPL, execute_document_tool, get_document_tools
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
@@ -282,7 +283,7 @@ class WinBrowAgent:
         # register Python-backed computer atoms + app adapter ops once
         for _t in (get_computer_tools() + get_adapter_tools()
                    + get_installer_tools() + get_shell_tools()
-                   + get_browser_tools()):
+                   + get_browser_tools() + get_document_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -471,6 +472,14 @@ class WinBrowAgent:
             out = await execute_shell_tool(tool_name, args)
             out.update({
                 "type": "shell",
+                "tool": tool_name,
+            })
+            return out
+        # document extraction (PDF/PPTX/DOCX/XLSX/CSV/Markdown/...)
+        if getattr(tool, "impl", None) == DOCUMENT_IMPL:
+            out = await asyncio.to_thread(execute_document_tool, tool_name, args)
+            out.update({
+                "type": "document",
                 "tool": tool_name,
             })
             return out

@@ -130,6 +130,11 @@ class GatewayResponse:
     elapsed_ms: float = 0.0
     reasoning: str = ""          # hidden chain-of-thought, when the provider returns it
     finish_reason: str = ""      # "stop" | "length" (truncated) | "tool_calls" | ...
+    usage: Dict[str, Any] = field(default_factory=dict)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
 
     @property
     def has_tool_calls(self) -> bool:
@@ -411,6 +416,45 @@ def extract_json_object(text: str) -> Optional[dict]:
     return None
 
 
+def _prompt_cache_enabled() -> bool:
+    """Prompt caching is on unless WINBROW_PROMPT_CACHE explicitly disables it."""
+    return os.environ.get("WINBROW_PROMPT_CACHE", "1").strip().lower() not in (
+        "0", "false", "off", "no",
+    )
+
+
+def _flatten_content(content: Any) -> Any:
+    """Turn Anthropic-style content blocks into one string for OpenAI/local."""
+    if isinstance(content, list):
+        parts = [
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict)
+        ]
+        return "\n\n".join(part for part in parts if part)
+    return content
+
+
+def _adapt_messages(
+    messages: List[Dict[str, Any]], provider: Provider,
+) -> List[Dict[str, Any]]:
+    """Keep two cached system blocks for OpenRouter; flatten elsewhere.
+
+    OpenRouter accepts Anthropic-style content blocks and forwards
+    ``cache_control`` to the upstream provider. OpenAI-compatible endpoints
+    (OpenAI, local llama.cpp) require a plain string system message, so the
+    blocks are flattened there and still preserve both text sections.
+    """
+    if not any(isinstance(message.get("content"), list) for message in messages):
+        return messages
+    if provider.name == "openrouter" and _prompt_cache_enabled():
+        return messages
+    return [
+        {**message, "content": _flatten_content(message.get("content"))}
+        for message in messages
+    ]
+
+
 class ModelGateway:
     """Chat interface with automatic provider fallback."""
 
@@ -665,6 +709,7 @@ class ModelGateway:
         reasoning: Optional[dict] = None,
     ) -> GatewayResponse:
         import asyncio
+        messages = _adapt_messages(messages, provider)
         payload: Dict[str, Any] = {
             "model": provider.model,
             "messages": messages,
@@ -744,12 +789,42 @@ class ModelGateway:
                     for d in details if isinstance(d, dict)
                 ).strip()
 
+        usage_raw = result.get("usage")
+        usage: Dict[str, Any] = usage_raw if isinstance(usage_raw, dict) else {}
+        input_tokens = int(
+            usage.get("input_tokens") or usage.get("prompt_tokens") or 0
+        )
+        output_tokens = int(
+            usage.get("output_tokens") or usage.get("completion_tokens") or 0
+        )
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+        cache_read = int(
+            usage.get("cache_read_input_tokens")
+            or usage.get("prompt_cache_hit_tokens")
+            or prompt_details.get("cached_tokens") or 0
+        )
+        cache_create = int(
+            usage.get("cache_creation_input_tokens")
+            or usage.get("prompt_cache_miss_tokens") or 0
+        )
         resp = GatewayResponse(
             content=msg.get("content") or "",
             provider=provider.name,
             model=result.get("model", provider.model),
             reasoning=str(reasoning or ""),
             finish_reason=str(choice.get("finish_reason") or ""),
+            usage=usage,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=cache_read,
+            cache_creation_input_tokens=cache_create,
+        )
+        log.info(
+            f"tokens — input: {input_tokens}, cache_read: {cache_read}, "
+            f"cache_create: {cache_create} "
+            f"(provider={provider.name}, output={output_tokens})"
         )
         for tc in msg.get("tool_calls") or []:
             try:
