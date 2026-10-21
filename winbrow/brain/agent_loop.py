@@ -17,6 +17,8 @@ steps instead of both steps being planned blind up front.
 
 Termination: done, clarify/chat, hard permission/policy stops, the same skill
 failing twice in a row, provider loss mid-task, or the max_steps action budget.
+Clarify pauses interactively when an ask_user_fn callback is wired; otherwise
+the question is returned with needs_input=True for the UI to ask.
 
 The gateway is optional: without any provider configured the brain raises
 GatewayUnavailable and the orchestrator falls back to the generator tier.
@@ -36,6 +38,7 @@ from urllib.parse import urlsplit
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from .model_gateway import (
+    PLANNER_CALL_CONFIG,
     GatewayError,
     GatewayResponse,
     GatewayUnavailable,
@@ -44,17 +47,29 @@ from .model_gateway import (
 )
 from . import prompts
 from ..computer import COMPUTER_IMPL
+from ..computer.tools import screen_read_text
 from ..adapters.manager import ADAPTER_IMPL
 from ..shell import SHELL_IMPL
 from ..browser_tools import BROWSER_IMPL
 from ..policy import PolicyError, validate_script_safety
 from ..registry import ArgSpec, Tool
+from ..utils.history import (
+    count_recent_stuck,
+    detect_stuck,
+    extract_tried_services,
+    format_history,
+    last_url,
+    tried_domains,
+)
 
 log = logging.getLogger("winbrow.brain.loop")
 
-# 6 was too tight for real multi-step work (create folder → open editor →
-# write file → run/verify). Env-tunable for latency-sensitive setups.
-MAX_STEPS_DEFAULT = int(os.environ.get("WINBROW_MAX_STEPS", "10"))
+# 10 was too tight for real multi-step work (find a file → open a site →
+# upload → verify). Env-tunable for latency-sensitive setups.
+MAX_STEPS_DEFAULT = int(os.environ.get("WINBROW_MAX_STEPS", "20"))
+# Warn the planner when the action budget is nearly exhausted so it can finish
+# or ask the user instead of silently hitting the hard stop.
+STEP_WARN_REMAINING = max(1, int(os.environ.get("WINBROW_STEP_WARN", "5")))
 MAX_PLANNER_TOOLS = 140
 # Backstop: one hung tool must never freeze the whole closed loop.
 STEP_TIMEOUT_S = float(os.environ.get("WINBROW_STEP_TIMEOUT", "120"))
@@ -131,6 +146,15 @@ META_SKILLS: dict[str, dict] = {
     },
 }
 
+# Computer skills with async implementations. The shared skill executor awaits
+# these callables instead of invoking the synchronous computer atom; OCR
+# captures screenshots and runs PowerShell, so it must stay off the event loop.
+COMPUTER_SKILL_DISPATCH: Dict[str, Callable[[dict], Awaitable[dict]]] = {
+    "screen_read_text": lambda args: screen_read_text(
+        region=args.get("region", "full")
+    ),
+}
+
 
 _ACTION_VERBS = (
     "open", "create", "make", "write", "save", "move", "copy", "rename",
@@ -149,6 +173,86 @@ def _looks_multi_part(utterance: str) -> bool:
         if re.search(rf"\b{v}(?:s|es|ed|ing)?\b", low)
     }
     return len(hits) >= 2
+
+
+_CLARIFY_ANSWER_RE = re.compile(
+    r"^\s*(?:option\s+|#)?(?:[1-9]\d?|first|second|third|fourth|fifth|"
+    r"the\s+(?:first|second|third|fourth|fifth)|yes|no|both|neither|"
+    r"that\s+one|this\s+one)\b",
+    re.I,
+)
+
+_OPTION_LINE_RE = re.compile(
+    r"^\s*(?:[-*•]|\(?[1-9]\d?[.)])\s+(.+?)\s*$"
+)
+
+
+def _option_key(value: str) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^\s*(?:[-*•]|\(?[1-9]\d?[.)])\s*", "", text)
+    return (text or str(value or "")).strip().casefold()
+
+
+def _extract_clarify_options(plan: dict, question: str = "") -> List[str]:
+    """Normalize explicit options, or recover them from a numbered question."""
+    options: List[str] = []
+    seen: set[str] = set()
+    raw = plan.get("options")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                item = item.get("value") or item.get("label") or item.get("text")
+            value = str(item or "").strip()
+            key = _option_key(value)
+            if value and key not in seen:
+                seen.add(key)
+                options.append(value)
+    if not options and question:
+        for line in str(question).splitlines():
+            match = _OPTION_LINE_RE.match(line)
+            if not match:
+                continue
+            value = match.group(1).strip()
+            key = _option_key(value)
+            if value and key not in seen:
+                seen.add(key)
+                options.append(value)
+    return options[:6]
+
+
+def _merge_clarify_answer(utterance: str, session: Any) -> str:
+    """Make a short/clicked answer self-contained by restoring its original goal."""
+    pending = getattr(session, "pending_clarification", None)
+    if not isinstance(pending, dict):
+        return utterance
+    text = (utterance or "").strip()
+    pending_options = [
+        str(option).strip() for option in (pending.get("options") or [])
+        if str(option).strip()
+    ]
+    clicked_option = any(
+        _option_key(text) == _option_key(option) for option in pending_options
+    )
+    if not _CLARIFY_ANSWER_RE.match(text) and not clicked_option:
+        return utterance
+    original = str(pending.get("goal") or "").strip()
+    question = str(pending.get("question") or "").strip()
+    if not original:
+        return utterance
+    merged = (
+        f"{original}\n"
+        f"User answered the earlier clarification with: {text}"
+        + (f"\nClarification question: {question}" if question else "")
+    )
+    if pending_options and any(
+        _option_key(option) not in question.casefold()
+        for option in pending_options
+    ):
+        merged += "\nOptions: " + " | ".join(
+            f"{index}) {option}"
+            for index, option in enumerate(pending_options, 1)
+        )
+    return merged
 
 
 _CODE_ARTIFACT_RE = re.compile(
@@ -195,6 +299,20 @@ def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
     ok_steps = [s for s in history if s.success]
     if not ok_steps:
         return ""
+    uploads = [i for i, s in enumerate(history)
+               if s.success and s.skill == "browser_upload_file"]
+    if uploads:
+        last_upload = uploads[-1]
+        verified = any(
+            s.success and s.skill in ("browser_wait", "browser_read_page")
+            for s in history[last_upload + 1:]
+        )
+        if not verified:
+            return (
+                "HISTORY shows browser_upload_file set the file, but no "
+                "browser_wait or browser_read_page followed it. Verify the "
+                "upload completed before emitting done."
+            )
     if _looks_multi_part(utterance) and len(ok_steps) == 1:
         return (
             "GOAL asks for several things, but HISTORY shows only one "
@@ -268,6 +386,9 @@ class BrainResult:
     pending: Optional[dict] = None
     complete: bool = False          # explicit done/chat after all goal parts
     evidence: dict = field(default_factory=dict)
+    needs_input: bool = False       # response is a question for the user
+    question: str = ""
+    options: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {
@@ -285,6 +406,12 @@ class BrainResult:
             d["pending"] = self.pending
         if self.evidence:
             d["evidence"] = self.evidence
+        if self.needs_input:
+            d["needs_input"] = True
+            d["question"] = self.question or self.response
+            d["status"] = "needs_input"
+            if self.options:
+                d["options"] = list(self.options)
         return d
 
 
@@ -297,15 +424,27 @@ class AgentBrain:
         registry: Any,                     # ToolRegistry
         store: Any,                        # MemoryStore
         executor: Callable[[str, dict], Awaitable[dict]],
-        max_steps: int = MAX_STEPS_DEFAULT,
+        max_steps: Optional[int] = None,
         tool_builder: Optional[Callable[[str, Any], Awaitable[dict]]] = None,
+        ask_user_fn: Optional[Callable[[str], Awaitable[str]]] = None,
     ):
         self.gateway = gateway
         self.registry = registry
         self.store = store
         self.executor = executor           # async (tool_name, args) -> execution dict
-        self.max_steps = max_steps
+        # Read the env at construction time: server.py imports the agent
+        # modules before it loads .env, so a module-level default would ignore
+        # WINBROW_MAX_STEPS. WinBrowAgent is constructed after the .env load.
+        self.max_steps = int(
+            max_steps if max_steps is not None
+            else os.environ.get("WINBROW_MAX_STEPS", str(MAX_STEPS_DEFAULT))
+        )
+        self.step_warn_remaining = max(1, int(
+            os.environ.get("WINBROW_STEP_WARN", str(STEP_WARN_REMAINING))))
         self.tool_builder = tool_builder   # async (task, ctx) -> build result | None
+        # Optional interactive pause: receives a clarify question and returns
+        # the user's answer. Without it, clarify is surfaced as needs_input.
+        self.ask_user_fn = ask_user_fn
 
     # ------------------------------------------------------------------ skills block
     def _skills_block(self, ctx: Any, utterance: str = "") -> str:
@@ -392,6 +531,7 @@ class AgentBrain:
         Raises GatewayUnavailable when no provider responds on the first call
         (the orchestrator then falls back to the generator tier).
         """
+        utterance = _merge_clarify_answer(utterance, session)
         memory_block = session.context_block()
         # enrich with episodic hits when the user asks about the past
         if any(w in utterance.lower() for w in ("yesterday", "earlier", "last time", "before", "history", "did i")):
@@ -413,6 +553,7 @@ class AgentBrain:
         coaching = ""
         repeats: Dict[tuple, int] = {}
         done_challenged = False
+        clarify_rounds = 0
         step_budget = max_steps if max_steps is not None else self.max_steps
 
         while len(result.steps) < step_budget:
@@ -423,9 +564,19 @@ class AgentBrain:
             if coaching:
                 turn_memory += f"\nPLANNER FEEDBACK: {coaching}"
                 coaching = ""
+            remaining = step_budget - len(result.steps)
+            if remaining <= self.step_warn_remaining:
+                turn_memory += (
+                    f"\nSTEP BUDGET WARNING: {remaining} action(s) remaining. "
+                    "If the task is nearly complete, finish it now. If you are "
+                    "stuck or missing information, emit clarify instead of "
+                    "retrying another search."
+                )
             messages = prompts.build_loop_messages(
-                utterance, _history_block(history), _ctx_block(ctx),
+                utterance, format_history(history), _ctx_block(ctx),
                 turn_memory, skills_block,
+                tried_block=extract_tried_services(history),
+                steps_remaining=remaining,
             )
             try:
                 plan = await self._ask_plan(messages, emit)
@@ -506,12 +657,39 @@ class AgentBrain:
                 return result
 
             if kind == "clarify":
-                # One utterance per turn: surface the question and let the
-                # user's next reply arrive as a new request (this turn is in
-                # session memory by then).
+                question = text or "Could you clarify what you want me to do?"
+                result.options = _extract_clarify_options(plan, question)
+                # Interactive pause: when a UI callback is wired, block this
+                # loop (not the event loop) until the user answers, then let
+                # the planner see the reply in HISTORY on the next turn.
+                if self.ask_user_fn is not None:
+                    try:
+                        answer = await self.ask_user_fn(question)
+                    except Exception as e:
+                        log.warning(f"ask_user callback failed ({e}); surfacing question.")
+                        answer = ""
+                    answer = str(answer or "").strip()
+                    if answer and clarify_rounds < 3:
+                        clarify_rounds += 1
+                        reply = BrainStepResult(
+                            "_user_reply", {"question": question}, True,
+                            f"User answered: {answer}",
+                        )
+                        history.append(reply)
+                        if emit:
+                            try:
+                                await emit({"type": "brain_step", "index": len(result.steps),
+                                            "total": len(result.steps), **reply.to_dict()})
+                            except Exception:
+                                pass
+                        continue
+                # No UI hooked up (or it timed out): surface the question and
+                # stop honestly. The user's next turn becomes a new request.
                 result.kind = "chat"
                 result.success = True
-                result.response = text or "Could you clarify what you want me to do?"
+                result.needs_input = True
+                result.question = question
+                result.response = question
                 return result
 
             if kind == "done":
@@ -569,12 +747,37 @@ class AgentBrain:
                         "it is in HISTORY. Do NOT repeat it. Emit the NEXT action needed, "
                         "or done only if every part of GOAL is complete."
                     )
+                    prior = next(
+                        (s for s in reversed(history)
+                         if s.success and _step_signature(s.skill, s.args) == sig),
+                        None,
+                    )
+                    if prior and prior.output:
+                        coaching = (
+                            f"'{skill}' with those exact arguments ALREADY SUCCEEDED. "
+                            f"Its result was: {prior.output[:300]} "
+                            "Do NOT repeat it; use this result and emit the NEXT action."
+                        )
                     log.info(f"Planner repeated completed step '{skill}'; re-planning with feedback.")
                     break
 
                 step_res = await self._run_step(skill, args, why, ctx=ctx)
                 result.steps.append(step_res)
                 history.append(step_res)
+                if detect_stuck(history):
+                    stuck = (
+                        "STUCK: You called the same skill twice and got identical "
+                        "output. The page has not changed. Do not call this skill "
+                        "again. Try a different approach or emit clarify."
+                    )
+                    step_res.warning = (
+                        f"{step_res.warning} {stuck}".strip()
+                        if step_res.warning else stuck
+                    )
+                    log.warning(
+                        f"Brain is stuck: '{skill}' returned identical output "
+                        f"on consecutive steps."
+                    )
                 log.info(
                     f"brain step result: {skill} success={step_res.success} "
                     f"output={step_res.output[:140]!r}"
@@ -598,6 +801,29 @@ class AgentBrain:
                     result.response = step_res.output
                     if step_res.pending:
                         result.pending = step_res.pending
+                    return result
+
+                # A warning alone does not stop a stubborn planner. After two
+                # stuck warnings in the recent window, stop spinning and ask
+                # the user instead of burning the remaining action budget.
+                recent_stuck = count_recent_stuck(history)
+                if recent_stuck >= 2:
+                    question = (
+                        f"I've been trying to complete '{utterance}' but I'm "
+                        f"going in circles. Here's where I am:\n"
+                        f"  Current page: {last_url(history)}\n"
+                        f"  Services tried: {', '.join(tried_domains(history)) or '(none)'}\n\n"
+                        f"How would you like me to proceed? Or can you do this "
+                        f"step manually and let me know when to continue?"
+                    )
+                    log.warning(
+                        f"Brain stuck {recent_stuck} times; forcing clarify."
+                    )
+                    result.kind = "chat"
+                    result.success = True
+                    result.needs_input = True
+                    result.question = question
+                    result.response = question
                     return result
 
                 if step_res.success:
@@ -672,10 +898,13 @@ class AgentBrain:
             resp = await self.gateway.chat(
                 messages,
                 json_schema=prompts.PLANNER_JSON_SCHEMA,
-                temperature=0.1 if attempt == 0 else 0.3,
-                # One step + a short rationale. 2500 tokens overflowed the
-                # local 8192-token context once HISTORY was added on turn 2.
-                max_tokens=1200,
+                # Some reasoning models ignore reasoning.max_tokens and spend
+                # most of max_tokens thinking. A 16k total budget leaves room
+                # for the JSON plan even after ~14k reasoning tokens. The local
+                # context guard clamps this when prompt + reply would exceed an
+                # 8192-token window.
+                temperature=PLANNER_CALL_CONFIG["temperature"],
+                max_tokens=PLANNER_CALL_CONFIG["max_tokens"],
             )
             plan = extract_json_object(resp.content)
             if plan:
@@ -721,11 +950,22 @@ class AgentBrain:
                         pass
                 return plan
             snippet = resp.content[:200].replace("\n", " ") if getattr(resp, "content", None) else "<empty>"
-            log.warning(f"Plan parse failed (attempt {attempt + 1}); retrying. Raw snippet: {snippet!r}")
-            messages = messages + [
-                {"role": "assistant", "content": resp.content[:500]},
-                {"role": "user", "content": "That was not valid JSON per the schema. Output ONLY the JSON object."},
-            ]
+            log.warning(
+                f"Plan parse failed (attempt {attempt + 1}); retrying. "
+                f"finish_reason={getattr(resp, 'finish_reason', '')!r} "
+                f"reasoning_len={len(getattr(resp, 'reasoning', '') or '')} "
+                f"Raw snippet: {snippet!r}"
+            )
+            retry_messages = list(messages)
+            # An empty assistant turn is not a useful correction and some
+            # providers reject it; only quote a real (malformed) reply.
+            if getattr(resp, "content", ""):
+                retry_messages.append(
+                    {"role": "assistant", "content": resp.content[:500]})
+            retry_messages.append(
+                {"role": "user",
+                 "content": "That was not valid JSON per the schema. Output ONLY the JSON object."})
+            messages = retry_messages
         # Last resort: surface as an unusable response, not a successful wrap-up.
         return {"kind": "chat", "_parse_failed": True,
                 "response": "I couldn't plan that. Try rephrasing."}
@@ -1011,6 +1251,20 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
                     "Verify this is the right page before proceeding."
                 )
 
+    if skill == "screen_read_text":
+        if result.get("success") and not str(result.get("text") or "").strip():
+            warnings.append(
+                "OCR succeeded but returned no text. The visible content "
+                "may be an image, a loading spinner, or an empty screen. "
+                "Try waiting and retrying, or use a different skill."
+            )
+        if not result.get("success"):
+            warnings.append(
+                "OCR failed. If this is a browser task, use "
+                "browser_read_page or browser_get_accessibility_tree "
+                "instead — OCR is not needed for browser content."
+            )
+
     if result.get("error"):
         warnings.append(f"This step failed: {result['error']}")
     elif result.get("success") is False:
@@ -1049,47 +1303,8 @@ def _extract_steps(plan: dict) -> List[dict]:
 
 
 def _history_block(history: List[BrainStepResult]) -> str:
-    """Compact, token-bounded rendering of every step taken so far.
-
-    This is the loop's working memory: values discovered by one step (file
-    paths, search results) are visible verbatim to every later decision.
-    """
-    if not history:
-        return "(none yet — this is the first action)"
-    shown = history[-10:]
-    latest_browser = max(
-        (i for i, s in enumerate(shown) if (s.skill or "").startswith("browser_")),
-        default=-1,
-    )
-    budget = 14_000
-    used = 0
-    lines: List[str] = []
-    if len(history) > len(shown):
-        lines.append(f"({len(history) - len(shown)} earlier steps omitted)")
-    for i, s in enumerate(shown, 1):
-        args = json.dumps(s.args or {}, ensure_ascii=False, default=str)
-        if len(args) > 240:
-            args = args[:237] + "..."
-        out = re.sub(r"\s+", " ", s.output or "").strip()
-        # Browser page dumps are the planner's primary evidence (repo names,
-        # stars, descriptions). Keep the latest page nearly verbatim, compress
-        # older pages, and cap the whole block so long research loops never
-        # crowd out the task and schema.
-        if (s.skill or "").startswith("browser_"):
-            out_limit = 3500 if i - 1 == latest_browser else 1000
-        else:
-            out_limit = 400
-        out_limit = max(200, min(out_limit, budget - used))
-        if len(out) > out_limit:
-            out = out[:out_limit - 3] + "..."
-        used += len(out)
-        status = "OK" if s.success else "FAILED"
-        lines.append(f"{i}. {s.skill}({args}) → {status}: {out}")
-        if s.warning:
-            warning = s.warning[:500]
-            used += len(warning)
-            lines.append(f"   _warning: {warning}")
-    return "\n".join(lines)
+    """Token-bounded history: old steps compressed, last 5 shown in detail."""
+    return format_history(history)
 
 
 def _ctx_block(ctx: Any) -> str:

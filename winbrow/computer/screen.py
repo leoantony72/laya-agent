@@ -74,7 +74,7 @@ _PS_OCR_SCRIPT = r"""
 param([string]$ImagePath, [string]$OutPath)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
-$null = [Windows.Data.Ocr.OcrEngine, Windows.Data.Ocr, ContentType=WindowsRuntime]
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime]
 $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType=WindowsRuntime]
 $null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType=WindowsRuntime]
 $null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType=WindowsRuntime]
@@ -91,10 +91,10 @@ function Await($WinRtTask, $ResultType) {
     $netTask.Result
 }
 
-$engine = [Windows.Data.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
 if (-not $engine) {
     # fall back to explicit English
-    $engine = [Windows.Data.Ocr.OcrEngine]::TryCreateFromLanguage(
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage(
         [Windows.Globalization.Language]::new('en-US'))
 }
 if (-not $engine) {
@@ -115,7 +115,7 @@ try {
         ([Windows.Graphics.Imaging.SoftwareBitmap])
 } finally { if ($stream) { $stream.Dispose() } }
 
-$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Data.Ocr.OcrResult])
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
 
 $logDenom = [Math]::Max([Math]::Max($bitmap.PixelWidth, $bitmap.PixelHeight), 1)
 $lines = @()
@@ -197,7 +197,7 @@ class Screen:
 
         Line rects are image coordinates OFFSETEBy the capture rect so they are
         directly usable for clicking."""
-        from ..windows import run_powershell
+        from ..windows import run_powershell_sync
         view = self.capture(rect)
         out_json = self.tmp_dir / f"ocr_{self._shot_id}.json"
         script = _PS_OCR_SCRIPT.replace(
@@ -208,7 +208,7 @@ class Screen:
             return {"available": False, "text": "", "lines": [],
                     "error": "OCR script template mismatch"}
         try:
-            res = run_powershell(script, timeout=60)
+            res = run_powershell_sync(script, timeout=60)
         except Exception as e:
             return {"available": False, "text": "", "lines": [], "error": str(e)}
         raw = out_json.read_text(encoding="utf-8", errors="replace") if out_json.exists() else ""

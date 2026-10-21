@@ -85,6 +85,15 @@ py -3 -m uvicorn server:app --host 127.0.0.1 --port 8765
 Navigate to:
 👉 **http://127.0.0.1:8765**
 
+### 3. Optional: OCR Setup (`screen_read_text`)
+
+OCR works out of the box on Windows 10/11 via the built-in Windows OCR API
+(the fallback engine). For better accuracy, install Tesseract:
+
+- Windows: <https://github.com/UB-Mannheim/tesseract/wiki>
+- Add Tesseract to PATH or set `pytesseract.pytesseract.tesseract_cmd`
+- If Tesseract is not installed, the Windows OCR API is used automatically.
+
 ---
 
 ## 📋 Example Commands

@@ -416,6 +416,8 @@ class TestBrowserTools(unittest.TestCase):
             self.navigated = []
             self.clicked = []
             self.typed = []
+            self.file_inputs = set()
+            self.uploads = []
 
         async def navigate_to(self, url, new_tab=False):
             self.navigated.append((url, new_tab))
@@ -448,6 +450,13 @@ class TestBrowserTools(unittest.TestCase):
             self.typed.append((selector, text))
             return {"success": True, "output": "typed"}
 
+        async def is_file_input(self, selector):
+            return selector in self.file_inputs
+
+        async def set_file_input(self, selector, path):
+            self.uploads.append((selector, path))
+            return {"success": True, "output": "uploaded"}
+
     def test_tools_registered_with_browser_impl(self):
         from winbrow.browser_tools import BROWSER_IMPL, get_browser_tools
         from winbrow.permissions import tool_tier
@@ -455,11 +464,14 @@ class TestBrowserTools(unittest.TestCase):
         tools = {t.name: t for t in get_browser_tools()}
         self.assertEqual(set(tools), {
             "browser_navigate", "browser_read_page",
-            "browser_interact", "browser_wait",
+            "browser_get_accessibility_tree",
+            "browser_interact", "browser_wait", "browser_upload_file",
         })
         self.assertTrue(all(t.impl == BROWSER_IMPL for t in tools.values()))
         self.assertEqual(tool_tier("browser_read_page"), "t0")
+        self.assertEqual(tool_tier("browser_get_accessibility_tree"), "t0")
         self.assertEqual(tool_tier("browser_interact"), "t1")
+        self.assertEqual(tool_tier("browser_upload_file"), "t1")
 
     def test_navigate_returns_page_state(self):
         from winbrow.browser_tools import execute_browser_tool
@@ -501,6 +513,19 @@ class TestBrowserTools(unittest.TestCase):
         self.assertTrue(typed["success"], typed)
         self.assertEqual(browser.typed, [("#search", "python")])
         self.assertEqual(typed["action"], "type")
+
+    def test_interact_selector_uploads_file(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        browser = self.FakeBrowser()
+        browser.file_inputs.add("#file")
+        path = r"D:\Docs\LDM seminar.pptx"
+        out = run(execute_browser_tool(
+            "browser_interact", {"selector": "#file", "value": path}, browser=browser))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(browser.uploads, [("#file", path)])
+        self.assertEqual(browser.typed, [])
+        self.assertEqual(out["action"], "upload")
 
     def test_wait_returns_state(self):
         from winbrow.browser_tools import execute_browser_tool

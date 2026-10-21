@@ -26,7 +26,7 @@ from typing import Any, Optional
 from .browser_task import BrowserController
 from .browser_tools import BROWSER_IMPL, execute_browser_tool, get_browser_tools
 from .brain import AgentBrain, GatewayUnavailable, ModelGateway
-from .brain.agent_loop import _ctx_block
+from .brain.agent_loop import COMPUTER_SKILL_DISPATCH, _ctx_block
 from .brain.model_gateway import extract_json_object
 from .brain.prompts import build_chat_messages
 from .memory.skills import MissingSkillParameters, parameterize_steps
@@ -276,6 +276,7 @@ class WinBrowAgent:
         registry: Optional[ToolRegistry] = None,
         session: Optional[SessionMemory] = None,
         store: Optional[MemoryStore] = None,
+        ask_user_fn: Optional[Any] = None,
     ):
         self.registry = registry or ToolRegistry()
         # register Python-backed computer atoms + app adapter ops once
@@ -302,12 +303,16 @@ class WinBrowAgent:
         self.session = session or get_session()
         self.gateway = gateway or ModelGateway()
         self.router = WinBrowRouter(self.registry, store=self.store)
+        # Optional UI/CLI callback: async (question) -> answer string. When
+        # absent, a clarify stops the loop and is surfaced as needs_input.
+        self.ask_user_fn = ask_user_fn
         self.brain = AgentBrain(
             gateway=self.gateway,
             registry=self.registry,
             store=self.store,
             executor=self.run_skill,
             tool_builder=self.build_new_tool,
+            ask_user_fn=self.ask_user_fn,
         )
 
     def get_context(self) -> WindowsContext:
@@ -325,6 +330,7 @@ class WinBrowAgent:
             store=self.store,
             executor=self.run_skill,
             tool_builder=self.build_new_tool,
+            ask_user_fn=self.ask_user_fn,
         )
 
     # ------------------------------------------------------------------ shared skill executor
@@ -437,7 +443,16 @@ class WinBrowAgent:
             }
         # v3/M1: Python-backed native computer atoms (no script template)
         if getattr(tool, "impl", None) == COMPUTER_IMPL:
-            out = execute_computer_tool(tool_name, args)
+            dispatch = COMPUTER_SKILL_DISPATCH.get(tool_name)
+            if dispatch is not None:
+                # Async atoms (OCR) run off the event loop via the brain's
+                # dispatcher. This branch is still behind the permission gate.
+                out = await dispatch(args)
+            elif tool_name == "screen_read_text":
+                # Safety net if the dispatcher entry is ever removed.
+                out = await asyncio.to_thread(execute_computer_tool, tool_name, args)
+            else:
+                out = execute_computer_tool(tool_name, args)
             out.update({
                 "type": "computer",
                 "tool": tool_name,

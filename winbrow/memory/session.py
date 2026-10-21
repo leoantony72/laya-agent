@@ -83,6 +83,8 @@ class SessionMemory:
         self.turns: List[Turn] = []
         # Per-kind entity stacks, most-recent-first
         self.entities: Dict[str, List[Entity]] = {"file": [], "folder": [], "app": [], "url": [], "query": []}
+        # A brain clarify question waiting for the user's next message.
+        self.pending_clarification: Optional[Dict[str, Any]] = None
         self.load()
 
     # ------------------------------------------------------------------ persistence
@@ -99,6 +101,9 @@ class SessionMemory:
             self.turns = [Turn(**t) for t in raw.get("turns", [])][-MAX_TURNS:]
             ents = raw.get("entities", {})
             self.entities = {k: [Entity(**e) for e in v] for k, v in ents.items()}
+            pending = raw.get("pending_clarification")
+            if isinstance(pending, dict):
+                self.pending_clarification = pending
         except Exception as e:
             log.debug(f"Session load failed (non-fatal): {e}")
 
@@ -116,6 +121,7 @@ class SessionMemory:
             sessions[self.session_id] = {
                 "turns": [t.to_dict() for t in self.turns],
                 "entities": {k: [e.to_dict() for e in v][:10] for k, v in self.entities.items()},
+                "pending_clarification": self.pending_clarification,
             }
             # keep only the 5 most recent sessions on disk
             if len(sessions) > 5:
@@ -129,6 +135,7 @@ class SessionMemory:
     def reset(self) -> None:
         self.turns = []
         self.entities = {k: [] for k in self.entities}
+        self.pending_clarification = None
         self.save()
 
     # ------------------------------------------------------------------ entity writes
@@ -188,6 +195,22 @@ class SessionMemory:
             output_snippet=str(execution.get("output", "")),
         ))
         self.turns = self.turns[-MAX_TURNS:]
+        if execution.get("needs_input"):
+            # Keep the original goal + question (and clickable options) so the
+            # next short answer can be resolved by the brain.
+            options = execution.get("options")
+            self.pending_clarification = {
+                "goal": utterance,
+                "question": str(
+                    execution.get("question") or execution.get("output") or ""
+                ).strip(),
+                "options": [
+                    str(option).strip() for option in (options or [])
+                    if str(option).strip()
+                ] if isinstance(options, list) else [],
+            }
+        else:
+            self.pending_clarification = None
         self.extract_entities(utterance, route, execution)
         self.save()
 
@@ -234,7 +257,34 @@ class SessionMemory:
             lines.append("Recent conversation:")
             for t in self.turns[-max_turns:]:
                 status = "ok" if t.success else "failed"
-                lines.append(f"  user: {t.utterance}  [{t.tool_name or t.route_kind} → {status}]")
+                line = f"  user: {t.utterance}  [{t.tool_name or t.route_kind} → {status}]"
+                snippet = re.sub(r"\s+", " ", t.output_snippet or "").strip()
+                if snippet:
+                    line += f" → {snippet[:180]}"
+                lines.append(line)
+        if self.pending_clarification:
+            goal = str(self.pending_clarification.get("goal") or "").strip()
+            question = str(self.pending_clarification.get("question") or "").strip()
+            options = [
+                str(option).strip()
+                for option in (self.pending_clarification.get("options") or [])
+                if str(option).strip()
+            ]
+            lines.append("Pending clarification:")
+            if goal:
+                lines.append(f"  Original goal: {goal}")
+            if question:
+                lines.append(f"  Question asked: {question}")
+            if options:
+                lines.append("  Options: " + " | ".join(
+                    f"{index}) {option}"
+                    for index, option in enumerate(options, 1)
+                ))
+            lines.append(
+                "  If the latest user message is a short answer, a clicked "
+                "option, or another choice, apply it to the Original goal and "
+                "continue from there. Do not restart discovery."
+            )
         ents = []
         for kind, stack in self.entities.items():
             for e in stack[:3]:

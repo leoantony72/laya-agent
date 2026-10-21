@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="color-scheme" content="light">
+    <meta name="color-scheme" content="dark">
     <title>WinBrow — Desktop &amp; Browser Control</title>
     <meta name="description" content="WinBrow: Windows-native desktop and browser control agent">
     <style>
@@ -446,6 +446,68 @@
         .btn-deny:hover { background: var(--err-bg); }
         .perm-remember { font-size: 11px; color: #8a5200; display: flex; align-items: center; gap: 4px; cursor: pointer; }
 
+        /* ── Clarify follow-up (options or free text) ── */
+        .clarify-box {
+            margin-top: 11px;
+            border: 1px solid var(--line);
+            background: #fff;
+            animation: rise 0.2s ease-out both;
+        }
+        .clarify-kicker {
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--line);
+            font-family: var(--mono); font-size: 9px; font-weight: 700;
+            letter-spacing: 0.1em; text-transform: uppercase;
+            color: var(--ink3);
+        }
+        .clarify-options { display: flex; flex-direction: column; }
+        .clarify-option {
+            display: flex; align-items: baseline; gap: 10px;
+            width: 100%; padding: 9px 12px;
+            border: none; border-bottom: 1px solid var(--line);
+            background: #fff; color: var(--ink);
+            font-family: var(--sans); font-size: 12.5px;
+            text-align: left; cursor: pointer;
+            transition: background 0.15s ease;
+        }
+        .clarify-option:last-child { border-bottom: none; }
+        .clarify-option:hover { background: var(--saffron-soft); }
+        .clarify-option:disabled { cursor: default; opacity: 0.55; }
+        .clarify-num {
+            flex: none; font-family: var(--mono); font-size: 9px;
+            font-weight: 700; color: var(--ink3);
+        }
+        .clarify-option-text { min-width: 0; overflow-wrap: anywhere; }
+        .clarify-input-row {
+            display: flex; align-items: center; gap: 8px;
+            padding: 9px 12px; border-top: 1px solid var(--line);
+        }
+        .clarify-input {
+            flex: 1; min-width: 0;
+            border: none; border-bottom: 1px solid var(--line);
+            background: transparent; padding: 6px 2px;
+            font-family: var(--serif); font-size: 14px;
+            color: var(--ink); outline: none;
+        }
+        .clarify-input:focus { border-bottom-color: var(--ink); }
+        .clarify-input::placeholder { color: var(--ink3); font-style: italic; }
+        .clarify-send {
+            flex: none; padding: 6px 12px;
+            border: 1px solid var(--ink); background: var(--ink); color: #fff;
+            font-family: var(--mono); font-size: 9.5px; font-weight: 600;
+            letter-spacing: 0.08em; text-transform: uppercase; cursor: pointer;
+        }
+        .clarify-send:hover { background: transparent; color: var(--ink); }
+        .clarify-send:disabled { opacity: 0.35; cursor: not-allowed; }
+        .clarify-answer {
+            padding: 8px 12px; border-top: 1px solid var(--line);
+            background: var(--line-soft); color: var(--ink2);
+            font-family: var(--mono); font-size: 10px;
+            overflow-wrap: anywhere;
+        }
+        .clarify-box.answered .clarify-options,
+        .clarify-box.answered .clarify-input-row { display: none; }
+
         .toast {
             position: fixed; bottom: 22px; right: 22px;
             background: var(--ink); color: #fff;
@@ -545,17 +607,425 @@
         @media (prefers-reduced-motion: reduce) {
             *, *::before, *::after { animation: none !important; transition: none !important; }
         }
+
+        /* ── Claude Code-inspired workspace theme ── */
+        :root {
+            --paper: #1a1917;
+            --ink: #ece9e2;
+            --ink2: #b6b0a4;
+            --ink3: #7f796e;
+            --line: #33302b;
+            --line-soft: #24221f;
+            --soft: #211f1c;
+            --surface: #211f1c;
+            --saffron: #d97757;
+            --saffron-dark: #e8a184;
+            --saffron-soft: #33231d;
+            --india-green: #8cc9a0;
+            --india-green-bg: #1e2d24;
+            --ashoka: #93baf5;
+            --ashoka-bg: #1c283a;
+            --maroon: #df9bb5;
+            --maroon-bg: #2f1f28;
+            --accent: var(--saffron);
+            --accent-dark: var(--saffron-dark);
+            --accent-soft: var(--saffron-soft);
+            --ok: var(--india-green);
+            --ok-bg: var(--india-green-bg);
+            --warn: #e0b15c;
+            --warn-bg: #2f2719;
+            --err: #e88b8b;
+            --err-bg: #341d1d;
+            --teal: #83c9c1;
+            --teal-bg: #1c2e2c;
+            --text-2: var(--ink2);
+            --text-3: var(--ink3);
+            --border: var(--line);
+            --serif: "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+            --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+            --mono: "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+        }
+
+        html { color-scheme: dark; }
+        body {
+            background: var(--paper);
+            color: var(--ink);
+            font-size: 13.5px;
+            line-height: 1.5;
+        }
+        #dottedSurface { display: none; }
+        ::selection { background: rgba(217, 119, 87, 0.28); color: #fff; }
+        ::-webkit-scrollbar-thumb { background: #3a362f; border-color: var(--paper); }
+        ::-webkit-scrollbar-thumb:hover { background: #4a453c; }
+        :is(button, .arch-card, #mcpLine, .tool-row, .mcp-card-head, .sug-body, summary):focus-visible {
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
+        }
+        .wrap { width: min(900px, 100% - 40px); }
+        @media (max-width: 480px) { .wrap { width: calc(100% - 28px); } }
+
+        .top {
+            background: rgba(26, 25, 23, 0.92);
+            border-bottom: 1px solid var(--line);
+            backdrop-filter: blur(14px);
+        }
+        .announce {
+            background: transparent;
+            color: var(--ink3);
+            border-bottom: 1px solid var(--line);
+            font-size: 9.5px;
+            padding: 6px 0;
+        }
+        .announce strong { color: var(--ink2); }
+        .announce #mcpLine { border-bottom-color: transparent; }
+        .announce #mcpLine:hover { color: var(--accent); border-bottom-color: var(--accent); }
+        .masthead { background: transparent; border-bottom: none; padding: 10px 0; }
+        .logo {
+            width: 24px; height: 24px;
+            background: var(--accent); color: #191816;
+            border-radius: 6px;
+            font-family: var(--mono); font-size: 12px; font-weight: 700;
+        }
+        .brand h1 { font-family: var(--sans); font-size: 15px; font-weight: 650; letter-spacing: -0.01em; }
+        .brand .ver {
+            font-size: 8.5px; color: var(--ink3);
+            border-color: var(--line); border-radius: 999px; padding: 1px 6px;
+        }
+        .status { font-size: 9.5px; }
+        .link-btn { font-size: 9.5px; color: var(--ink2); }
+        .link-btn:hover { color: var(--ink); border-bottom-color: var(--accent); }
+        .sep { color: var(--line); }
+
+        .hero { padding: 38px 0 10px; animation: rise 0.3s ease-out both; }
+        .hero-kicker {
+            text-align: left !important;
+            font-size: 9px; color: var(--ink3);
+            letter-spacing: 0.14em; margin-bottom: 10px;
+        }
+        .hero-kicker::before { width: 16px; background: var(--accent); margin-right: 8px; }
+        .hero h2 {
+            font-family: var(--sans);
+            font-size: clamp(24px, 4vw, 34px);
+            font-weight: 600; line-height: 1.15; letter-spacing: -0.025em;
+            text-align: left; margin-bottom: 8px;
+        }
+        .hero h2::before, .hero h2::after { content: none; }
+        .hero-sub {
+            text-align: left; font-size: 12.5px; color: var(--ink3);
+            max-width: 560px; margin: 0 0 22px;
+        }
+        .arch-bar { border-top: 1px solid var(--line); padding: 14px 0 9px; }
+        .arch-label { font-size: 8.5px; color: var(--ink3); }
+        .arch-nav { display: none; }
+        .archive {
+            display: flex; flex-wrap: wrap; gap: 6px;
+            overflow: visible; scroll-snap-type: none; padding: 0 0 8px;
+        }
+        .arch-card {
+            width: auto; flex: none;
+            display: flex; flex-direction: row; align-items: center; gap: 7px;
+            padding: 6px 10px;
+            border: 1px solid var(--line); border-radius: 999px;
+            background: var(--soft); text-align: left;
+        }
+        .arch-card:hover {
+            border-color: #4a453c; background: var(--line-soft);
+            transform: none; box-shadow: none;
+        }
+        .arch-year {
+            align-self: center; margin: 0; padding: 0;
+            border: none; background: none;
+            color: var(--ink3); font-size: 8px; letter-spacing: 0.08em;
+        }
+        .arch-card b {
+            font-family: var(--sans); font-size: 11.5px; font-weight: 500;
+            color: var(--ink2); margin: 0;
+        }
+        .arch-card:hover b { color: var(--ink); }
+        .arch-card .d, .arch-card .go { display: none; }
+
+        .trace-head { padding: 18px 0 8px; }
+        .trace-label { font-size: 8.5px; color: var(--ink3); letter-spacing: 0.14em; }
+        .trace-rule { background: var(--line); }
+        .trace-hint { font-size: 8.5px; color: var(--ink3); }
+        .trace { flex: 1; gap: 8px; padding-bottom: 24px; min-height: 22vh; }
+        .trace .empty { margin: auto; }
+        .entry {
+            padding: 13px 15px;
+            border: 1px solid var(--line); border-radius: 10px;
+            background: var(--soft);
+            animation: rise 0.2s ease-out both;
+        }
+        .entry:hover { border-color: #453f37; }
+        .entry-top { margin-bottom: 9px; align-items: center; }
+        .entry-cmd { font-family: var(--sans); font-size: 13.5px; font-weight: 600; color: var(--ink); }
+        .tag {
+            border-radius: 999px; font-size: 8.5px;
+            letter-spacing: 0.06em; padding: 2px 7px;
+        }
+        .tag.tool { color: var(--saffron-dark); border-color: #4a3128; background: var(--saffron-soft); }
+        .tag.learned { color: var(--maroon); border-color: #442d39; background: var(--maroon-bg); }
+        .tag.browser { color: var(--ashoka); border-color: #2d3c55; background: var(--ashoka-bg); }
+        .tag.chat { color: var(--ok); border-color: #2a3f31; background: var(--ok-bg); }
+        .tag.error { color: var(--err); border-color: #4a2a2a; background: var(--err-bg); }
+        .tag.mcp { color: var(--teal); border-color: #2c4441; background: var(--teal-bg); }
+        .output {
+            border: 1px solid var(--line); border-left: 1px solid var(--line);
+            border-radius: 8px; background: var(--paper);
+            padding: 10px 12px;
+            color: var(--ink2);
+            font-family: var(--mono); font-size: 11.5px; line-height: 1.6;
+            overflow-wrap: anywhere;
+        }
+        .output.error { border-color: #4a2a2a; background: var(--err-bg); color: var(--err); }
+        .script-toggle { color: var(--ink3); border-bottom: none; font-size: 8.5px; margin-top: 8px; }
+        .script-toggle:hover { color: var(--ink); }
+        .script-body {
+            background: var(--paper); border-color: var(--line);
+            border-radius: 8px; color: var(--ink2); font-size: 10.5px;
+        }
+        .entry-meta { color: var(--ink3); font-size: 9px; margin-top: 9px; }
+        .routing {
+            background: var(--soft); border: 1px solid var(--line); border-radius: 10px;
+            padding: 12px 14px; color: var(--ink2);
+            font-family: var(--sans); font-style: normal; font-size: 12.5px;
+        }
+        .routing strong { color: var(--ink); }
+        .spinner { border-color: var(--line); border-top-color: var(--accent); }
+        .empty { color: var(--ink3); }
+        .trace .empty { font-family: var(--sans); font-style: normal; font-size: 12.5px; }
+
+        .steps {
+            margin-top: 9px;
+            border: 1px solid var(--line); border-radius: 8px;
+            overflow: hidden; background: var(--paper);
+        }
+        .steps-head {
+            padding: 7px 10px; border-bottom: 1px solid var(--line);
+            font-family: var(--mono); font-size: 8.5px; font-weight: 700;
+            letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink3);
+        }
+        .step { border-bottom: 1px solid var(--line); }
+        .step:last-child { border-bottom: none; }
+        .step-row {
+            display: flex; align-items: center; gap: 8px;
+            padding: 7px 10px; cursor: pointer; list-style: none;
+        }
+        .step-row::-webkit-details-marker { display: none; }
+        .step-row:hover { background: var(--line-soft); }
+        .step-row::after {
+            content: "›"; flex: none;
+            font-family: var(--mono); font-size: 12px; color: var(--ink3);
+            transition: transform 0.15s ease;
+        }
+        .step[open] .step-row::after { transform: rotate(90deg); }
+        .step-mark { width: 12px; flex: none; font-family: var(--mono); font-size: 10px; }
+        .step-mark.ok { color: var(--ok); }
+        .step-mark.err { color: var(--err); }
+        .step-skill {
+            flex: none; max-width: 48%;
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            font-family: var(--mono); font-size: 10.5px;
+            font-weight: 600; color: var(--ink);
+        }
+        .step-args {
+            flex: 1; min-width: 0;
+            font-family: var(--mono); font-size: 9.5px; color: var(--ink3);
+            overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .step-ms { flex: none; font-family: var(--mono); font-size: 9px; color: var(--ink3); }
+        .step-warning {
+            padding: 7px 10px;
+            border-top: 1px solid #4a3b20;
+            background: var(--warn-bg); color: var(--warn);
+            font-size: 10.5px;
+        }
+        .step-output {
+            margin: 0; padding: 9px 10px;
+            border-top: 1px solid var(--line);
+            background: var(--soft);
+            font-family: var(--mono); font-size: 10.5px; line-height: 1.55;
+            color: var(--ink2); white-space: pre-wrap; overflow-wrap: anywhere;
+        }
+
+        .suggestions { margin-top: 0; }
+        .sug-panel {
+            background: var(--soft); border-color: var(--line);
+            border-radius: 10px 10px 0 0;
+        }
+        .suggestions h3 { color: var(--ink3); border-bottom-color: var(--line); }
+        .sug-item { border-bottom-color: var(--line); }
+        .sug-item:hover { background: var(--line-soft); }
+        .sug-icon {
+            background: var(--paper); border-color: var(--line);
+            border-radius: 7px; color: var(--accent-dark);
+        }
+        .sug-title { font-family: var(--sans); font-size: 12.5px; font-weight: 600; }
+        .sug-why { color: var(--ink3); }
+        .sug-dismiss:hover { color: var(--err); }
+
+        .dock {
+            background: linear-gradient(to top, var(--paper) 72%, rgba(26, 25, 23, 0));
+            border-top: none; padding: 12px 0 8px;
+        }
+        .cmd {
+            background: var(--soft); border: 1px solid var(--line);
+            border-radius: 12px; padding: 10px 12px;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.35);
+        }
+        .tribar { display: none; }
+        .cmd-row { align-items: center; gap: 9px; }
+        .cmd-prompt {
+            flex: none; padding-left: 2px;
+            font-family: var(--mono); font-size: 17px; line-height: 1;
+            color: var(--accent);
+        }
+        #cmdInput {
+            border-bottom: 1px solid transparent;
+            font-family: var(--mono); font-size: 13px;
+            padding: 8px 2px; color: var(--ink);
+        }
+        #cmdInput:focus { border-bottom-color: transparent; }
+        #cmdInput::placeholder { font-style: normal; color: var(--ink3); }
+        .btn-primary {
+            background: var(--accent); border-color: var(--accent); color: #191816;
+            border-radius: 7px; font-size: 9.5px; letter-spacing: 0.08em; padding: 9px 14px;
+        }
+        .btn-primary:hover { background: var(--accent-dark); color: #191816; }
+        .btn-primary:disabled { opacity: 0.4; }
+        .kbd { margin-left: 4px; font-size: 9px; opacity: 0.7; }
+        .btn-mic {
+            background: var(--paper); border-color: var(--line); color: var(--ink3);
+            width: 36px; height: 36px; border-radius: 7px;
+        }
+        .btn-mic:hover { color: var(--ink); border-color: #4a453c; }
+        .btn-mic.listening { color: var(--err); border-color: var(--err); }
+        .foot { color: var(--ink3); font-size: 8.5px; }
+        .foot::before, .foot::after { color: var(--line); }
+
+        .modal-bg { background: rgba(0, 0, 0, 0.6); backdrop-filter: blur(5px); }
+        .modal {
+            background: var(--soft); border-color: var(--line);
+            border-radius: 12px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+        }
+        .modal h2 { font-family: var(--sans); font-size: 16px; font-weight: 600; }
+        .modal .sub { color: var(--ink3); }
+        .field label { color: var(--ink3); font-size: 9px; }
+        .input {
+            background: var(--paper); border-color: var(--line);
+            border-radius: 7px; color: var(--ink); font-size: 12.5px;
+        }
+        .input:focus { border-color: var(--accent); }
+        .btn-cancel {
+            background: transparent; border-color: var(--line); color: var(--ink2);
+            border-radius: 7px;
+        }
+        .btn-cancel:hover { border-color: #4a453c; color: var(--ink); }
+        .btn-save {
+            background: var(--accent); border-color: var(--accent); color: #191816;
+            border-radius: 7px;
+        }
+        .btn-save:hover { background: var(--accent-dark); color: #191816; }
+
+        .perm-box {
+            background: var(--warn-bg); border-color: #4a3b20; border-radius: 8px;
+        }
+        .perm-title { color: var(--warn); }
+        .btn-approve {
+            background: var(--accent); border-color: var(--accent); color: #191816;
+            border-radius: 6px;
+        }
+        .btn-approve:hover { background: transparent; color: var(--accent-dark); }
+        .btn-deny {
+            background: transparent; border-color: #4a2a2a; color: var(--err);
+            border-radius: 6px;
+        }
+        .btn-deny:hover { background: var(--err-bg); }
+        .perm-remember { color: var(--ink2); }
+
+        .clarify-box {
+            background: var(--paper); border-color: var(--line);
+            border-radius: 8px; overflow: hidden;
+        }
+        .clarify-kicker { color: var(--ink3); border-bottom-color: var(--line); }
+        .clarify-option {
+            background: var(--paper); border-bottom-color: var(--line);
+            color: var(--ink); font-size: 12px;
+        }
+        .clarify-option:hover { background: var(--accent-soft); }
+        .clarify-num { color: var(--ink3); }
+        .clarify-input-row { border-top-color: var(--line); }
+        .clarify-input {
+            font-family: var(--mono); font-size: 12px;
+            border-bottom-color: var(--line); color: var(--ink);
+        }
+        .clarify-input:focus { border-bottom-color: var(--accent); }
+        .clarify-input::placeholder { color: var(--ink3); font-style: normal; }
+        .clarify-send {
+            background: var(--accent); border-color: var(--accent); color: #191816;
+            border-radius: 6px;
+        }
+        .clarify-send:hover { background: transparent; color: var(--accent-dark); }
+        .clarify-answer { background: var(--line-soft); color: var(--ink2); }
+
+        .toast {
+            background: var(--soft); color: var(--ink);
+            border: 1px solid var(--line); border-radius: 8px;
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.45);
+        }
+
+        .tools-panel {
+            background: var(--soft); border-color: var(--line);
+            border-radius: 12px; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.55);
+        }
+        .tools-head h2 { font-family: var(--sans); font-size: 16px; font-weight: 600; }
+        .tools-toolbar .input { background: var(--paper); }
+        .chip {
+            border-color: var(--line); color: var(--ink2); border-radius: 999px;
+        }
+        .chip:hover { background: var(--line); border-color: #4a453c; color: var(--ink); }
+        .chip:hover i { color: var(--ink3); }
+        .chip i { color: var(--ink3); }
+        .chip.is-active { background: var(--accent); border-color: var(--accent); color: #191816; }
+        .chip.is-active i { color: rgba(25, 24, 22, 0.6); }
+        .mcp-card { background: var(--paper); border-color: var(--line); border-radius: 8px; }
+        .mcp-card-head:hover { background: var(--line-soft); }
+        .badge-dot { background: var(--line); }
+        .mcp-name { font-family: var(--sans); font-size: 12.5px; font-weight: 600; }
+        .mcp-sub { color: var(--ink3); }
+        .mcp-desc { color: var(--ink2); }
+        .mcp-card.open .mcp-desc { color: var(--ink2); }
+        .tool-row { border-bottom-color: var(--line); }
+        .tool-row:hover { background: var(--line-soft); }
+        .tool-name { color: var(--ink); }
+        .tool-desc { color: var(--ink2); }
+        .tool-detail {
+            background: var(--soft); border-color: var(--line);
+            border-radius: 7px; color: var(--ink2);
+        }
+        .tier.t0 { color: var(--ashoka); border-color: #2d3c55; background: var(--ashoka-bg); }
+        .tier.t1 { color: var(--ok); border-color: #2a3f31; background: var(--ok-bg); }
+        .tier.t2 { color: var(--warn); border-color: #4a3b20; background: var(--warn-bg); }
+        .tier.t3 { color: var(--err); border-color: #4a2a2a; background: var(--err-bg); }
+        .imp { background: var(--line-soft); color: var(--ink2); border-color: var(--line); }
+        .imp.mcp { background: var(--accent-soft); color: var(--accent-dark); border-color: #4a3128; }
+        .tools-foot { color: var(--ink3); border-top-color: var(--line); }
+
+        @media (max-width: 560px) {
+            .hero { padding-top: 28px; }
+            .hero h2 { font-size: 26px; }
+            .arch-card { width: auto; }
+            #cmdInput { font-size: 12.5px; }
+        }
     </style>
 </head>
 <body>
 
-<canvas id="dottedSurface" aria-hidden="true"></canvas>
-
 <div class="top">
     <div class="announce">
-        <div class="wrap announce-in" style="display:flex;align-items:center;justify-content:space-between;gap:14px;width:100%;">
+        <div class="wrap announce-in" style="display:flex;align-items:center;justify-content:space-between;gap:14px;">
             <span id="ctxLine">—</span>
-            <span id="mcpLine" title="Open the Tools browser" onclick="openTools()">🔌 MCP: …</span>
+            <span id="mcpLine" title="Open the Tools browser" onclick="openTools()">MCP: …</span>
         </div>
     </div>
     <div class="wrap">
@@ -579,11 +1049,11 @@
 <div class="container" style="display:flex;flex-direction:column;min-height:calc(100dvh - 64px);">
 
     <header class="hero wrap">
-        <p class="hero-kicker" style="text-align:center;">Hands-free control for Windows &amp; Chrome</p>
-        <h2>Run anything by <em id="rotWord">your voice.</em></h2>
-        <p class="hero-sub">Every command executes on this machine, the moment you send it. Nothing leaves your PC.</p>
+        <p class="hero-kicker">Local agent · Windows &amp; Chrome</p>
+        <h2>What should I run?</h2>
+        <p class="hero-sub">Send a command or start with a quick action. Everything executes on this machine.</p>
         <div class="arch-bar">
-            <span class="arch-label">Archive — quick runs</span>
+            <span class="arch-label">Quick actions</span>
             <div class="arch-nav">
                 <button id="archPrev" aria-label="Scroll back">‹</button>
                 <button id="archNext" aria-label="Scroll forward">›</button>
@@ -605,10 +1075,10 @@
     <div class="trace-head wrap">
         <span class="trace-label">Execution trace</span>
         <span class="trace-rule"></span>
-        <span class="trace-hint">Results land here, above the console</span>
+        <span class="trace-hint">Activity appears here</span>
     </div>
     <main class="trace wrap" id="feedList">
-        <div class="empty">No runs yet — the trace starts when you send your first command.</div>
+        <div class="empty">No runs yet. Send a command to begin.</div>
     </main>
 
     <div class="dock wrap">
@@ -619,12 +1089,18 @@
         <div class="cmd">
             <div class="tribar"></div>
             <div class="cmd-row">
-                <input type="text" id="cmdInput" placeholder="Say it. I run it. — e.g. set volume to max" autocomplete="off" spellcheck="false" />
-                <button class="btn-mic" id="micBtn" title="Voice input" aria-label="Voice input">●</button>
-                <button class="btn btn-primary" id="execBtn">Run ▸</button>
+                <span class="cmd-prompt" aria-hidden="true">›</span>
+                <input type="text" id="cmdInput" placeholder="Describe a task for this PC…" autocomplete="off" spellcheck="false" />
+                <button class="btn-mic" id="micBtn" title="Voice input" aria-label="Voice input">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+                        <rect x="9" y="2.5" width="6" height="12" rx="3"></rect>
+                        <path d="M5 10.5a7 7 0 0 0 14 0M12 17.5V21"></path>
+                    </svg>
+                </button>
+                <button class="btn btn-primary" id="execBtn">Run <span class="kbd">↵</span></button>
             </div>
         </div>
-        <footer class="foot">WinBrow runs commands locally on your PC</footer>
+        <footer class="foot">Commands execute locally · Enter to run</footer>
     </div>
 
 </div>
@@ -907,6 +1383,43 @@ function toggleRaw(el) {
     el.textContent = open ? 'Show raw JSON' : 'Hide raw JSON';
 }
 
+function stepArgSummary(args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) return '';
+    const parts = [];
+    Object.entries(args).forEach(([key, value]) => {
+        if (value == null || value === '') return;
+        let text = typeof value === 'string' ? value : JSON.stringify(value);
+        text = String(text).replace(/\s+/g, ' ').trim();
+        if (text.length > 90) text = text.slice(0, 89) + '…';
+        parts.push(`${key}=${text}`);
+    });
+    return parts.join(' · ');
+}
+
+function renderSteps(steps) {
+    if (!Array.isArray(steps) || !steps.length) return '';
+    const rows = steps.map(step => {
+        const ok = step.success !== false;
+        const args = stepArgSummary(step.args);
+        const warning = step.warning
+            ? `<div class="step-warning">${escHtml(step.warning)}</div>`
+            : '';
+        return `
+            <details class="step">
+                <summary class="step-row">
+                    <span class="step-mark ${ok ? 'ok' : 'err'}">${ok ? '✓' : '✕'}</span>
+                    <span class="step-skill">${escHtml(step.skill || 'step')}</span>
+                    <span class="step-args">${escHtml(args)}</span>
+                    <span class="step-ms">${Math.round(Number(step.elapsed_ms) || 0)} ms</span>
+                </summary>
+                ${warning}
+                <pre class="step-output">${escHtml(String(step.output || '').trim() || '(no output)')}</pre>
+            </details>
+        `;
+    }).join('');
+    return `<div class="steps"><div class="steps-head">Execution steps · ${steps.length}</div>${rows}</div>`;
+}
+
 function renderCard(data) {
     const route = data.route || {};
     const exec = data.execution || {};
@@ -920,6 +1433,10 @@ function renderCard(data) {
     const conf = route.confidence ? Math.round(route.confidence * 100) : 100;
     const hasScript = exec.script && exec.script.trim().length > 0;
     const friendly = friendlyJson(exec.output);
+    const needsInput = exec.needs_input === true || exec.status === 'needs_input';
+    const options = Array.isArray(exec.options)
+        ? exec.options.map(o => String(o || '').trim()).filter(Boolean).slice(0, 6)
+        : [];
 
     const card = document.createElement('div');
     card.className = 'entry';
@@ -930,7 +1447,7 @@ function renderCard(data) {
     if (pendingId) {
         permBoxHtml = `
             <div class="perm-box" id="perm-${pendingId}">
-                <div class="perm-title">⚠️ Action Requires Approval (${escHtml(exec.tool || 'Action')})</div>
+                <div class="perm-title">Action requires approval · ${escHtml(exec.tool || 'Action')}</div>
                 <div class="perm-btns">
                     <button class="btn-approve" onclick="resolvePermission('${pendingId}', true)">Approve & Run</button>
                     <button class="btn-deny" onclick="resolvePermission('${pendingId}', false)">Deny</button>
@@ -946,7 +1463,9 @@ function renderCard(data) {
             <span class="tag ${tagClass}">${tagLabel}</span>
         </div>
         <div class="output ${success ? '' : 'error'}">${friendly != null ? friendly : escHtml(exec.output || 'Done.')}</div>
+        ${renderSteps(exec.steps)}
         ${permBoxHtml}
+        ${needsInput ? '<div class="clarify-slot"></div>' : ''}
         ${friendly != null ? `<div class="script-toggle" onclick="toggleRaw(this)">Show raw JSON</div><pre class="script-body">${escHtml(String(exec.output || '').trim())}</pre>` : hasScript ? `<div class="script-toggle" onclick="toggleScript(this)">Show script</div><pre class="script-body">${escHtml(exec.script.trim())}</pre>` : ''}
         <div class="entry-meta">
             <span>${escHtml(toolName)} · ${conf}%</span>
@@ -954,11 +1473,99 @@ function renderCard(data) {
         </div>
     `;
 
+    if (needsInput) {
+        const slot = card.querySelector('.clarify-slot');
+        if (slot) slot.replaceWith(buildClarifyBox(options));
+    }
+
     const empty = feedList.querySelector('.empty');
     if (empty) empty.remove();
     feedList.appendChild(card);
     card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     while (feedList.children.length > 30) feedList.removeChild(feedList.firstChild);
+}
+
+function clarifyOptionLabel(value) {
+    return String(value).replace(/^\s*(?:[-*•]|\(?[1-9]\d?[.)])\s*/, '').trim() || String(value);
+}
+
+function buildClarifyBox(options) {
+    const box = document.createElement('div');
+    box.className = 'clarify-box';
+
+    const kicker = document.createElement('div');
+    kicker.className = 'clarify-kicker';
+    kicker.textContent = options.length ? 'Choose one or type your own answer' : 'Type your answer';
+    box.appendChild(kicker);
+
+    if (options.length) {
+        const wrap = document.createElement('div');
+        wrap.className = 'clarify-options';
+        options.forEach((option, index) => {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'clarify-option';
+            const num = document.createElement('span');
+            num.className = 'clarify-num';
+            num.textContent = String(index + 1).padStart(2, '0');
+            const label = document.createElement('span');
+            label.className = 'clarify-option-text';
+            label.textContent = clarifyOptionLabel(option);
+            btn.append(num, label);
+            btn.addEventListener('click', () => submitClarify(box, option));
+            wrap.appendChild(btn);
+        });
+        box.appendChild(wrap);
+    }
+
+    const row = document.createElement('div');
+    row.className = 'clarify-input-row';
+    const input = document.createElement('input');
+    input.className = 'clarify-input';
+    input.type = 'text';
+    input.placeholder = options.length ? 'Type a reply…' : 'Your answer…';
+    input.autocomplete = 'off';
+    const send = document.createElement('button');
+    send.type = 'button';
+    send.className = 'clarify-send';
+    send.textContent = 'Send';
+    const submit = () => {
+        const answer = input.value.trim();
+        if (answer) submitClarify(box, answer);
+    };
+    send.addEventListener('click', submit);
+    input.addEventListener('keydown', e => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            submit();
+        }
+    });
+    row.append(input, send);
+    box.appendChild(row);
+    setTimeout(() => {
+        if (!box.classList.contains('answered') && !isExecuting) {
+            try { input.focus({ preventScroll: true }); } catch (e) {}
+        }
+    }, 60);
+    return box;
+}
+
+function retireClarifyBox(box, answer) {
+    if (box.classList.contains('answered')) return;
+    box.classList.add('answered');
+    box.querySelectorAll('button, input').forEach(el => { el.disabled = true; });
+    const note = document.createElement('div');
+    note.className = 'clarify-answer';
+    note.textContent = answer ? 'You: ' + answer : 'Answered in a later message.';
+    box.appendChild(note);
+}
+
+function submitClarify(box, answer) {
+    if (isExecuting) return;
+    document.querySelectorAll('.clarify-box:not(.answered)').forEach(other => {
+        retireClarifyBox(other, other === box ? answer : '');
+    });
+    run(answer);
 }
 
 async function resolvePermission(id, approve) {
@@ -974,10 +1581,10 @@ async function resolvePermission(id, approve) {
         });
         const res = await resp.json();
         if (box) {
-            box.style.background = approve ? '#f6ffed' : '#fff1f0';
-            box.style.borderColor = approve ? '#b7eb8f' : '#ffa39e';
+            box.style.background = approve ? 'var(--ok-bg)' : 'var(--err-bg)';
+            box.style.borderColor = approve ? '#2a3f31' : '#4a2a2a';
             const outText = res.result?.execution?.output || (approve ? 'Action approved and executed.' : 'Action denied.');
-            box.innerHTML = `<span style="font-weight:600;color:${approve ? '#389e0d' : '#cf1322'}">${approve ? '✅ Approved & Executed' : '❌ Denied'}</span>: ${escHtml(outText)}`;
+            box.innerHTML = `<span style="font-weight:600;color:${approve ? 'var(--ok)' : 'var(--err)'}">${approve ? 'Approved & executed' : 'Denied'}</span>: ${escHtml(outText)}`;
         }
     } catch (e) {
         if (box) box.innerHTML = 'Error: ' + escHtml(e.message);

@@ -1605,6 +1605,56 @@ class BrowserController:
         result["method"] = "powershell_clipboard"
         return result
 
+    async def set_file_input(self, selector: str, path: str) -> dict[str, Any]:
+        """Set a file input's files via CDP (file pickers cannot be typed into)."""
+        backend, tabs = await self._tabs()
+        target = self._pick_tab(tabs) if tabs else None
+        if not target:
+            return {"success": False, "error": "CDP not available"}
+        try:
+            async with self._page_conn(target) as conn:
+                probe = await conn.call(
+                    "Runtime.evaluate",
+                    {"expression": f"document.querySelector({json.dumps(selector)})",
+                     "returnByValue": False},
+                    timeout=8,
+                )
+                obj = probe.get("result", {}).get("result", {})
+                object_id = obj.get("objectId")
+                if not object_id:
+                    return {"success": False, "error": f"Element not found: {selector}"}
+                set_resp = await conn.call(
+                    "DOM.setFileInputFiles",
+                    {"files": [path], "objectId": object_id},
+                    timeout=15,
+                )
+                if "error" in set_resp:
+                    return {"success": False, "error": str(set_resp["error"])}
+                with contextlib.suppress(Exception):
+                    await conn.call(
+                        "Runtime.callFunctionOn",
+                        {
+                            "objectId": object_id,
+                            "functionDeclaration": (
+                                "function(){ this.dispatchEvent(new Event('input',{bubbles:true})); "
+                                "this.dispatchEvent(new Event('change',{bubbles:true})); }"
+                            ),
+                        },
+                        timeout=5,
+                    )
+            return {"success": True, "output": f"Set file input to {path}",
+                    "path": path, "method": f"cdp_{backend}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def is_file_input(self, selector: str) -> bool:
+        """True when the selector points at an <input type="file">."""
+        result = await self.execute_js(
+            f"(() => {{ const el = document.querySelector({json.dumps(selector)}); "
+            f"return !!(el && el.type === 'file'); }})()"
+        )
+        return bool(result.get("success") and result.get("value"))
+
     async def fill_and_submit_form(self, fields: dict[str, str], submit_selector: str = "") -> dict[str, Any]:
         """Fill multiple form fields and optionally submit."""
         results = []

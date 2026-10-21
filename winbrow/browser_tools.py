@@ -1,13 +1,14 @@
 """
 Browser primitives for the System-2 browser loop
 ================================================
-`browser_navigate`, `browser_read_page`, `browser_interact` and `browser_wait`
-expose the browser as small, observable steps. The Brain planner can therefore
-navigate, inspect what actually rendered, and act on the result instead of
-asking the one-shot Laya engine to finish a whole research task in one call.
+`browser_navigate`, `browser_read_page`, `browser_interact`, `browser_wait`
+and `browser_upload_file` expose the browser as small, observable steps. The
+Brain planner can therefore navigate, inspect what actually rendered, and act
+on the result instead of asking the one-shot Laya engine to finish a whole
+research task in one call.
 
-All four tools return the current page state (title, URL, visible text and
-links) so later planning turns can consume values discovered earlier.
+All state-reading tools return the current page state (title, URL, visible text
+and links) so later planning turns can consume values discovered earlier.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -32,6 +34,60 @@ _MAX_STATE_CHARS = 9000
 _MAX_LINKS = 40
 _MAX_WAIT_S = 10.0
 _BROWSER_OP_TIMEOUT_S = 20.0
+
+_A11Y_JS = r"""
+(() => {
+  const out = [];
+  document.querySelectorAll('[data-winbrow-id]').forEach(
+    el => el.removeAttribute('data-winbrow-id'));
+  const implicitRole = {
+    a: 'link', button: 'button', input: 'textbox', textarea: 'textbox',
+    select: 'combobox', option: 'option', img: 'img', form: 'form',
+    nav: 'navigation', main: 'main', header: 'banner', footer: 'contentinfo'
+  };
+  const nodes = document.querySelectorAll(
+    'a[href], button, input, textarea, select, [role], [aria-label], ' +
+    '[onclick], [contenteditable="true"], summary, label'
+  );
+  let n = 0;
+  for (const el of nodes) {
+    if (n >= 160) break;
+    const tag = (el.tagName || '').toLowerCase();
+    const isInput = tag === 'input' || tag === 'textarea' || tag === 'select';
+    const isFile = tag === 'input' && (el.type || '').toLowerCase() === 'file';
+    const r = el.getBoundingClientRect();
+    const css = getComputedStyle(el);
+    if (!isFile && (r.width < 2 || r.height < 2)) continue;
+    if (!isFile && (css.visibility === 'hidden' || css.display === 'none')) continue;
+    const assocLabel = el.labels && el.labels.length
+      ? (el.labels[0].innerText || el.labels[0].textContent || '') : '';
+    const raw = el.getAttribute('aria-label') || el.getAttribute('title') ||
+                el.getAttribute('placeholder') || assocLabel ||
+                (isFile ? (el.getAttribute('name') || 'file input')
+                        : (isInput ? (el.value || '') : el.innerText)) || '';
+    const label = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
+    if (!label) continue;
+    const ref = 'w' + n;
+    el.setAttribute('data-winbrow-id', ref);
+    out.push({
+      ref: ref,
+      role: el.getAttribute('role') || implicitRole[tag] || tag,
+      label: label,
+      tag: tag,
+      type: el.getAttribute('type') || '',
+      href: el.getAttribute('href') || '',
+      disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
+      selector: '[data-winbrow-id="' + ref + '"]'
+    });
+    n++;
+  }
+  return {
+    title: document.title || '',
+    url: location.href || '',
+    elements: out
+  };
+})()
+"""
 
 _PAGE_STATE_JS = r"""
 (() => {
@@ -119,13 +175,63 @@ def get_browser_tools():
             ],
         ),
         Tool(
+            name="browser_get_accessibility_tree",
+            description=(
+                "List the CURRENT page's interactive elements (links, buttons, "
+                "inputs, labels) with roles, accessible names and CSS selectors. "
+                "Use this before browser_interact on an unfamiliar page: find "
+                "the upload button/input here, then pass its selector. This is "
+                "the browser alternative to screen_read_text/OCR."
+            ),
+            script="",
+            impl=BROWSER_IMPL,
+            args=[
+                ArgSpec(
+                    name="max_elements", kind="text",
+                    instructions="Maximum elements to return (20-160)",
+                    default="80",
+                ),
+            ],
+            speak="result",
+            examples=[
+                "show the buttons on this page",
+                "find the upload button",
+                "what can I click here",
+            ],
+        ),
+        Tool(
+            name="browser_upload_file",
+            description=(
+                "Set a file on the active page's file input via CDP "
+                "DOM.setFileInputFiles, bypassing the OS file picker dialog. "
+                "Call this AFTER clicking the button that opens file selection. "
+                "Use it for every upload (Aspose, Google Drive, OneDrive, any "
+                "site). Call browser_wait before reading the page."
+            ),
+            script="",
+            impl=BROWSER_IMPL,
+            args=[
+                ArgSpec(
+                    name="file_path", kind="text",
+                    instructions="Absolute path of the file to upload, e.g. C:\\Docs\\report.pptx",
+                ),
+            ],
+            speak="result",
+            examples=[
+                "upload the file",
+                "set the report on the file input",
+            ],
+        ),
+        Tool(
             name="browser_interact",
             description=(
                 "Perform ONE interaction on the current page: click a link or "
                 "button, type into a field, submit a search, or scroll. Prefer "
                 "passing a CSS selector and (for typing) a value when known; "
                 "otherwise give a natural-language instruction and Laya will "
-                "choose the element. Returns the resulting page state."
+                "choose the element. For file uploads, use browser_upload_file "
+                "after clicking the button that opens file selection. Returns "
+                "the resulting page state."
             ),
             script="",
             impl=BROWSER_IMPL,
@@ -142,7 +248,7 @@ def get_browser_tools():
                 ),
                 ArgSpec(
                     name="value", kind="text",
-                    instructions="Optional text to type into the selector",
+                    instructions="Text to type into the selected element",
                     default="",
                 ),
             ],
@@ -329,6 +435,111 @@ async def _read(browser: "BrowserController", args: dict) -> dict[str, Any]:
     return await _state_output(browser, url=url, max_chars=max_chars)
 
 
+_ACTION_PREFIX_RE = re.compile(
+    r"^\s*(?:click|press|tap|hit|open|select|choose|type|fill|enter|submit|"
+    r"upload|set)\s+(?:on\s+|the\s+|a\s+|an\s+)?", re.I)
+
+
+def _pick_element(instruction: str, elements: list) -> Optional[dict]:
+    """Match a natural-language instruction to a visible element by label.
+
+    Deterministic, no model call: 'click the Upload button' matches an element
+    whose accessible name is 'Upload'. Returns None when the match is weak so
+    the caller can fall back to the existing Laya decision path.
+    """
+    text = _ACTION_PREFIX_RE.sub("", instruction or "").strip().lower()
+    text = re.sub(r"\b(?:button|link|field|box|input|menu|item|tab)\b", "", text)
+    text = re.sub(r"[\"'“”]", "", text).strip()
+    if not text:
+        return None
+    tokens = {t for t in re.split(r"[^a-z0-9]+", text) if len(t) > 1}
+    best: Optional[dict] = None
+    best_score = 0.0
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(el.get("label") or "")).strip().lower()
+        if not label:
+            continue
+        if label in text:
+            score = 1.0
+        else:
+            label_tokens = {t for t in re.split(r"[^a-z0-9]+", label) if len(t) > 1}
+            if not label_tokens:
+                continue
+            overlap = len(tokens & label_tokens) / len(label_tokens)
+            score = overlap if overlap >= 0.6 else 0.0
+        if score > best_score:
+            best_score = score
+            best = el
+    return best if best_score >= 0.6 else None
+
+
+async def _accessibility_tree(browser: "BrowserController", args: dict) -> dict[str, Any]:
+    """DOM-derived interactive-element snapshot (no OCR, no screenshots)."""
+    max_elements = _int_arg(args, "max_elements", 80, 20, 160)
+    result = await browser.execute_js(_A11Y_JS)
+    if not result.get("success"):
+        return {
+            "success": False,
+            "output": f"Could not read the accessibility tree: {result.get('error') or 'CDP unavailable'}",
+        }
+    value = result.get("value")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = {}
+    if not isinstance(value, dict):
+        value = {}
+    elements = value.get("elements") or []
+    title = str(value.get("title") or "")
+    url = str(value.get("url") or "")
+    lines = [f"Title: {title or '(untitled)'}", f"URL: {url or '(unknown)'}", "",
+             "INTERACTIVE ELEMENTS:"]
+    shown = 0
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        if shown >= max_elements:
+            break
+        label = re.sub(r"\s+", " ", str(el.get("label") or "")).strip()
+        if not label:
+            continue
+        role = str(el.get("role") or el.get("tag") or "element")
+        selector = str(el.get("selector") or "")
+        extras = []
+        if el.get("type"):
+            extras.append(f"type={el['type']}")
+        if el.get("href"):
+            extras.append(f"href={str(el['href'])[:100]}")
+        if el.get("disabled"):
+            extras.append("disabled")
+        suffix = (" (" + ", ".join(extras) + ")") if extras else ""
+        lines.append(f"- {role} \"{label[:100]}\"{suffix} -> selector {selector}")
+        shown += 1
+    if shown == 0:
+        lines.append("(no interactive elements found)")
+    return {
+        "success": True,
+        "output": _clip("\n".join(lines), _MAX_STATE_CHARS),
+        "url": url,
+        "title": title,
+        "element_count": shown,
+    }
+
+
+async def _type_or_upload(browser: "BrowserController", selector: str,
+                          value: str) -> tuple[str, dict[str, Any]]:
+    """Type into a text field, or set files when the target is a file input."""
+    try:
+        if await browser.is_file_input(selector):
+            return "upload", await browser.set_file_input(selector, value)
+    except Exception as exc:
+        log.debug(f"File-input probe failed for {selector}: {exc}")
+    return "type", await browser.type_in_element(selector, value)
+
+
 async def _interact(browser: "BrowserController", args: dict) -> dict[str, Any]:
     instruction = str(args.get("instruction") or args.get("goal") or "").strip()
     selector = str(args.get("selector") or "").strip()
@@ -339,8 +550,7 @@ async def _interact(browser: "BrowserController", args: dict) -> dict[str, Any]:
     if selector:
         try:
             if value:
-                action = "type"
-                result = await browser.type_in_element(selector, value)
+                action, result = await _type_or_upload(browser, selector, value)
             else:
                 action = "click"
                 result = await browser.click_element(selector)
@@ -352,38 +562,77 @@ async def _interact(browser: "BrowserController", args: dict) -> dict[str, Any]:
                 "success": False,
                 "output": "browser_interact needs an instruction or a selector.",
             }
-        engine = LayaUltrafastEngine(browser)
+        # Search-before-act: try the DOM accessibility snapshot first. This
+        # turns "click Upload" into a selector deterministically, with no
+        # screenshot/OCR and no extra model call.
         try:
-            harvest = await engine.harvest_elements()
-            elements = harvest.get("elements") or []
-            if harvest.get("error") or not elements:
-                return {
-                    "success": False,
-                    "output": (
-                        "Could not find interactive elements on the current page"
-                        + (f": {harvest.get('error')}" if harvest.get("error") else ".")
-                    ),
-                }
-            step = await engine.decide_with_laya(
-                instruction, harvest.get("url", ""), harvest.get("title", ""), elements, [],
-            )
-            if step is None:
-                step = engine.make_typed_decision(
+            snap = await browser.execute_js(_A11Y_JS)
+            snap_value = snap.get("value")
+            if isinstance(snap_value, str):
+                try:
+                    snap_value = json.loads(snap_value)
+                except ValueError:
+                    snap_value = None
+            elements = (snap_value or {}).get("elements") or [] \
+                if isinstance(snap_value, dict) else []
+            match = None
+            if value and elements:
+                wants_file = not instruction or re.search(
+                    r"\b(?:upload|attach|choose|select|file)\b", instruction, re.I)
+                file_inputs = [
+                    el for el in elements
+                    if isinstance(el, dict)
+                    and str(el.get("type") or "").lower() == "file"
+                ]
+                if wants_file and file_inputs:
+                    match = file_inputs[0]
+            if match is None:
+                match = _pick_element(instruction, elements)
+            if match:
+                selector = str(match.get("selector") or "")
+                if selector:
+                    if value:
+                        action, result = await _type_or_upload(browser, selector, value)
+                    else:
+                        action = "click"
+                        result = await browser.click_element(selector)
+                    result.setdefault("output", f"{action} {match.get('label', '')!r}")
+        except Exception as exc:
+            log.debug(f"Accessibility interaction match failed: {exc}")
+
+        if not selector:
+            engine = LayaUltrafastEngine(browser)
+            try:
+                harvest = await engine.harvest_elements()
+                elements = harvest.get("elements") or []
+                if harvest.get("error") or not elements:
+                    return {
+                        "success": False,
+                        "output": (
+                            "Could not find interactive elements on the current page"
+                            + (f": {harvest.get('error')}" if harvest.get("error") else ".")
+                        ),
+                    }
+                step = await engine.decide_with_laya(
                     instruction, harvest.get("url", ""), harvest.get("title", ""), elements, [],
                 )
-            if step is None:
-                return {"success": False, "output": "No browser action could be chosen."}
-            action = step.action
-            if action == "finish":
-                state = await _state_output(browser)
-                state["output"] = (
-                    "No action was needed; the page already matches the instruction.\n\n"
-                    + state.get("output", "")
-                )
-                return state
-            result = await engine.execute_step(step)
-        except Exception as exc:
-            return {"success": False, "output": f"Browser interaction failed: {exc}"}
+                if step is None:
+                    step = engine.make_typed_decision(
+                        instruction, harvest.get("url", ""), harvest.get("title", ""), elements, [],
+                    )
+                if step is None:
+                    return {"success": False, "output": "No browser action could be chosen."}
+                action = step.action
+                if action == "finish":
+                    state = await _state_output(browser)
+                    state["output"] = (
+                        "No action was needed; the page already matches the instruction.\n\n"
+                        + state.get("output", "")
+                    )
+                    return state
+                result = await engine.execute_step(step)
+            except Exception as exc:
+                return {"success": False, "output": f"Browser interaction failed: {exc}"}
 
     await asyncio.sleep(0.6)
     state = await _state_output(browser)
@@ -410,6 +659,117 @@ async def _wait(browser: "BrowserController", args: dict) -> dict[str, Any]:
     return await _state_output(browser)
 
 
+# Google Drive upload sequence — the order matters:
+#   1. browser_navigate https://drive.google.com/drive/my-drive
+#   2. browser_interact "click the '+ New' button"
+#   3. browser_interact "click 'File upload' in the dropdown menu"
+#   4. browser_upload_file { "file_path": "..." }
+#      (DOM.setFileInputFiles sets the file after Chrome activates the hidden
+#      input when the upload menu item is clicked)
+#   5. browser_wait "upload progress bar disappears or file appears in Drive"
+#   6. browser_read_page to confirm the file is listed in Drive
+#
+# Drive keeps its <input type="file"> hidden until the upload menu item is
+# clicked. Typing a path into the input with browser_interact therefore fails
+# or targets nothing; the input must be activated first, then set over CDP.
+async def browser_upload_file(
+    file_path: str,
+    browser: Optional["BrowserController"] = None,
+) -> dict[str, Any]:
+    """Set a file on the page's active file input via CDP.
+
+    The OS file picker cannot be driven by CDP. DOM.setFileInputFiles writes
+    the selected file directly onto the input element (hidden inputs included),
+    which is the only reliable way to upload without the dialog.
+    """
+    path = str(file_path or "").strip().strip('"')
+    if not path or not os.path.isfile(path):
+        return {"success": False, "output": f"File not found: {file_path}"}
+    if browser is None:
+        return {"success": False, "output": "No browser controller available."}
+
+    try:
+        tabs_fn = getattr(browser, "_tabs", None)
+        pick_fn = getattr(browser, "_pick_tab", None)
+        conn_fn = getattr(browser, "_page_conn", None)
+        if not (callable(tabs_fn) and callable(pick_fn) and callable(conn_fn)):
+            result = await browser.set_file_input("input[type='file']", path)
+        else:
+            backend, tabs = await tabs_fn()
+            target = pick_fn(tabs) if tabs else None
+            if not target:
+                return {
+                    "success": False,
+                    "output": "CDP not available. Could not reach the browser.",
+                }
+            async with conn_fn(target) as conn:
+                document = await conn.call(
+                    "DOM.getDocument", {"depth": 1}, timeout=10,
+                )
+                if "error" in document:
+                    return {
+                        "success": False,
+                        "output": f"DOM.getDocument failed: {document['error']}",
+                    }
+                root_id = document.get("result", {}).get("root", {}).get("nodeId")
+                if not root_id:
+                    return {
+                        "success": False,
+                        "output": "DOM.getDocument returned no root node.",
+                    }
+
+                query = await conn.call(
+                    "DOM.querySelectorAll",
+                    {"nodeId": root_id, "selector": "input[type='file']"},
+                    timeout=10,
+                )
+                if "error" in query:
+                    return {
+                        "success": False,
+                        "output": f"DOM.querySelectorAll failed: {query['error']}",
+                    }
+                node_ids = query.get("result", {}).get("nodeIds") or []
+                if not node_ids:
+                    return {
+                        "success": False,
+                        "output": (
+                            "No file input found. Make sure you clicked the "
+                            "upload button first."
+                        ),
+                    }
+
+                set_result = await conn.call(
+                    "DOM.setFileInputFiles",
+                    {"nodeId": node_ids[0], "files": [path]},
+                    timeout=15,
+                )
+                if "error" in set_result:
+                    return {
+                        "success": False,
+                        "output": f"DOM.setFileInputFiles failed: {set_result['error']}",
+                    }
+            result = {"success": True, "method": f"cdp_{backend}"}
+
+        if not result.get("success", False):
+            return {
+                "success": False,
+                "output": str(
+                    result.get("error") or result.get("output") or "File upload failed."
+                ),
+            }
+        return {
+            "success": True,
+            "output": (
+                f"File set on the page's file input: {path}. "
+                "Call browser_wait before reading the page to confirm the upload."
+            ),
+            "path": path,
+            "method": result.get("method", "cdp_dom_set_file_input_files"),
+        }
+    except Exception as exc:
+        return {"success": False, "output": f"File upload failed: {exc}"}
+
+
 async def execute_browser_tool(tool_name: str, args: dict,
                                browser: Optional["BrowserController"] = None) -> dict[str, Any]:
     """Execute one browser primitive against the agent's BrowserController."""
@@ -419,10 +779,16 @@ async def execute_browser_tool(tool_name: str, args: dict,
         operation = _navigate(browser, args)
     elif tool_name == "browser_read_page":
         operation = _read(browser, args)
+    elif tool_name == "browser_get_accessibility_tree":
+        operation = _accessibility_tree(browser, args)
     elif tool_name == "browser_interact":
         operation = _interact(browser, args)
     elif tool_name == "browser_wait":
         operation = _wait(browser, args)
+    elif tool_name == "browser_upload_file":
+        operation = browser_upload_file(
+            str(args.get("file_path") or args.get("path") or ""), browser,
+        )
     else:
         return {"success": False, "output": f"Unknown browser op '{tool_name}'"}
 

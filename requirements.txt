@@ -2,9 +2,11 @@ laya
 fastapi[standard]
 uvicorn[standard]
 pyautogui
-mss
+mss>=9.0.0
 psutil
-Pillow
+Pillow>=10.0.0
+# OCR: pytesseract is the primary engine; Windows OCR is the fallback
+pytesseract>=0.3.13
 jinja2
 python-multipart
 # Optional but recommended (search/vector memory, UIA, voice, skills)

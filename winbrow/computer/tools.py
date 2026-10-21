@@ -14,6 +14,7 @@ Dispatch:     execute_computer_tool(name, args, ctx).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -158,25 +159,335 @@ def _wait_for_window(args: dict) -> dict:
     return res
 
 
-def _screen_read_text(args: dict) -> dict:
-    """OCR the foreground window (or screen) and return lines with rects."""
-    hwnd = args.get("hwnd") or foreground_hwnd()
-    win = None
-    for w in _get_driver().list_windows():
-        if w.hwnd == hwnd:
-            win = w
-            break
-    screen = _get_screen()
+_BROWSER_PROCESSES = {
+    "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+    "opera.exe", "vivaldi.exe",
+}
+_BROWSER_TITLE_HINTS = (
+    "google chrome", "microsoft edge", "mozilla firefox",
+    "brave", "opera", "vivaldi",
+)
+
+# Windows.Media.Ocr (WinRT) via PowerShell. The AsTask helper is required in
+# PowerShell 5.1 — WinRT async operations do not expose GetAwaiter() there.
+# Paths are substituted as single-quoted PowerShell literals; results are
+# written to a JSON file so console encoding cannot corrupt non-ASCII text.
+_WIN_OCR_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$ImagePath = '__IMAGE_PATH__'
+$OutPath = '__OUT_PATH__'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType=WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType=WindowsRuntime]
+$null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType=WindowsRuntime]
+$null = [Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType=WindowsRuntime]
+$null = [Windows.Globalization.Language, Windows.Foundation, ContentType=WindowsRuntime]
+
+$asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+})[0]
+function Await($WinRtTask, $ResultType) {
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+
+$engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+if (-not $engine) {
+    $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage(
+        [Windows.Globalization.Language]::new('en-US'))
+}
+if (-not $engine) {
+    @{ available = $false; reason = 'no OCR language pack'; text = '' } |
+        ConvertTo-Json -Compress | Set-Content -Path $OutPath -Encoding UTF8
+    exit 0
+}
+
+$bitmap = $null
+$stream = $null
+try {
+    $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($ImagePath)) `
+        ([Windows.Storage.StorageFile])
+    $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) `
+        ([Windows.Storage.Streams.IRandomAccessStream])
+    $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) `
+        ([Windows.Graphics.Imaging.BitmapDecoder])
+    $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) `
+        ([Windows.Graphics.Imaging.SoftwareBitmap])
+} finally { if ($stream) { $stream.Dispose() } }
+
+$result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+$lines = @()
+foreach ($line in $result.Lines) {
+    $lines += @{
+        text = $line.Text
+        rect = @([int]$line.BoundingRect.X, [int]$line.BoundingRect.Y,
+                 [int]$line.BoundingRect.Width, [int]$line.BoundingRect.Height)
+    }
+}
+@{
+    available = $true
+    text      = $result.Text
+    width     = [int]$bitmap.PixelWidth
+    height    = [int]$bitmap.PixelHeight
+    lines     = $lines
+} | ConvertTo-Json -Depth 4 -Compress | Set-Content -Path $OutPath -Encoding UTF8
+"""
+
+
+def _ps_quote(value: str) -> str:
+    """Escape a value as a PowerShell single-quoted literal."""
+    return str(value).replace("'", "''")
+
+
+def _window_bbox(hwnd: int) -> Optional[tuple]:
+    """(left, top, right, bottom) for a window, or None if unavailable."""
     try:
-        ocr = screen.ocr(screen.capture_window(win).rect if win else None)
+        for win in _get_driver().list_windows():
+            if win.hwnd == hwnd and not win.is_minimized:
+                l, t, r, b = win.rect
+                if r > l and b > t:
+                    return (l, t, r, b)
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        rect = wintypes.RECT()
+        if ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            if rect.right > rect.left and rect.bottom > rect.top:
+                return (rect.left, rect.top, rect.right, rect.bottom)
+    except Exception:
+        pass
+    return None
+
+
+def _active_window_bbox() -> Optional[tuple]:
+    hwnd = foreground_hwnd()
+    return _window_bbox(hwnd) if hwnd else None
+
+
+def _browser_bbox() -> Optional[tuple]:
+    """Largest visible browser window, falling back to the focused window."""
+    try:
+        windows = [
+            w for w in _get_driver().list_windows()
+            if not w.is_minimized
+            and w.rect[2] > w.rect[0] and w.rect[3] > w.rect[1]
+        ]
+    except Exception:
+        return _active_window_bbox()
+    candidates = [
+        w for w in windows
+        if (w.process_name or "").lower() in _BROWSER_PROCESSES
+        or any(h in (w.title or "").lower() for h in _BROWSER_TITLE_HINTS)
+    ]
+    if not candidates:
+        return _active_window_bbox()
+    win = max(
+        candidates,
+        key=lambda w: (w.rect[2] - w.rect[0]) * (w.rect[3] - w.rect[1]),
+    )
+    return win.rect
+
+
+def _capture_screenshot_sync(region: str) -> Optional[str]:
+    """Capture the screen/window to a temp PNG. Returns the path or None."""
+    import os
+    import tempfile
+
+    region = str(region or "full").strip().lower()
+    if region not in ("full", "active_window", "browser"):
+        region = "full"
+
+    fd, screenshot_path = tempfile.mkstemp(prefix="winbrow_ocr_", suffix=".png")
+    os.close(fd)
+
+    try:
+        if region == "full":
+            try:
+                import mss
+                with mss.mss() as sct:
+                    sct.shot(output=screenshot_path)
+                return screenshot_path
+            except Exception as e:
+                log.debug(f"mss capture failed ({e}); falling back to PIL")
+
+            from PIL import ImageGrab
+            ImageGrab.grab().save(screenshot_path)
+            return screenshot_path
+
+        bbox = _browser_bbox() if region == "browser" else _active_window_bbox()
+        if bbox is None:
+            raise RuntimeError("no capturable window found")
+
+        from PIL import ImageGrab
+        try:
+            img = ImageGrab.grab(bbox=bbox, all_screens=True)
+        except TypeError:
+            img = ImageGrab.grab(bbox=bbox)
+        img.save(screenshot_path)
+        return screenshot_path
     except Exception as e:
-        return {"success": False, "output": f"OCR failed: {e}"}
-    if not ocr.get("available"):
-        return {"success": False,
-                "output": f"OCR unavailable ({ocr.get('reason') or ocr.get('error', 'unknown')})"}
-    lines = ocr.get("lines", [])
-    return {"success": True, "text": ocr.get("text", ""), "lines": lines,
-            "output": f"Read {len(lines)} lines of text"}
+        log.debug(f"Screenshot capture failed for region '{region}': {e}")
+        try:
+            os.unlink(screenshot_path)
+        except OSError:
+            pass
+        return None
+
+
+def _windows_ocr_text(image_path: str) -> str:
+    """Run Windows.Media.Ocr in a PowerShell child process; return its text."""
+    import base64
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    fd, out_json = tempfile.mkstemp(prefix="winbrow_ocr_", suffix=".json")
+    os.close(fd)
+    try:
+        script = (
+            _WIN_OCR_SCRIPT
+            .replace("__IMAGE_PATH__", _ps_quote(image_path))
+            .replace("__OUT_PATH__", _ps_quote(out_json))
+        )
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        proc = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded,
+            ],
+            capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        raw = ""
+        try:
+            with open(out_json, "r", encoding="utf-8-sig", errors="replace") as f:
+                raw = f.read().strip()
+        except OSError:
+            pass
+        if not raw:
+            detail = (
+                (proc.stderr or b"").decode("utf-8", errors="replace")
+                or (proc.stdout or b"").decode("utf-8", errors="replace")
+            ).strip()
+            raise RuntimeError(
+                f"Windows OCR returned no output: {detail[:200] or 'unknown error'}"
+            )
+
+        data = json.loads(raw)
+        if not data.get("available"):
+            raise RuntimeError(data.get("reason") or "OCR unavailable")
+        return str(data.get("text") or "").strip()
+    finally:
+        try:
+            os.unlink(out_json)
+        except OSError:
+            pass
+
+
+def _ocr_output(text: str) -> str:
+    """Visible step output: the count plus the extracted text for the planner."""
+    return f"OCR extracted {len(text)} characters:\n{text[:4000]}"
+
+
+def _ocr_sync(region: str) -> dict:
+    """Synchronous OCR implementation. Runs in a thread executor."""
+    import os
+    import shutil
+
+    region = str(region or "full").strip().lower()
+    if region not in ("full", "active_window", "browser"):
+        region = "full"
+
+    screenshot_path = _capture_screenshot_sync(region)
+    if not screenshot_path:
+        return {"success": False, "output": "Screenshot capture failed",
+                "region": region}
+
+    try:
+        try:
+            import pytesseract
+            from PIL import Image
+
+            tesseract = shutil.which("tesseract")
+            if not tesseract:
+                for candidate in (
+                    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                    r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+                ):
+                    if os.path.isfile(candidate):
+                        tesseract = candidate
+                        break
+            if tesseract:
+                pytesseract.pytesseract.tesseract_cmd = tesseract
+
+            with Image.open(screenshot_path) as img:
+                text = pytesseract.image_to_string(img).strip()
+            return {
+                "success": True,
+                "text": text,
+                "output": _ocr_output(text),
+                "method": "pytesseract",
+                "region": region,
+            }
+        except ImportError:
+            pass
+        except Exception as e:
+            log.debug(f"pytesseract OCR failed ({e}); trying Windows OCR")
+
+        try:
+            text = _windows_ocr_text(screenshot_path)
+            if text:
+                return {
+                    "success": True,
+                    "text": text,
+                    "output": _ocr_output(text),
+                    "method": "windows_ocr",
+                    "region": region,
+                }
+            return {
+                "success": False,
+                "output": (
+                    "Windows OCR returned no text. The screen may be blank "
+                    "or the content unreadable."
+                ),
+                "region": region,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "output": f"All OCR methods failed: {str(e)}",
+                "region": region,
+            }
+    finally:
+        try:
+            os.unlink(screenshot_path)
+        except OSError:
+            pass
+
+
+async def screen_read_text(region: str = "full") -> dict:
+    """Capture the screen or a window and extract text via OCR.
+
+    region: "full" | "active_window" | "browser"
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _ocr_sync, region)
+    except Exception as e:
+        return {"success": False, "output": f"OCR failed: {str(e)}"}
+
+
+def _screen_read_text(args: dict) -> dict:
+    """Sync dispatcher entry for screen_read_text (runs off the event loop)."""
+    return _ocr_sync(str(args.get("region") or "full"))
 
 
 def _file_dialog_save(args: dict) -> dict:
@@ -312,10 +623,27 @@ def get_computer_tools():
         ),
         Tool(
             name="screen_read_text",
-            description="Read the screen/window with OCR and return line texts with click coordinates.",
+            description=(
+                "Capture the screen or a window and extract text via OCR. Use only "
+                "for native desktop apps with no DOM/API; prefer browser_read_page "
+                "for browser content."
+            ),
             script="",
             impl=COMPUTER_IMPL,
-            examples=["what does the dialog say", "read the popup"],
+            args=[ArgSpec(
+                name="region", kind="enum",
+                instructions="What to capture for OCR",
+                criteria={
+                    "full": "entire screen",
+                    "active_window": "currently focused window",
+                    "browser": "browser window specifically",
+                },
+                default="full",
+            )],
+            examples=[
+                "what does the dialog say", "read the popup",
+                "read the active window", "read the screen",
+            ],
         ),
         Tool(
             name="file_dialog_save",

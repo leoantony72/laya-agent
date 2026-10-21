@@ -51,6 +51,27 @@ OPENROUTER_ALLOW_FALLBACKS = os.environ.get("WINBROW_OPENROUTER_ALLOW_FALLBACKS"
 
 REQUEST_TIMEOUT_S = float(os.environ.get("WINBROW_BRAIN_TIMEOUT", "45"))
 
+# Reasoning models (DeepSeek V4.1 Flash and R1-style models) spend completion
+# tokens on hidden reasoning BEFORE emitting content, and those tokens count
+# against max_tokens. Unbounded, a long think can consume the whole budget:
+# content comes back empty with finish_reason="length" and the planner sees an
+# unusable reply. Cap reasoning on structured calls so JSON always has room.
+REASONING_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_MAX_TOKENS", "2000"))
+
+# Retry ladder used when content is empty because reasoning ate the budget:
+# first tighten the reasoning cap (same total budget), then disable reasoning
+# entirely so the model has to emit its JSON answer.
+REASONING_RETRY_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_RETRY_TOKENS", "400"))
+REASONING_OFF_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_OFF_MAX_TOKENS", "1000"))
+
+# Planner call budget. Some reasoning models ignore reasoning.max_tokens and
+# spend most of max_tokens thinking, so the total must be large enough that
+# ~14k reasoning tokens still leave room for the JSON plan on the wire.
+PLANNER_CALL_CONFIG = {
+    "max_tokens": int(os.environ.get("WINBROW_PLANNER_MAX_TOKENS", "16000")),
+    "temperature": float(os.environ.get("WINBROW_PLANNER_TEMPERATURE", "1")),
+}
+
 # Built-in local brain: llama.cpp server started by server.py (winbrow/llm.py)
 BUILTIN_LOCAL_ENDPOINT = "http://127.0.0.1:8080"
 BUILTIN_LOCAL_MODEL = "qwen2.5-0.5b-instruct"
@@ -84,6 +105,16 @@ class GatewayError(Exception):
     """Provider call failed after retries."""
 
 
+class PlannerFailure(GatewayError):
+    """Reasoning consumed the budget and no content could be produced."""
+
+    def __init__(self, message: str, finish_reason: str = "",
+                 reasoning_length: int = 0):
+        super().__init__(message)
+        self.finish_reason = finish_reason
+        self.reasoning_length = reasoning_length
+
+
 @dataclass
 class ToolCall:
     name: str
@@ -97,10 +128,20 @@ class GatewayResponse:
     provider: str = ""
     model: str = ""
     elapsed_ms: float = 0.0
+    reasoning: str = ""          # hidden chain-of-thought, when the provider returns it
+    finish_reason: str = ""      # "stop" | "length" (truncated) | "tool_calls" | ...
 
     @property
     def has_tool_calls(self) -> bool:
         return bool(self.tool_calls)
+
+    @property
+    def truncated(self) -> bool:
+        return self.finish_reason == "length"
+
+    @property
+    def reasoning_length(self) -> int:
+        return len(self.reasoning or "")
 
 
 @dataclass
@@ -471,8 +512,15 @@ class ModelGateway:
         temperature: float = 0.2,
         max_tokens: int = 900,
         timeout: Optional[float] = None,
+        reasoning: Optional[dict] = None,
     ) -> GatewayResponse:
-        """One chat completion across the provider chain. Async wrapper."""
+        """One chat completion across the provider chain. Async wrapper.
+
+        `reasoning` overrides the OpenRouter reasoning policy for this call
+        (e.g. {"enabled": False} for normalizers/chat). By default, structured
+        calls get a bounded reasoning budget and unstructured calls disable it,
+        so hidden reasoning can never eat the whole max_tokens allowance.
+        """
         if not self.providers:
             raise GatewayUnavailable("No LLM provider configured (set OPENROUTER_API_KEY)")
         last_err: Optional[Exception] = None
@@ -485,8 +533,51 @@ class ModelGateway:
                 try:
                     resp = await self._chat_with_provider(
                         provider, messages, tools, json_schema, temperature, max_tokens,
-                        timeout or _provider_timeout(provider),
+                        timeout or _provider_timeout(provider), reasoning,
                     )
+                    # Reasoning can exhaust max_tokens before any content is
+                    # emitted. Retry with a hard reasoning cap, then with
+                    # reasoning off entirely, so the model is forced to write
+                    # the JSON answer instead of thinking until it is cut off.
+                    if self._empty_after_reasoning(resp, provider):
+                        log.warning(
+                            f"finish_reason={resp.finish_reason!r} — "
+                            f"reasoning={resp.reasoning_length} tokens, "
+                            f"content={'empty' if not resp.content else len(resp.content)}; "
+                            "retrying with capped reasoning."
+                        )
+                        try:
+                            answered = await self._retry_with_capped_reasoning(
+                                provider, messages, tools, json_schema, temperature,
+                                max_tokens, timeout or _provider_timeout(provider),
+                            )
+                        except GatewayUnavailable:
+                            raise
+                        except Exception as e:
+                            last_err = e
+                            log.warning(
+                                f"Reasoning retries on '{provider.name}' failed: "
+                                f"{_redact(e)}; trying next."
+                            )
+                            break
+                        if answered is not None and (
+                                answered.content.strip() or answered.tool_calls):
+                            answered.elapsed_ms = round(
+                                (time.perf_counter() - t0) * 1000, 1)
+                            return answered
+                        detail = answered or resp
+                        last_err = PlannerFailure(
+                            f"finish_reason={detail.finish_reason!r}, "
+                            f"reasoning_tokens={detail.reasoning_length}, "
+                            "content=empty after reasoning retries",
+                            finish_reason=detail.finish_reason,
+                            reasoning_length=detail.reasoning_length,
+                        )
+                        log.warning(
+                            f"Provider '{provider.name}' still returned no "
+                            "content after reasoning retries; trying next."
+                        )
+                        break
                     resp.elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
                     return resp
                 except GatewayUnavailable:
@@ -502,7 +593,65 @@ class ModelGateway:
                         continue
                     log.warning(f"Provider '{provider.name}' failed: {_redact(e)}; trying next.")
                     break
+        if isinstance(last_err, PlannerFailure):
+            raise last_err
         raise GatewayError(f"All providers failed; last error: {_redact(last_err)}")
+
+    @staticmethod
+    def _empty_after_reasoning(resp: GatewayResponse, provider: Provider) -> bool:
+        return bool(
+            not resp.content.strip()
+            and not resp.tool_calls
+            and provider.name == "openrouter"
+            and (resp.reasoning or resp.finish_reason == "length")
+        )
+
+    async def _retry_with_capped_reasoning(
+        self,
+        provider: Provider,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[dict]],
+        json_schema: Optional[dict],
+        temperature: float,
+        max_tokens: int,
+        timeout: float,
+    ) -> Optional[GatewayResponse]:
+        """Retry an empty truncated response with a tighter reasoning budget.
+
+        Attempt 2 keeps the total budget but caps reasoning hard. Attempt 3
+        disables reasoning entirely and only asks for enough tokens to emit
+        the JSON answer. Returns the last response if none produce content.
+        """
+        capped = min(REASONING_RETRY_MAX_TOKENS, max(64, max_tokens // 2))
+        answer_budget = max(256, min(max_tokens, REASONING_OFF_MAX_TOKENS))
+        ladder = (
+            (max_tokens, {"max_tokens": capped}),
+            (answer_budget, {"enabled": False}),
+        )
+        last_resp: Optional[GatewayResponse] = None
+        for attempt_no, (budget, policy) in enumerate(ladder, start=2):
+            try:
+                resp = await self._chat_with_provider(
+                    provider, messages, tools, json_schema, temperature,
+                    budget, timeout, policy,
+                )
+            except GatewayUnavailable:
+                raise
+            except Exception as e:
+                log.warning(
+                    f"Reasoning retry {attempt_no} on '{provider.name}' "
+                    f"failed: {_redact(e)}; trying next policy."
+                )
+                continue
+            last_resp = resp
+            if resp.content.strip() or resp.tool_calls:
+                return resp
+            log.warning(
+                f"Reasoning retry {attempt_no} on '{provider.name}' still "
+                f"empty (finish_reason={resp.finish_reason!r}, "
+                f"reasoning={resp.reasoning_length} tokens)."
+            )
+        return last_resp
 
     async def _chat_with_provider(
         self,
@@ -513,6 +662,7 @@ class ModelGateway:
         temperature: float,
         max_tokens: int,
         timeout: float,
+        reasoning: Optional[dict] = None,
     ) -> GatewayResponse:
         import asyncio
         payload: Dict[str, Any] = {
@@ -528,6 +678,20 @@ class ModelGateway:
                 "type": "json_schema",
                 "json_schema": {"name": "winbrow_plan", "strict": False, "schema": json_schema},
             }
+        if provider.name == "openrouter":
+            if reasoning is not None:
+                payload["reasoning"] = reasoning
+            elif json_schema:
+                # Leave the rest of the budget for the actual JSON object.
+                if REASONING_MAX_TOKENS > 0:
+                    payload["reasoning"] = {
+                        "max_tokens": min(
+                            REASONING_MAX_TOKENS, max(64, max_tokens // 2)),
+                    }
+            else:
+                # Short replies (chat, STT normalization, parameter fill) do
+                # not need chain-of-thought and cannot afford it.
+                payload["reasoning"] = {"enabled": False}
         if (
             provider.name == "openrouter"
             and OPENROUTER_ONLY_PROVIDER
@@ -571,10 +735,21 @@ class ModelGateway:
         except (KeyError, IndexError, TypeError):
             raise GatewayError(f"Malformed provider response: {_redact(result)[:300]}")
 
+        reasoning = msg.get("reasoning") or msg.get("reasoning_content") or ""
+        if not reasoning:
+            details = msg.get("reasoning_details")
+            if isinstance(details, list):
+                reasoning = "\n".join(
+                    str(d.get("text") or d.get("summary") or "")
+                    for d in details if isinstance(d, dict)
+                ).strip()
+
         resp = GatewayResponse(
             content=msg.get("content") or "",
             provider=provider.name,
             model=result.get("model", provider.model),
+            reasoning=str(reasoning or ""),
+            finish_reason=str(choice.get("finish_reason") or ""),
         )
         for tc in msg.get("tool_calls") or []:
             try:

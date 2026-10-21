@@ -6,7 +6,7 @@
 - focus_window(title(text)): Bring an app window to the front by title.
 - wait_for_window(title(text), timeout(text)): Wait until an app window with a title exists, then focus it.
 - minimize_all_except(app(text)): Minimize every window except the named app's windows.
-- screen_read_text(no args): Read the screen/window with OCR and return line texts with click coordinates.
+- screen_read_text(region(enum)): Capture the screen or a window and extract text via OCR. Use only for native desktop apps with no DOM/API; prefer browser_read_page for browser content.
 - file_dialog_save(filename(text)): Complete the focused Save/Save-As dialog with a filename and confirm.
 - vscode_open(target(text)): Open a file or folder in VS Code.
 - vscode_install_extension(extension_id(text)): Install a VS Code extension from the marketplace by id.

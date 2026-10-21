@@ -25,11 +25,19 @@ from winbrow.brain.model_gateway import (
     GatewayResponse,
     GatewayUnavailable,
     ModelGateway,
+    PlannerFailure,
     extract_json_object,
 )
-from winbrow.brain.agent_loop import AgentBrain, BrainResult
+from winbrow.brain.agent_loop import AgentBrain, BrainResult, _merge_clarify_answer
 from winbrow.memory import MemoryStore, SessionMemory
 from winbrow.registry import ToolRegistry
+from winbrow.utils.history import (
+    count_recent_stuck,
+    detect_stuck,
+    extract_tried_services,
+    format_history,
+    tried_domains,
+)
 from winbrow.windows import WindowsContext
 
 
@@ -144,6 +152,96 @@ class TestGatewayChain(unittest.TestCase):
         self.assertEqual(resp.tool_calls[0].name, "volume_set_level")
         self.assertEqual(resp.tool_calls[0].arguments["level"], "50")
 
+    def test_parse_response_captures_reasoning_and_finish_reason(self):
+        from winbrow.brain.model_gateway import Provider
+        gw = ModelGateway.__new__(ModelGateway)
+        provider = Provider(name="openrouter", base_url="u", api_key="k", model="m")
+        resp = gw._parse_response({
+            "choices": [{
+                "message": {"content": "", "reasoning": "thinking..."},
+                "finish_reason": "length",
+            }],
+        }, provider)
+        self.assertEqual(resp.reasoning, "thinking...")
+        self.assertEqual(resp.finish_reason, "length")
+        self.assertTrue(resp.truncated)
+
+    def test_empty_content_from_truncated_reasoning_retries_with_capped_then_disabled(self):
+        from winbrow.brain.model_gateway import Provider
+        gw = ModelGateway.__new__(ModelGateway)
+        gw.providers = [Provider(
+            name="openrouter", base_url="u", api_key="k",
+            model="deepseek/deepseek-v4.1-flash")]
+        calls = []
+
+        async def fake(provider, messages, tools, schema, temperature,
+                       max_tokens, timeout, reasoning=None):
+            calls.append(reasoning)
+            if len(calls) < 3:
+                return GatewayResponse(
+                    content="", reasoning="long think cut off",
+                    finish_reason="length", provider="openrouter", model="m")
+            return GatewayResponse(
+                content='{"kind":"chat","response":"hi"}',
+                finish_reason="stop", provider="openrouter", model="m")
+
+        gw._chat_with_provider = fake
+        resp = run(gw.chat(
+            [{"role": "user", "content": "hi"}],
+            json_schema={"type": "object"}))
+        self.assertEqual(resp.content, '{"kind":"chat","response":"hi"}')
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[1], {"max_tokens": 400})
+        self.assertEqual(calls[2], {"enabled": False})
+
+    def test_empty_content_after_all_reasoning_retries_raises(self):
+        from winbrow.brain.model_gateway import Provider
+        gw = ModelGateway.__new__(ModelGateway)
+        gw.providers = [Provider(
+            name="openrouter", base_url="u", api_key="k",
+            model="deepseek/deepseek-v4.1-flash")]
+
+        async def fake(provider, messages, tools, schema, temperature,
+                       max_tokens, timeout, reasoning=None):
+            return GatewayResponse(
+                content="", reasoning="truncated mid-word",
+                finish_reason="length", provider="openrouter", model="m")
+
+        gw._chat_with_provider = fake
+        with self.assertRaises(PlannerFailure) as ctx:
+            run(gw.chat(
+                [{"role": "user", "content": "hi"}],
+                json_schema={"type": "object"}))
+        self.assertEqual(ctx.exception.finish_reason, "length")
+        self.assertGreater(ctx.exception.reasoning_length, 0)
+
+
+    def test_openrouter_reasoning_budget_for_json_and_chat(self):
+        import winbrow.brain.model_gateway as gmod
+        from winbrow.brain.model_gateway import Provider
+        provider = Provider(
+            name="openrouter", base_url="https://openrouter.ai/api/v1",
+            api_key="k", model="deepseek/deepseek-v4.1-flash")
+        gw = ModelGateway.__new__(ModelGateway)
+        payloads = []
+
+        def fake_post(url, payload, headers, timeout):
+            payloads.append(payload)
+            return {"choices": [{"message": {"content": "{}"}}], "model": "m"}
+
+        with patch.object(gmod, "_post_json", fake_post):
+            run(gw._chat_with_provider(
+                provider, [{"role": "user", "content": "hi"}],
+                None, {"type": "object"}, 0.1, 1200, 10))
+            run(gw._chat_with_provider(
+                provider, [{"role": "user", "content": "hi"}],
+                None, None, 0.1, 300, 10))
+
+        self.assertIn("max_tokens", payloads[0]["reasoning"])
+        self.assertLessEqual(
+            payloads[0]["reasoning"]["max_tokens"], gmod.REASONING_MAX_TOKENS)
+        self.assertEqual(payloads[1]["reasoning"], {"enabled": False})
+
     def test_openrouter_chain_from_env(self):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-123"}):
             gw = ModelGateway()
@@ -168,6 +266,100 @@ class TestGatewayChain(unittest.TestCase):
         gw._chat_with_provider = fake_chat_with_provider
         resp = run(gw.chat([{"role": "user", "content": "hi"}]))
         self.assertEqual(resp.provider, "backup")
+
+
+class TestStuckDetection(unittest.TestCase):
+    def test_identical_skill_and_output_is_stuck(self):
+        history = [
+            {"step": {"skill": "browser_get_accessibility_tree"},
+             "result": {"output": "INTERACTIVE ELEMENTS"}},
+            {"step": {"skill": "browser_get_accessibility_tree"},
+             "result": {"output": "INTERACTIVE ELEMENTS"}},
+        ]
+        self.assertTrue(detect_stuck(history))
+
+    def test_different_output_is_progress(self):
+        history = [
+            {"step": {"skill": "browser_read_page"}, "result": {"output": "before"}},
+            {"step": {"skill": "browser_read_page"}, "result": {"output": "after"}},
+        ]
+        self.assertFalse(detect_stuck(history))
+
+    def test_brain_step_results_are_supported(self):
+        from winbrow.brain.agent_loop import BrainStepResult
+        history = [
+            BrainStepResult("browser_get_accessibility_tree", {}, True, "same"),
+            BrainStepResult("browser_get_accessibility_tree", {}, True, "same"),
+        ]
+        self.assertTrue(detect_stuck(history))
+
+    def test_short_history_is_not_stuck(self):
+        self.assertFalse(detect_stuck([
+            {"step": {"skill": "browser_read_page"}, "result": {"output": "x"}},
+        ]))
+
+    def test_count_recent_stuck(self):
+        history = [
+            {"step": {"skill": "browser_read_page"},
+             "result": {"output": "same",
+                        "_warning": "STUCK: identical output"}},
+            {"step": {"skill": "browser_read_page"},
+             "result": {"output": "same",
+                        "_warning": "STUCK: identical output"}},
+            {"step": {"skill": "browser_read_page"},
+             "result": {"output": "different"}},
+        ]
+        self.assertEqual(count_recent_stuck(history), 2)
+
+
+class TestHistoryCompression(unittest.TestCase):
+    def _history(self, n=8):
+        return [{
+            "step": {"skill": "browser_read_page",
+                     "args": {"url": f"https://example.com/{i}"}},
+            "result": {"success": True, "output": f"page {i} " + "x" * 2000},
+        } for i in range(n)]
+
+    def test_old_steps_compressed_recent_steps_full(self):
+        block = format_history(self._history())
+        self.assertIn("Step 1: browser_read_page → ✓", block)
+        self.assertIn("--- last 5 steps in full ---", block)
+        self.assertIn("Step 8:", block)
+        self.assertLess(len(block), 5000)
+
+    def test_tried_services_tracks_dead_ends(self):
+        history = [
+            {"step": {"skill": "browser_navigate",
+                      "args": {"url": "https://www.example.com/a"}},
+             "result": {"success": True, "output": "ok"}},
+            {"step": {"skill": "browser_navigate",
+                      "args": {"url": "https://bad.test/x"}},
+             "result": {"success": False,
+                        "output": "chrome-error://chromewebdata"}},
+        ]
+        block = extract_tried_services(history)
+        self.assertIn("example.com → visited", block)
+        self.assertIn("ERROR — chrome privacy/cert error", block)
+        self.assertIn("Do not navigate to these again", block)
+        self.assertEqual(tried_domains(history), ["example.com", "bad.test"])
+
+    def test_planner_message_includes_tried_and_remaining(self):
+        from winbrow.brain.prompts import build_loop_messages, build_planner_message
+
+        history = [{
+            "step": {"skill": "browser_navigate",
+                     "args": {"url": "https://example.com/upload"}},
+            "result": {"success": True, "output": "loaded"},
+        }]
+        messages = build_loop_messages(
+            "finish the upload", format_history(history), "ctx", "mem", "skills",
+            tried_block=extract_tried_services(history), steps_remaining=7)
+        content = messages[1]["content"]
+        self.assertIn("STEPS REMAINING: 7", content)
+        self.assertIn("ALREADY TRIED:", content)
+        direct = build_planner_message("finish the upload", history, 7)
+        self.assertIn("STEPS REMAINING: 7", direct)
+        self.assertIn("ALREADY TRIED:", direct)
 
 
 class TestSessionMemory(unittest.TestCase):
@@ -221,6 +413,29 @@ class TestSessionMemory(unittest.TestCase):
         block = s.context_block()
         self.assertIn("open a.png", block)
         self.assertIn("file=a.png", block)
+
+    def test_pending_clarification_options_roundtrip(self):
+        s = self._sess()
+        s.record_turn("open it", {"kind": "chat"},
+                      {"success": True, "needs_input": True,
+                       "question": "Which file?", "options": ["a.pptx", "b.pptx"]})
+        self.assertEqual(s.pending_clarification["options"], ["a.pptx", "b.pptx"])
+        s2 = SessionMemory(path=s.path, session_id=s.session_id)
+        self.assertEqual(s2.pending_clarification["options"], ["a.pptx", "b.pptx"])
+        self.assertIn("a.pptx", s2.context_block())
+        s.record_turn("1", {"kind": "chat"}, {"success": True})
+        self.assertIsNone(s.pending_clarification)
+
+    def test_clarify_answer_can_be_option_text(self):
+        s = self._sess()
+        s.pending_clarification = {
+            "goal": "open the pptx online",
+            "question": "Which file?",
+            "options": [r"C:\Users\X\a.pptx", r"C:\Users\X\b.pptx"],
+        }
+        merged = _merge_clarify_answer(r"C:\Users\X\b.pptx", s)
+        self.assertIn("open the pptx online", merged)
+        self.assertIn(r"C:\Users\X\b.pptx", merged)
 
 
 class TestMemoryStore(unittest.TestCase):
@@ -349,6 +564,62 @@ class TestAgentBrain(unittest.TestCase):
         res = run(brain.handle("open ghostapp", _FakeCtx(), _FakeSession()))
         self.assertFalse(res.success)
         self.assertIn("failed", res.response.lower())
+
+    def test_identical_outputs_get_stuck_warning(self):
+        brain = self._brain(None)
+
+        async def same_output(tool_name, args):
+            return {"success": True, "output": "page unchanged"}
+
+        brain.executor = same_output
+        brain.gateway._responses = [
+            plan("action", steps=[
+                {"skill": "volume_set_level", "args": {"level": "40"}}]),
+            plan("action", steps=[
+                {"skill": "volume_set_level", "args": {"level": "41"}}]),
+            plan("done", response="Done."),
+        ]
+        res = run(brain.handle("set volume twice", _FakeCtx(), _FakeSession()))
+        self.assertEqual(len(res.steps), 2)
+        self.assertIn("same skill twice", res.steps[-1].warning)
+
+    def test_two_stuck_warnings_force_clarify(self):
+        brain = self._brain(None)
+
+        async def same_output(tool_name, args):
+            return {"success": True, "output": "page unchanged"}
+
+        brain.executor = same_output
+        brain.gateway._responses = [
+            plan("action", steps=[
+                {"skill": "volume_set_level", "args": {"level": str(i)}}])
+            for i in range(3)
+        ]
+        res = run(brain.handle("keep trying", _FakeCtx(), _FakeSession()))
+        self.assertEqual(len(res.steps), 3)
+        self.assertTrue(res.needs_input)
+        self.assertIn("going in circles", res.question)
+
+    def test_clarify_surfaces_options(self):
+        options = [r"C:\Users\X\LDM seminar.pptx",
+                   r"C:\Users\X\Latent_Diffusion_Models_Seminar.pptx"]
+        brain = self._brain(FakeGateway([{
+            "kind": "clarify",
+            "question": "Which PowerPoint file should I open?",
+            "options": options,
+        }]))
+        res = run(brain.handle("open it online", _FakeCtx(), _FakeSession()))
+        self.assertTrue(res.needs_input)
+        self.assertEqual(res.options, options)
+        self.assertEqual(res.to_dict()["options"], options)
+
+    def test_clarify_recovers_options_from_numbered_question(self):
+        brain = self._brain(FakeGateway([{
+            "kind": "clarify",
+            "question": "Which one?\n1) LDM seminar.pptx\n2) Latent models.pptx",
+        }]))
+        res = run(brain.handle("open it online", _FakeCtx(), _FakeSession()))
+        self.assertEqual(res.options, ["LDM seminar.pptx", "Latent models.pptx"])
 
     def test_max_steps_cap(self):
         brain = self._brain(None)

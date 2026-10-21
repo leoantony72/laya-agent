@@ -394,11 +394,7 @@ async def _run_powershell_once(script: str, timeout: int = 30) -> dict[str, Any]
     """
     t0 = time.perf_counter()
     # Add utf-8 output encoding prefix for clean text capture
-    wrapped_script = (
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
-        + script
-    )
+    wrapped_script = _wrap_ps_script(script)
 
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -449,76 +445,105 @@ def _kill_process_tree(pid: int) -> None:
         pass
 
 
-async def _run_powershell_sync(
+def _wrap_ps_script(script: str) -> str:
+    # PowerShell requires param() to be the first statement in a command.
+    # The OCR script starts with param(), so prefixing it would break it.
+    if script.lstrip().lower().startswith("param"):
+        return script
+    return (
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+        + script
+    )
+
+
+def _run_powershell_blocking(
     wrapped_script: str, timeout: int, t0: float
 ) -> dict[str, Any]:
-    """Sync PowerShell in an executor — works on any event loop.
+    """Blocking PowerShell spawn with temp-file output.
 
     Output goes to temp files instead of pipes: GUI launchers (VS Code's
     `code` shim) leave a child holding the inherited pipe open, and
     subprocess.run() would then wait for EOF forever. Waiting only on the
     process and reading the files avoids that hang.
     """
-    def _sync() -> dict[str, Any]:
-        with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
-            try:
-                proc = subprocess.Popen(
-                    [
-                        "powershell.exe",
-                        "-NoProfile",
-                        "-NonInteractive",
-                        "-ExecutionPolicy", "Bypass",
-                        "-Command", wrapped_script,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=out_f,
-                    stderr=err_f,
-                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                )
-            except Exception as e:
-                return {
-                    "success": False,
-                    "returncode": -1,
-                    "stdout": "",
-                    "stderr": f"{type(e).__name__}: {e}",
-                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-                }
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                _kill_process_tree(proc.pid)
-                try:
-                    proc.wait(timeout=5)
-                except Exception:
-                    pass
-                return {
-                    "success": False,
-                    "returncode": -1,
-                    "stdout": "",
-                    "stderr": f"PowerShell command timed out after {timeout} seconds",
-                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-                }
-            except Exception as e:
-                _kill_process_tree(proc.pid)
-                return {
-                    "success": False,
-                    "returncode": -1,
-                    "stdout": "",
-                    "stderr": f"{type(e).__name__}: {e}",
-                    "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
-                }
-            out_f.seek(0)
-            err_f.seek(0)
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        try:
+            proc = subprocess.Popen(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass",
+                    "-Command", wrapped_script,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=out_f,
+                stderr=err_f,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as e:
             return {
-                "success": proc.returncode == 0,
-                "returncode": proc.returncode,
-                "stdout": out_f.read().decode("utf-8", errors="replace").strip(),
-                "stderr": err_f.read().decode("utf-8", errors="replace").strip(),
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"{type(e).__name__}: {e}",
                 "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
             }
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc.pid)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"PowerShell command timed out after {timeout} seconds",
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+        except Exception as e:
+            _kill_process_tree(proc.pid)
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"{type(e).__name__}: {e}",
+                "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+            }
+        out_f.seek(0)
+        err_f.seek(0)
+        return {
+            "success": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": out_f.read().decode("utf-8", errors="replace").strip(),
+            "stderr": err_f.read().decode("utf-8", errors="replace").strip(),
+            "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+        }
 
+
+def run_powershell_sync(script: str, timeout: int = 30) -> dict[str, Any]:
+    """Blocking PowerShell runner for synchronous callers (e.g. Screen.ocr).
+
+    Never call this from the event-loop thread; async code must use
+    run_powershell(). Prior to this helper, Screen.ocr called the async
+    run_powershell() without awaiting it, which silently produced a
+    "coroutine was never awaited" failure and no OCR output.
+    """
+    return _run_powershell_blocking(_wrap_ps_script(script), timeout,
+                                    time.perf_counter())
+
+
+async def _run_powershell_sync(
+    wrapped_script: str, timeout: int, t0: float
+) -> dict[str, Any]:
+    """Sync PowerShell in an executor — works on any event loop."""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _sync)
+    return await loop.run_in_executor(
+        None, _run_powershell_blocking, wrapped_script, timeout, t0)
 
 
 # ---------------------------------------------------------------------------
