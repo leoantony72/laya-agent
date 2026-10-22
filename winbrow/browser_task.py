@@ -540,6 +540,26 @@ class BrowserController:
         # "auto" picks whichever is running; can override to "chrome" or "edge"
         self.preferred_browser = preferred_browser
         self._current_tab_id: Optional[str] = None
+        # Set when a browser task starts: its first navigation gets a fresh tab
+        # instead of taking over the tab the user is currently on.
+        self._task_tab_pending = False
+
+    # ── Task tab scope ─────────────────────────────────────────────────────
+
+    def begin_task(self) -> None:
+        """Mark the start of a browser task.
+
+        Every task must work in its own tab. Rather than opening a blank tab
+        up front (a read-only task such as "what does this page say" still
+        needs the tab in front of the user), the first navigation of the task
+        opens the dedicated tab; later steps reuse it because `_open_tab`
+        records it as `_current_tab_id`.
+        """
+        self._task_tab_pending = True
+
+    def end_task(self) -> None:
+        """Clear the task-tab scope so the next task starts a fresh tab."""
+        self._task_tab_pending = False
 
     # ── Detection ──────────────────────────────────────────────────────────
 
@@ -841,6 +861,14 @@ class BrowserController:
         """Navigate the active tab to a URL, or open a new tab first."""
         if not url.startswith(("http://", "https://", "file://")):
             url = "https://" + url
+
+        # The first navigation of a browser task opens its own tab so the page
+        # the user is working in is never replaced. Later navigations in the
+        # same task reuse that tab (remembered as _current_tab_id).
+        if not new_tab and self._task_tab_pending:
+            log.info(f"Browser task start: opening a new tab for {url}")
+            new_tab = True
+        self._task_tab_pending = False
 
         # Ensure browser with CDP is running
         if not _cdp_available():
@@ -1723,7 +1751,13 @@ class BrowserController:
 
         from .ultrafast import LayaUltrafastEngine
         engine = LayaUltrafastEngine(self)
-        res = await engine.run_task(goal=goal, max_steps=max_steps)
+        # Same task-tab guarantee as the brain loop: nothing may overwrite the
+        # tab the user is working in.
+        self.begin_task()
+        try:
+            res = await engine.run_task(goal=goal, max_steps=max_steps)
+        finally:
+            self.end_task()
         result = {
             "success": res.success,
             "goal": res.goal,

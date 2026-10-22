@@ -49,7 +49,7 @@ def _load_env_file() -> None:
                 continue
             key, _, value = line.partition("=")
             key, value = key.strip(), value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
+            if key and (key not in os.environ or not os.environ[key]):
                 os.environ[key] = value
     except Exception as e:
         _logging.getLogger("winbrow-server").warning(f".env load failed (non-fatal): {e}")

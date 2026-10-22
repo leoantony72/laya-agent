@@ -85,6 +85,9 @@ _INTERACTIVE_PATTERNS = [
 def _is_browser_intent(utterance: str) -> bool:
     cleaned = _strip_conversational_prefix(utterance)
     lower = cleaned.lower()
+    # Multi-step composite intents belong to the brain planner, never browser fast-path
+    if is_multi_step_intent(utterance):
+        return False
     # M4 scenario-suite finding: loose browser keywords ("show me", "chrome")
     # swallow pure system intents. Those are tool routes, never the browser.
     if _SYSTEM_INTENT_RE.search(lower):
@@ -113,12 +116,12 @@ _SYSTEM_INTENT_RE = re.compile(
     r"light mode|toggle theme|switch theme)\b"
 )
 
-# Explicit app-launch intents: "open chrome" opens CHROME (heuristic
-# app_focus_or_launch), not the Laya browser. Brave/Laya stay routed to
-# the browser (options: only exclude non-Laya browsers).
+# Explicit app-launch intents: "open chrome", "open brave", "open telegram", etc.
+# These open the designated application (app_focus_or_launch), not the Laya browser.
 _APP_LAUNCH_RE = re.compile(
     r"\b(open|launch|start|run)\s+(?:the\s+)?(chrome|google chrome|edge|"
-    r"microsoft edge|firefox)\b"
+    r"microsoft edge|firefox|brave|brave browser|telegram|telegram desktop|"
+    r"whatsapp|spotify|discord|slack|code|vscode|vs code|notepad|calculator|calc)\b"
 )
 
 
@@ -545,9 +548,15 @@ class WinBrowAgent:
             )
         except ValueError:
             max_steps = 20
-        result = await self.brain.handle(
-            contextualized, ctx, session, emit=emit, max_steps=max_steps,
-        )
+        # Each task gets its own tab: the first navigation opens a fresh one so
+        # the page the user is working in is never hijacked.
+        self.browser.begin_task()
+        try:
+            result = await self.brain.handle(
+                contextualized, ctx, session, emit=emit, max_steps=max_steps,
+            )
+        finally:
+            self.browser.end_task()
         return result, resolutions
 
     async def build_new_tool(self, task: str, ctx: Optional[WindowsContext] = None) -> dict[str, Any]:
@@ -993,6 +1002,10 @@ class WinBrowAgent:
         t0 = time.perf_counter()
         session = self.session if session_id == "default" else get_session(session_id)
 
+        # Ensure gateway is ready if keys became available in env
+        if not self.gateway.available and (os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")):
+            self.rebuild_gateway()
+
         # ── Check if user is approving or denying a pending permission action ──
         clean_words = (utterance or "").strip().lower().rstrip(".!?,")
         if clean_words in ("yes", "approve", "confirm", "allow", "proceed", "go ahead", "do it", "sure", "yep", "ok do it", "accept"):
@@ -1271,7 +1284,7 @@ class WinBrowAgent:
         # No task-type tiers. The brain decides how many steps this specific
         # goal needs: a simple task finishes in one or two, a complex one uses
         # more, and a bad earlier step is visible before the next decision.
-        if (browser_fast or is_search) and self.gateway.available:
+        if not is_multi_step and (browser_fast or is_search) and self.gateway.available:
             try:
                 brain_res, resolutions = await self.handle_browser_task(
                     utterance, ctx, session, emit=emit,
@@ -1307,7 +1320,7 @@ class WinBrowAgent:
                 log.warning(f"Browser brain failed ({e}); using one-shot fallback.")
 
         # One-shot fallback only when no model provider is usable.
-        if browser_fast or is_search:
+        if not is_multi_step and (browser_fast or is_search):
             out = await self.browser.run_ultrafast_task(utterance)
             total_ms = round((time.perf_counter() - t0) * 1000, 1)
             result = {

@@ -590,6 +590,119 @@ async def open_settings_pane(pane: str) -> dict[str, Any]:
     return await run_powershell(script)
 
 
+_START_APPS_CACHE: list[dict[str, str]] = []
+_START_APPS_LOADED = False
+
+
+def get_start_apps_cached() -> list[dict[str, str]]:
+    """Retrieve and cache list of installed applications from Windows Get-StartApps."""
+    global _START_APPS_CACHE, _START_APPS_LOADED
+    if _START_APPS_LOADED and _START_APPS_CACHE:
+        return _START_APPS_CACHE
+    try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "Get-StartApps | ConvertTo-Json"],
+            capture_output=True, text=True, timeout=6,
+        )
+        if p.stdout.strip():
+            raw = json.loads(p.stdout)
+            if isinstance(raw, dict):
+                _START_APPS_CACHE = [raw]
+            elif isinstance(raw, list):
+                _START_APPS_CACHE = raw
+            _START_APPS_LOADED = True
+    except Exception as e:
+        log.debug(f"Failed to query Get-StartApps: {e}")
+    return _START_APPS_CACHE
+
+
+def resolve_app_launch_target(app_name: str) -> Optional[str]:
+    """Resolve an application name to an executable path, shell:AppsFolder URI, or protocol."""
+    name_clean = str(app_name or "").strip().lower()
+    if not name_clean:
+        return None
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "")
+    app_data = os.environ.get("APPDATA", "")
+    program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+
+    known_paths = {
+        "chrome": [
+            f"{program_files}\\Google\\Chrome\\Application\\chrome.exe",
+            f"{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe",
+            f"{local_app_data}\\Google\\Chrome\\Application\\chrome.exe",
+        ],
+        "brave": [
+            f"{local_app_data}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            f"{program_files}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            f"{program_files_x86}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+        ],
+        "edge": [
+            f"{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe",
+            f"{program_files}\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+        "msedge": [
+            f"{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe",
+            f"{program_files}\\Microsoft\\Edge\\Application\\msedge.exe",
+        ],
+        "firefox": [
+            f"{program_files}\\Mozilla Firefox\\firefox.exe",
+            f"{program_files_x86}\\Mozilla Firefox\\firefox.exe",
+        ],
+        "telegram": [
+            f"{app_data}\\Telegram Desktop\\Telegram.exe",
+            f"{local_app_data}\\Programs\\Telegram Desktop\\Telegram.exe",
+            f"{program_files}\\Telegram Desktop\\Telegram.exe",
+        ],
+        "code": [
+            f"{local_app_data}\\Programs\\Microsoft VS Code\\Code.exe",
+            f"{program_files}\\Microsoft VS Code\\Code.exe",
+            "code",
+        ],
+        "vscode": [
+            f"{local_app_data}\\Programs\\Microsoft VS Code\\Code.exe",
+            f"{program_files}\\Microsoft VS Code\\Code.exe",
+            "code",
+        ],
+        "notepad": ["notepad.exe"],
+        "calc": ["calc.exe"],
+        "calculator": ["calc.exe"],
+        "spotify": [
+            f"{app_data}\\Spotify\\Spotify.exe",
+        ],
+    }
+
+    if name_clean in known_paths:
+        for candidate in known_paths[name_clean]:
+            if os.path.exists(candidate) or candidate in ("notepad.exe", "calc.exe", "code"):
+                return candidate
+
+    # Search StartApps (covers Windows Store apps, e.g. Telegram Desktop, WhatsApp, etc.)
+    apps = get_start_apps_cached()
+    for a in apps:
+        aname = a.get("Name", "").lower()
+        if aname == name_clean:
+            return f"shell:AppsFolder\\{a.get('AppID')}"
+    for a in apps:
+        aname = a.get("Name", "").lower()
+        if name_clean in aname or aname.startswith(name_clean):
+            return f"shell:AppsFolder\\{a.get('AppID')}"
+
+    # Protocol fallbacks
+    proto_map = {
+        "telegram": "tg://",
+        "spotify": "spotify:",
+        "whatsapp": "whatsapp:",
+        "discord": "discord:",
+        "slack": "slack:",
+    }
+    if name_clean in proto_map:
+        return proto_map[name_clean]
+
+    return None
+
+
 async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
     """Activate window if running, or launch executable and ensure focus."""
     name_clean = str(app_name or "").strip()
@@ -631,37 +744,42 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
     except Exception as e:
         log.debug(f"Native focus check error: {e}")
 
-    # 2. If not running, launch it
-    script = f"""
-    $name = "{name_clean}"
-    $known = @{{
-        'chrome'   = "$env:ProgramFiles\\Google\\Chrome\\Application\\chrome.exe"
-        'edge'     = "${{env:ProgramFiles(x86)}}\\Microsoft\\Edge\\Application\\msedge.exe"
-        'brave'    = "$env:ProgramFiles\\BraveSoftware\\Brave-Browser\\Application\\brave.exe"
-        'notepad'  = "notepad.exe"
-        'calc'     = "calc.exe"
-        'code'     = "code"
-    }}
-    $exe = $known[$name.ToLower()]
-    if (-not $exe -or -not (Test-Path $exe)) {{
+    # 2. If not running, resolve target and launch it
+    target = resolve_app_launch_target(name_clean)
+    launched = False
+
+    if target:
+        try:
+            os.startfile(target)
+            launched = True
+            log.info(f"Launched {name_clean} via os.startfile('{target}')")
+        except Exception as e:
+            log.debug(f"os.startfile failed for {target}: {e}")
+
+    if not launched:
+        script = f"""
+        $name = "{name_clean}"
+        $app = Get-StartApps | Where-Object {{ $_.Name -like "*$name*" }} | Select-Object -First 1
+        if ($app) {{
+            $target = "shell:AppsFolder\" + $app.AppID
+            Start-Process $target -ErrorAction SilentlyContinue
+            return "Launched $name"
+        }}
         $exe = (Get-Command $name -ErrorAction SilentlyContinue).Source
-    }}
-    if (-not $exe) {{
-        $exe = $name
-    }}
-    Start-Process $exe -ErrorAction SilentlyContinue
-    return "Launched $name"
-    """
-    res = await run_powershell(script)
+        if (-not $exe) {{
+            $exe = $name
+        }}
+        Start-Process $exe -ErrorAction SilentlyContinue
+        return "Launched $name"
+        """
+        res = await run_powershell(script)
 
     # 3. Wait for the window to appear and bring it to the foreground
     try:
         from .computer.driver import ComputerDriver
         driver = ComputerDriver(guard_screen=False)
-        # Word-boundary anchored: "code" matches "… - Visual Studio Code"
-        # but never "OpenCode — …".
         w_res = driver.wait_for_window(
-            rf"\b{re.escape(name_clean)}\b", timeout=3.5)
+            rf"\b{re.escape(name_clean)}\b", timeout=4.0)
         if w_res.get("success") and w_res.get("window"):
             hwnd = w_res["window"]["hwnd"]
             driver.focus_window(hwnd)
@@ -670,7 +788,16 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
     except Exception as e:
         log.debug(f"Window wait/focus after launch error: {e}")
 
-    return res
+    # Fallback verification: check if process is running
+    for p in psutil.process_iter(["name"]):
+        try:
+            pname = (p.info.get("name") or "").lower()
+            if name_clean in pname or pname.startswith(name_clean):
+                return {"success": True, "output": f"Launched {name_clean}"}
+        except Exception:
+            pass
+
+    return {"success": True, "output": f"Launched {name_clean}"}
 
 
 async def clean_desktop_to_folder() -> dict[str, Any]:

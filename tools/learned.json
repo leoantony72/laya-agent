@@ -21,5 +21,16 @@
       "create folder named papers"
     ],
     "args": []
+  },
+  {
+    "name": "create_folder_and_also_make_a_summ",
+    "description": "Create a new folder named 'and also make a summary of the paper in a text file and put it also in the downloads folder' on the Desktop.",
+    "script": "\n                $path = Join-Path ([Environment]::GetFolderPath('Desktop')) \"and also make a summary of the paper in a text file and put it also in the downloads folder\"\n                New-Item -ItemType Directory -Path $path -Force | Out-Null\n                return \"Created folder: $path\"\n                ",
+    "scope": null,
+    "speak": "done",
+    "examples": [
+      "create folder named and also make a summary of the paper in a text file and put it also in the downloads folder"
+    ],
+    "args": []
   }
 ]

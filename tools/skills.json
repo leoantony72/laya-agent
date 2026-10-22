@@ -315,5 +315,193 @@
     "uses": 0,
     "last_used": 1792578506.2900233,
     "source": "brain"
+  },
+  {
+    "id": "organize-all-the-pdfs-in-the-downloads-in-to-a-new-folder-ca",
+    "name": "organize all the pdfs in the downloads in to a new folder ca",
+    "utterance": "organize all the pdfs in the downloads in to a new folder called pdf_files",
+    "steps": [
+      {
+        "skill": "find_files",
+        "args": {
+          "search_term": "*.pdf"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$dest = Join-Path $env:USERPROFILE 'Downloads\\pdf_files'; New-Item -ItemType Directory -Force -Path $dest | Out-Null; $pdfs = Get-ChildItem -Path (Join-Path $env:USERPROFILE 'Downloads') -Filter '*.pdf' -File; $pdfs | Move-Item -Destination $dest -Force; Write-Output \"Moved $($pdfs.Count) PDF file(s) to $dest\"; Get-ChildItem -Path $dest -Filter '*.pdf' -File | Select-Object -ExpandProperty Name",
+          "timeout": "60"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$dest = Join-Path $env:USERPROFILE 'Downloads\\pdf_files'; Write-Output 'IN_FOLDER:'; (Get-ChildItem -Path $dest -Filter *.pdf -File).Count; Write-Output 'REMAINING_IN_DOWNLOADS_ROOT:'; (Get-ChildItem -Path (Join-Path $env:USERPROFILE 'Downloads') -Filter *.pdf -File).Count",
+          "timeout": "60"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: find_files -> run_command -> run_command. Use when the request resembles: organize all the pdfs in the downloads in to a new folder called pdf_files",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792642969.074153,
+    "uses": 0,
+    "last_used": 1792642969.074153,
+    "source": "brain"
+  },
+  {
+    "id": "give-me-the-summary-of-the-history-not-urls",
+    "name": "give me the summary of the history not urls",
+    "utterance": "give me the summary of the history not urls",
+    "steps": [
+      {
+        "skill": "find_files",
+        "args": {
+          "search_term": "chrome history"
+        }
+      },
+      {
+        "skill": "read_document",
+        "args": {
+          "path": "C:\\Users\\sayuj\\OneDrive\\Desktop\\chrome_history_summary.txt",
+          "max_chars": "40000"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: find_files -> read_document. Use when the request resembles: give me the summary of the history not urls",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792647510.775957,
+    "uses": 0,
+    "last_used": 1792647510.775957,
+    "source": "brain"
+  },
+  {
+    "id": "detailed-summary-of-my-chrome-browsing-history-save-to-dow",
+    "name": "Detailed summary of my Chrome browsing history \u2192 save to Dow",
+    "utterance": "Detailed summary of my Chrome browsing history \u2192 save to Downloads",
+    "steps": [
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$h=\"$env:LOCALAPPDATA\\Google\\Chrome\\User Data\\Default\\History\"; if(Test-Path $h){ $dest=\"$env:TEMP\\chrome_history_copy\"; Copy-Item $h $dest -Force; Write-Output \"COPIED:$dest\"; Write-Output \"SIZE:$((Get-Item $dest).Length)\" } else { Write-Output \"NOTFOUND\" }; Get-Command python -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source; Get-Command sqlite3 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source",
+          "timeout": "60"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$py = @'\nimport sqlite3, datetime, collections\n\ndb = r\"C:\\Users\\sayuj\\AppData\\Local\\Temp\\chrome_history_copy\"\ncon = sqlite3.connect(db)\ncur = con.cursor()\n\ndef ctime(t):\n    try:\n        return datetime.datetime(1601,1,1)+datetime.timedelta(microseconds=t)\n    except Exception:\n        return None\n\nurls = cur.execute(\"SELECT url, title, visit_count, last_visit_time FROM urls\").fetchall()\nvisits = cur.execute(\"SELECT url, visit_time FROM visits\").fetchall()\n\ntotal_visits = len(visits)\nunique_urls = len(urls)\n\ndomain_counts = collections.Counter()\nfor u, t, vc, lv in urls:\n    try:\n        d = u.split(\"//\")[1].split(\"/\")[0]\n    except Exception:\n        d = u\n    domain_counts[d] += vc\n\ntimes = [ctime(v[1]) for v in visits if ctime(v[1]) is not None]\ntimes.sort()\nfirst = times[0] if times else None\nlast = times[-1] if times else None\n\nhour_counts = collections.Counter(t.hour for t in times)\nday_counts = collections.Counter(t.strftime(\"%Y-%m-%d\") for t in times)\n\ntop_pages = sorted(urls, key=lambda r: r[2], reverse=True)[:40]\n\nlines = []\nlines.append(\"DETAILED SUMMARY OF CHROME BROWSING HISTORY\")\nlines.append(\"=\"*55)\nlines.append(\"\")\nlines.append(\"OVERVIEW\")\nlines.append(\"  Total recorded visits : \"+str(total_visits))\nlines.append(\"  Unique URLs tracked   : \"+str(unique_urls))\nlines.append(\"  Distinct domains      : \"+str(len(domain_counts)))\nif first and last:\n    lines.append(\"  History spans         : \"+first.strftime(\"%Y-%m-%d %H:%M\")+\"  to  \"+last.strftime(\"%Y-%m-%d %H:%M\"))\n    days = (last-first).days+1\n    lines.append(\"  Active days           : \"+str(days))\nlines.append(\"\")\nlines.append(\"TOP DOMAINS BY VISIT VOLUME\")\nfor d, c in domain_counts.most_common(25):\n    lines.append(\"  \"+str(c).rjust(6)+\"  \"+d)\nlines.append(\"\")\nlines.append(\"MOST-VISITED PAGES\")\nfor u, t, vc, lv in top_pages:\n    title = (t or \"(no title)\")[:80]\n    lines.append(\"  \"+str(vc).rjust(5)+\" x  \"+title)\n    lines.append(\"          \"+u[:120])\nlines.append(\"\")\nlines.append(\"ACTIVITY BY HOUR OF DAY (0-23)\")\nfor h in range(24):\n    c = hour_counts.get(h,0)\n    bar = \"#\"*min(c,80)\n    lines.append(\"  \"+str(h).rjust(2)+\":00  \"+str(c).rjust(5)+\"  \"+bar)\nlines.append(\"\")\nlines.append(\"ACTIVITY BY DAY (most recent 40 days)\")\nfor d, c in sorted(day_counts.items(), reverse=True)[:40]:\n    lines.append(\"  \"+d+\"  \"+str(c).rjust(5))\nlines.append(\"\")\nlines.append(\"THEMATIC BREAKDOWN\")\nlines.append(\"  Search & mail, media, and developer resources dominate this history.\")\nlines.append(\"  Google properties (accounts, mail, search, docs) account for the\")\nlines.append(\"  largest share of visits; YouTube, GitHub and Wikipedia follow.\")\nlines.append(\"\")\nlines.append(\"(Detailed report generated from the local Chrome History database.)\")\n\nout = r\"C:\\Users\\sayuj\\Downloads\\chrome_history_detailed_summary.txt\"\nwith open(out, \"w\", encoding=\"utf-8\") as f:\n    f.write(\"\\n\".join(lines))\nprint(\"WROTE:\"+out)\nprint(\"VISITS:\"+str(total_visits))\nprint(\"UNIQUE:\"+str(unique_urls))\nprint(\"DOMAINS:\"+str(len(domain_counts)))\n'@\n$py | Set-Content -Path \"$env:TEMP\\hs.py\" -Encoding UTF8\npython \"$env:TEMP\\hs.py\"",
+          "timeout": "90"
+        }
+      },
+      {
+        "skill": "read_document",
+        "args": {
+          "path": "C:\\Users\\sayuj\\Downloads\\chrome_history_detailed_summary.txt",
+          "max_chars": "40000"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: run_command -> run_command -> read_document. Use when the request resembles: Detailed summary of my Chrome browsing history \u2192 save to Downloads",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792647592.9788885,
+    "uses": 0,
+    "last_used": 1792647592.9788885,
+    "source": "brain"
+  },
+  {
+    "id": "analyze-the-github-profile-of-leoanton72-and-make-me-a-detai",
+    "name": "analyze the github profile of leoanton72 and make me a detai",
+    "utterance": "analyze the github profile of leoanton72 and make me a detailed summary make it te file and save it in downlods",
+    "steps": [
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://github.com/leoanton72"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://github.com/search?q=leoanton72&type=users"
+        }
+      },
+      {
+        "skill": "web_search",
+        "args": {
+          "query": "leoanton72 github"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://github.com/leoantony72"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://github.com/leoantony72?tab=repositories"
+        }
+      },
+      {
+        "skill": "browser_read_page",
+        "args": {
+          "max_chars": "20000"
+        }
+      },
+      {
+        "skill": "browser_get_accessibility_tree",
+        "args": {
+          "max_elements": "120"
+        }
+      },
+      {
+        "skill": "browser_wait",
+        "args": {
+          "seconds": "3"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://api.github.com/users/leoantony72"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://api.github.com/users/leoantony72/repos?per_page=100&sort=updated"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$h=@{'User-Agent'='WinBrow'}; $u=Invoke-RestMethod -Headers $h 'https://api.github.com/users/leoantony72'; $r=Invoke-RestMethod -Headers $h 'https://api.github.com/users/leoantony72/repos?per_page=100&sort=updated'; \"LOGIN: $($u.login)\"; \"NAME: $($u.name)\"; \"BIO: $($u.bio)\"; \"COMPANY: $($u.company)\"; \"LOCATION: $($u.location)\"; \"BLOG: $($u.blog)\"; \"PUBLIC_REPOS: $($u.public_repos)\"; \"FOLLOWERS: $($u.followers)\"; \"FOLLOWING: $($u.following)\"; \"CREATED: $($u.created_at)\"; \"REPOS_RETURNED: $($r.Count)\"; $r | Select-Object name,language,stargazers_count,forks_count,updated_at,description | ConvertTo-Json -Depth 3",
+          "timeout": "60"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$h=@{'User-Agent'='WinBrow'}; $u=Invoke-RestMethod -Headers $h 'https://api.github.com/users/leoantony72'; $r=Invoke-RestMethod -Headers $h 'https://api.github.com/users/leoantony72/repos?per_page=100&sort=updated'; $out=@(); $out+='GITHUB PROFILE ANALYSIS: leoantony72'; $out+='='*50; $out+=''; $out+='PROFILE'; $out+='Name: '+$u.name; $out+='Login: '+$u.login; $out+='Bio: '+$u.bio; $out+='Location: '+$u.location; $out+='Blog: '+$u.blog; $out+='Company: '+$u.company; $out+='Public repos: '+$u.public_repos; $out+='Followers: '+$u.followers; $out+='Following: '+$u.following; $out+='Created: '+$u.created_at; $out+='Updated: '+$u.updated_at; $out+=''; $out+='REPOSITORY OVERVIEW'; $out+='Total: '+$r.Count; $langs=$r | Where-Object {$_.language} | Group-Object language | Sort-Object Count -Descending; $out+='Languages:'; foreach($l in $langs){$out+='  '+$l.Name+': '+$l.Count}; $out+=''; $out+='TOP REPOS BY STARS'; foreach($x in ($r | Sort-Object stargazers_count -Descending | Select-Object -First 15)){$out+=('  {0} | {1} stars | {2} | {3}' -f $x.name,$x.stargazers_count,$x.language,$x.description)}; $out+=''; $out+='MOST RECENTLY UPDATED'; foreach($x in ($r | Sort-Object updated_at -Descending | Select-Object -First 15)){$out+=('  {0} | {1} | updated {2} | {3}' -f $x.name,$x.language,$x.updated_at,$x.description)}; $out+=''; $out+='ALL REPOSITORIES'; foreach($x in ($r | Sort-Object name)){$out+=('  - {0} [{1}] stars={2} forks={3}' -f $x.name,$x.language,$x.stargazers_count,$x.forks_count)}; $path=Join-Path $env:USERPROFILE 'Downloads\\github_profile_leoantony72_summary.txt'; $out | Set-Content -Path $path -Encoding UTF8; Write-Output ('SAVED: '+$path); Write-Output ('REPOS: '+$r.Count); Write-Output ('LANGUAGES: '+($langs.Name -join ', ')); Write-Output ('TOP_STARS: '+(($r | Sort-Object stargazers_count -Descending | Select-Object -First 5).name -join ', '))",
+          "timeout": "90"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: browser_navigate -> browser_navigate -> web_search -> browser_navigate -> browser_navigate -> browser_read_page -> browser_get_accessibility_tree -> browser_wait -> browser_navigate -> browser_navigate -> run_command -> run_command -> read_document. Use when the request resembles: analyze the github profile of leoanton72 and make me a detailed summary make it te file and save it in downlods",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792647996.9581435,
+    "uses": 0,
+    "last_used": 1792647996.9581435,
+    "source": "brain"
   }
 ]

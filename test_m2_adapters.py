@@ -612,6 +612,91 @@ class TestBrowserTools(unittest.TestCase):
         self.assertIn("dashboard", block)
 
 
+class TestBrowserTaskTabs(unittest.TestCase):
+    """A browser task must open its own tab, never reuse the user's tab."""
+
+    def _controller(self):
+        from unittest.mock import AsyncMock
+        from winbrow.browser_task import BrowserController
+
+        browser = BrowserController()
+        browser._tabs = AsyncMock(return_value=(
+            "ws",
+            [
+                {"id": "user-tab", "url": "https://mail.google.com", "title": "Inbox"},
+                {"id": "task-tab", "url": "https://github.com", "title": "GitHub"},
+            ],
+        ))
+        browser._open_tab = AsyncMock(
+            side_effect=self._open_tab_side_effect(browser))
+        browser._activate_tab = AsyncMock()
+        return browser
+
+    @staticmethod
+    def _open_tab_side_effect(browser):
+        async def _open_tab(url):
+            # Mirror the real _open_tab: the new tab becomes the task tab.
+            browser._current_tab_id = "task-tab"
+            return {"id": "task-tab", "url": url}
+
+        return _open_tab
+
+    @staticmethod
+    def _fake_page_conn(browser):
+        from contextlib import asynccontextmanager
+
+        class _Conn:
+            async def call(self, *args, **kwargs):
+                return {"result": {}}
+
+        @asynccontextmanager
+        async def page_conn(tab):
+            yield _Conn()
+
+        browser._page_conn = page_conn
+
+    def test_first_navigation_of_task_opens_a_new_tab(self):
+        from unittest.mock import patch
+
+        browser = self._controller()
+        browser.begin_task()
+        with patch("winbrow.browser_task._cdp_available", return_value=True):
+            out = run(browser.navigate_to("https://github.com/trending"))
+
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["method"], "cdp_new_tab")
+        browser._open_tab.assert_awaited_once_with("https://github.com/trending")
+        self.assertEqual(browser._current_tab_id, "task-tab")
+        self.assertFalse(browser._task_tab_pending)
+
+    def test_later_navigation_in_task_reuses_its_tab(self):
+        from unittest.mock import patch
+
+        browser = self._controller()
+        self._fake_page_conn(browser)
+        browser.begin_task()
+        with patch("winbrow.browser_task._cdp_available", return_value=True):
+            run(browser.navigate_to("https://github.com/trending"))
+            out = run(browser.navigate_to("https://github.com/trending/python"))
+
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["method"], "cdp_navigate")
+        browser._open_tab.assert_awaited_once()
+        browser._activate_tab.assert_awaited_with("task-tab")
+
+    def test_navigation_outside_a_task_reuses_the_active_tab(self):
+        from unittest.mock import patch
+
+        browser = self._controller()
+        self._fake_page_conn(browser)
+        with patch("winbrow.browser_task._cdp_available", return_value=True):
+            out = run(browser.navigate_to("https://github.com/trending"))
+
+        self.assertTrue(out["success"], out)
+        browser._open_tab.assert_not_awaited()
+        browser._activate_tab.assert_awaited_with("user-tab")
+
+
 class TestAgentWiring(unittest.TestCase):
     def setUp(self):
         from winbrow.memory.skills import reset_skills

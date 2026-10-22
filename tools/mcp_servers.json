@@ -126,6 +126,7 @@
       "id": "filesystem",
       "command": ["cmd", "/c", "npx", "-y", "@modelcontextprotocol/server-filesystem", "%USERPROFILE%"],
       "timeout_s": 60.0,
+      "preload": true,
       "enabled": true,
       "description": "Official filesystem server: read/write/edit/move/create files+dirs, list, tree, glob search, metadata — sandboxed to the user profile (verified live, 14 tools)"
     },

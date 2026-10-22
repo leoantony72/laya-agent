@@ -52,13 +52,19 @@ _MULTI_STEP_CUES = (
     "star count", "how many stars", "top repository", "top repo",
     "new file called", "new file named", "to a new file", "into a new file",
     "in a new file", "write the results", "write results", "watchlist",
-    "step by step", "multi-step",
+    "step by step", "multi-step", "and inside", "then inside", "and open",
+    "then open", "and play", "then play", "and click", "then click",
+    "and search", "then search", "in the system", "there is an app",
 )
 
 
 def is_multi_step_intent(text: str) -> bool:
     low = (text or "").lower()
-    return any(cue in low for cue in _MULTI_STEP_CUES)
+    if any(cue in low for cue in _MULTI_STEP_CUES):
+        return True
+    if re.search(r"\b(open|launch|start|run)\b.+\b(and|then)\b.+\b(open|play|search|find|click|type|save|create)\b", low):
+        return True
+    return False
 
 # Nicknames the bundled folder tools understand. Kept in one place so the
 # open/close fallback branches agree on what a "folder" can be.
@@ -561,6 +567,9 @@ _LAUNCH_APPS = {
     "chrome": "chrome", "google chrome": "chrome",
     "edge": "msedge", "microsoft edge": "msedge", "msedge": "msedge",
     "firefox": "firefox",
+    "brave": "brave", "brave browser": "brave",
+    "telegram": "telegram", "telegram desktop": "telegram",
+    "whatsapp": "whatsapp",
     "spotify": "spotify", "discord": "discord", "slack": "slack",
     "code": "code", "vscode": "code", "vs code": "code",
     "notepad": "notepad", "explorer": "explorer",
@@ -1167,6 +1176,11 @@ class WinBrowRouter:
         if _STOP_RE.search(lower):
             return Route(kind=STOP, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
 
+        # Multi-step composite intents must always go to the brain planner (NEW_ACTION)
+        # rather than being hijacked by a single heuristic tool.
+        if is_multi_step_intent(cleaned):
+            return Route(kind=NEW_ACTION, confidence=0.85, latency_ms=elapsed_ms, tier="multi_step")
+
         # --- MCP KNOWLEDGE TOOLS (brainless quick routes; M6) ---
         # "what is X on wikipedia" → get_summary ("X" is the title);
         # "search wikipedia for X" → search_wikipedia (titles + snippets);
@@ -1550,6 +1564,9 @@ class WinBrowRouter:
 
         if _STOP_RE.search(lower):
             return Route(kind=STOP, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
+
+        if is_multi_step_intent(cleaned):
+            return Route(kind=NEW_ACTION, confidence=0.85, latency_ms=elapsed_ms, tier="multi_step")
 
         # --- EDITOR RECIPE (same gating as the heuristic layer) ---
         m = _TYPE_RE.match(lower)
