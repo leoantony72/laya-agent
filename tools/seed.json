@@ -27,11 +27,11 @@
   },
   {
     "name": "media_playback",
-    "description": "Control media playback like play, pause, next track, or previous song.",
+    "description": "Control media that is already playing: play/pause, next track, or previous track. Does not open, search for, or start a specific song or video.",
     "examples": [
       "pause the music",
-      "play",
-      "skip song"
+      "resume the video",
+      "next track"
     ],
     "scope": null,
     "args": [
@@ -40,9 +40,9 @@
         "kind": "enum",
         "instructions": "Which playback control?",
         "criteria": {
-          "play_pause": "play or pause music, resume track",
-          "next": "next song, skip track",
-          "prev": "previous song, go back a track"
+          "play_pause": "resume or pause the current track or video",
+          "next": "next track, skip song",
+          "prev": "previous track, go back a song"
         },
         "default": "play_pause"
       }

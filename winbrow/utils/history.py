@@ -25,6 +25,22 @@ DOCUMENT_READ_SKILLS = frozenset({
 DOCUMENT_STEP_LIMIT = 30_000
 DOCUMENT_TOTAL_BUDGET = 60_000
 
+# Browser page snapshots are the biggest per-step history cost. Keep the last
+# three readable and strip page text from everything older; only the newest
+# step gets the full decision context.
+BROWSER_SKILLS = frozenset({
+    "browser_navigate",
+    "browser_read_page",
+    "browser_read_full",
+    "browser_get_accessibility_tree",
+    "browser_interact",
+    "browser_wait",
+    "browser_upload_file",
+})
+PAGE_TEXT_LIMIT_RECENT = 2000
+PAGE_TEXT_LIMIT_CURRENT = 3000
+BROWSER_DETAIL_STEPS = 3
+
 
 def _skill_of(entry: Any) -> str:
     if isinstance(entry, dict):
@@ -129,6 +145,33 @@ def _url_of(entry: Any) -> str:
     return str((getattr(entry, "args", {}) or {}).get("url") or "")
 
 
+def _title_of(entry: Any) -> str:
+    if isinstance(entry, dict):
+        result = entry.get("result")
+        if isinstance(result, dict) and result.get("title"):
+            return str(result["title"])
+        step = entry.get("step")
+        args = step.get("args") if isinstance(step, dict) else entry.get("args")
+        if isinstance(args, dict) and args.get("title"):
+            return str(args["title"])
+        return ""
+    return str(getattr(entry, "title", "") or "")
+
+
+def _compact_browser_outcome(entry: Any) -> str:
+    """URL/title only — page text is stripped from older browser steps."""
+    parts: List[str] = []
+    url = _url_of(entry)
+    title = _title_of(entry)
+    if url:
+        parts.append(f"url={url}")
+    if title:
+        parts.append(f"title={title}")
+    if parts:
+        return " ".join(parts)
+    return _output_of(entry)[:OUTCOME_LIMIT].split("\n")[0]
+
+
 def _domain_from_url(url: str) -> str:
     raw = str(url or "").strip()
     if not raw:
@@ -181,7 +224,10 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
     lines: List[str] = []
 
     for i, entry in enumerate(history[:older_count]):
-        outcome = _output_of(entry)[:OUTCOME_LIMIT].split("\n")[0]
+        if _skill_of(entry) in BROWSER_SKILLS:
+            outcome = _compact_browser_outcome(entry)
+        else:
+            outcome = _output_of(entry)[:OUTCOME_LIMIT].split("\n")[0]
         warning = _warning_of(entry)
         warning_text = f" ⚠ _warning: {warning[:160]}" if warning else ""
         ok = "✓" if _success_of(entry) else "✗"
@@ -199,10 +245,20 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
         warning = _warning_of(entry)
         warning_text = f"\n     ⚠ _warning: {warning}" if warning else ""
         args = _format_args(_args_of(entry))
+        if _skill_of(entry) in BROWSER_SKILLS:
+            distance = len(recent) - 1 - idx
+            if distance >= BROWSER_DETAIL_STEPS:
+                output = _compact_browser_outcome(entry)
+            elif distance == 0:
+                output = _output_of(entry)[:PAGE_TEXT_LIMIT_CURRENT]
+            else:
+                output = _output_of(entry)[:PAGE_TEXT_LIMIT_RECENT]
+        else:
+            output = _output_of(entry)[:limits[idx]]
         lines.append(
             f"  Step {i + 1}: {_skill_of(entry)}({args}) → "
             f"success={_success_of(entry)} "
-            f"output={_output_of(entry)[:limits[idx]]}"
+            f"output={output}"
             f"{warning_text}"
         )
 

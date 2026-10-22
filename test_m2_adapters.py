@@ -463,12 +463,13 @@ class TestBrowserTools(unittest.TestCase):
 
         tools = {t.name: t for t in get_browser_tools()}
         self.assertEqual(set(tools), {
-            "browser_navigate", "browser_read_page",
+            "browser_navigate", "browser_read_page", "browser_read_full",
             "browser_get_accessibility_tree",
             "browser_interact", "browser_wait", "browser_upload_file",
         })
         self.assertTrue(all(t.impl == BROWSER_IMPL for t in tools.values()))
         self.assertEqual(tool_tier("browser_read_page"), "t0")
+        self.assertEqual(tool_tier("browser_read_full"), "t0")
         self.assertEqual(tool_tier("browser_get_accessibility_tree"), "t0")
         self.assertEqual(tool_tier("browser_interact"), "t1")
         self.assertEqual(tool_tier("browser_upload_file"), "t1")
@@ -496,6 +497,88 @@ class TestBrowserTools(unittest.TestCase):
         self.assertTrue(out["success"], out)
         self.assertIn("truncated", out["output"])
         self.assertLess(len(out["output"]), 4000)
+
+    def test_read_full_returns_text_and_filtered_elements(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        class FullBrowser(self.FakeBrowser):
+            async def execute_js(self, code):
+                if "data-winbrow-id" in code:
+                    return {
+                        "success": True,
+                        "value": {
+                            "title": "Trending",
+                            "url": "https://github.com/trending/python",
+                            "elements": [
+                                {"role": "button", "label": "Upload file",
+                                 "selector": '[data-winbrow-id="w0"]'},
+                                {"role": "link", "label": "owner / repo",
+                                 "selector": '[data-winbrow-id="w1"]'},
+                            ],
+                        },
+                    }
+                return await super().execute_js(code)
+
+        browser = FullBrowser()
+        out = run(execute_browser_tool(
+            "browser_read_full", {"target": "upload"}, browser=browser))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["element_count"], 1)
+        self.assertEqual(out["target"], "upload")
+        self.assertIn("58,234 stars", out["output"])
+        self.assertIn("PAGE TEXT", out["output"])
+        self.assertIn("INTERACTIVE ELEMENTS: matching 'upload'", out["output"])
+        self.assertIn('[data-winbrow-id="w0"]', out["output"])
+        self.assertNotIn('[data-winbrow-id="w1"]', out["output"])
+
+    def test_accessibility_tree_filters_by_target_and_chars(self):
+        from winbrow.browser_tools import execute_browser_tool
+
+        class TreeBrowser(self.FakeBrowser):
+            async def execute_js(self, code):
+                return {
+                    "success": True,
+                    "value": {
+                        "title": "Trending",
+                        "url": "https://github.com/trending/python",
+                        "elements": [
+                            {"role": "button", "label": "Upload file",
+                             "selector": '[data-winbrow-id="w0"]'},
+                            {"role": "link", "label": "owner / repo",
+                             "selector": '[data-winbrow-id="w1"]'},
+                        ],
+                    },
+                }
+
+        browser = TreeBrowser()
+        out = run(execute_browser_tool(
+            "browser_get_accessibility_tree",
+            {"target": "upload", "max_chars": "1000"}, browser=browser))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(out["element_count"], 1)
+        self.assertEqual(out["total_elements"], 2)
+        self.assertNotIn("owner / repo", out["output"])
+
+        async def dense_js(code):
+            return {
+                "success": True,
+                "value": {
+                    "title": "Dense",
+                    "url": "https://example.com",
+                    "elements": [
+                        {"role": "button", "label": "Button " + "x" * 100,
+                         "selector": f'[data-winbrow-id="w{i}"]'}
+                        for i in range(200)
+                    ],
+                },
+            }
+
+        dense = TreeBrowser()
+        dense.execute_js = dense_js
+        truncated = run(execute_browser_tool(
+            "browser_get_accessibility_tree", {"max_chars": "1200"}, browser=dense))
+        self.assertTrue(truncated["_truncated"], truncated)
+        self.assertIn("... [truncated]", truncated["output"])
 
     def test_interact_selector_clicks_and_types(self):
         from winbrow.browser_tools import execute_browser_tool
@@ -560,6 +643,34 @@ class TestBrowserTools(unittest.TestCase):
         self.assertGreater(len(block), 400)
         self.assertLessEqual(len(block), 3600)
         self.assertIn("repo evidence", block)
+
+    def test_browser_turns_get_tighter_reasoning_and_brevity(self):
+        from winbrow.brain.model_gateway import (
+            PLANNER_CALL_CONFIG,
+            REASONING_MAX_TOKENS,
+            get_reasoning_config,
+        )
+        from winbrow.brain.prompt import BROWSER_BREVITY, build_planner_message
+
+        browser_history = [
+            {"skill": "browser_navigate"},
+            {"skill": "browser_read_full"},
+            {"skill": "browser_interact"},
+        ]
+        self.assertEqual(
+            get_reasoning_config(browser_history),
+            {"max_tokens": 8000, "reasoning_max": 600},
+        )
+        self.assertEqual(
+            get_reasoning_config([{"skill": "open_file"}]),
+            {
+                "max_tokens": PLANNER_CALL_CONFIG["max_tokens"],
+                "reasoning_max": REASONING_MAX_TOKENS,
+            },
+        )
+        message = build_planner_message(
+            "upload the file", [{"skill": "browser_read_full"}])
+        self.assertIn(BROWSER_BREVITY, message)
 
     def test_brain_history_caps_long_browser_loops(self):
         from winbrow.brain.agent_loop import BrainStepResult, _history_block
@@ -659,13 +770,16 @@ class TestBrowserTaskTabs(unittest.TestCase):
         from unittest.mock import patch
 
         browser = self._controller()
+        self._fake_page_conn(browser)
         browser.begin_task()
         with patch("winbrow.browser_task._cdp_available", return_value=True):
             out = run(browser.navigate_to("https://github.com/trending"))
 
         self.assertTrue(out["success"], out)
-        self.assertEqual(out["method"], "cdp_new_tab")
-        browser._open_tab.assert_awaited_once_with("https://github.com/trending")
+        self.assertEqual(out["method"], "cdp_navigate")
+        self.assertEqual(out["tab"], "new")
+        browser._open_tab.assert_awaited_once_with("about:blank")
+        self.assertEqual(browser._agent_tab_id, "task-tab")
         self.assertEqual(browser._current_tab_id, "task-tab")
         self.assertFalse(browser._task_tab_pending)
 
@@ -684,7 +798,37 @@ class TestBrowserTaskTabs(unittest.TestCase):
         browser._open_tab.assert_awaited_once()
         browser._activate_tab.assert_awaited_with("task-tab")
 
-    def test_navigation_outside_a_task_reuses_the_active_tab(self):
+    def test_page_state_cache_reuses_until_forced(self):
+        browser = self._controller()
+        calls = {"fetch": 0}
+
+        async def current_url():
+            return "https://example.com/page"
+
+        async def fetch_state():
+            calls["fetch"] += 1
+            return {
+                "title": "Example",
+                "url": "https://example.com/page",
+                "text": f"snapshot {calls['fetch']}",
+                "links": [],
+                "method": "cdp",
+            }
+
+        browser._get_current_url = current_url
+        browser._fetch_page_state = fetch_state
+        first = run(browser.get_page_state())
+        cached = run(browser.get_page_state())
+        forced = run(browser.get_page_state(force_refresh=True))
+
+        self.assertEqual(calls["fetch"], 2)
+        self.assertNotIn("_cached", first)
+        self.assertTrue(cached["_cached"])
+        self.assertEqual(cached["text"], "snapshot 1")
+        self.assertNotIn("_cached", forced)
+        self.assertEqual(forced["text"], "snapshot 2")
+
+    def test_navigation_outside_a_task_still_gets_an_agent_tab(self):
         from unittest.mock import patch
 
         browser = self._controller()
@@ -693,8 +837,10 @@ class TestBrowserTaskTabs(unittest.TestCase):
             out = run(browser.navigate_to("https://github.com/trending"))
 
         self.assertTrue(out["success"], out)
-        browser._open_tab.assert_not_awaited()
-        browser._activate_tab.assert_awaited_with("user-tab")
+        self.assertEqual(out["method"], "cdp_navigate")
+        browser._open_tab.assert_awaited_once_with("about:blank")
+        browser._activate_tab.assert_awaited_with("task-tab")
+        self.assertEqual(browser._agent_tab_id, "task-tab")
 
 
 class TestAgentWiring(unittest.TestCase):

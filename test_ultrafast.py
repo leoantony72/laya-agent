@@ -2,7 +2,12 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 
-from winbrow.ultrafast import InteractiveElement, LayaUltrafastEngine, UltrafastStep
+from winbrow.ultrafast import (
+    InteractiveElement,
+    LayaUltrafastEngine,
+    UltrafastStep,
+    _clean_video_query,
+)
 
 
 class TestLayaUltrafastEngine(unittest.TestCase):
@@ -18,6 +23,12 @@ class TestLayaUltrafastEngine(unittest.TestCase):
         self.mock_browser.get_current_url = AsyncMock(return_value={"url": "about:blank", "title": ""})
 
         self.engine = LayaUltrafastEngine(self.mock_browser)
+
+    def test_clean_video_query_understands_yt_alias(self):
+        self.assertEqual(
+            _clean_video_query("play timeless song in yt"), "timeless")
+        self.assertEqual(
+            _clean_video_query("play timeless song on youtube"), "timeless")
 
     def test_harvest_elements_parses_dom_nodes(self):
         self.mock_browser.execute_js.return_value = {

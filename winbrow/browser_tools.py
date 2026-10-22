@@ -1,8 +1,9 @@
 """
 Browser primitives for the System-2 browser loop
 ================================================
-`browser_navigate`, `browser_read_page`, `browser_interact`, `browser_wait`
-and `browser_upload_file` expose the browser as small, observable steps. The
+`browser_navigate`, `browser_read_full`, `browser_read_page`,
+`browser_interact`, `browser_wait` and `browser_upload_file` expose the browser
+as small, observable steps. The
 Brain planner can therefore navigate, inspect what actually rendered, and act
 on the result instead of asking the one-shot Laya engine to finish a whole
 research task in one call.
@@ -18,6 +19,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import TYPE_CHECKING, Any, Optional
 
 from .ultrafast import LayaUltrafastEngine
@@ -34,6 +36,11 @@ _MAX_STATE_CHARS = 9000
 _MAX_LINKS = 40
 _MAX_WAIT_S = 10.0
 _BROWSER_OP_TIMEOUT_S = 20.0
+# The accessibility tree is capped by CHARACTERS, not by element count, so a
+# dense page cannot cut off the control the brain needs before it appears.
+_MAX_TREE_CHARS = 6000
+_MAX_READ_FULL_TEXT_CHARS = 3000
+_MAX_READ_FULL_TREE_CHARS = 3000
 
 _A11Y_JS = r"""
 (() => {
@@ -51,7 +58,6 @@ _A11Y_JS = r"""
   );
   let n = 0;
   for (const el of nodes) {
-    if (n >= 160) break;
     const tag = (el.tagName || '').toLowerCase();
     const isInput = tag === 'input' || tag === 'textarea' || tag === 'select';
     const isFile = tag === 'input' && (el.type || '').toLowerCase() === 'file';
@@ -118,11 +124,12 @@ def get_browser_tools():
         Tool(
             name="browser_navigate",
             description=(
-                "Open a URL in the browser, wait for it to render, and return "
-                "the page title, URL, visible text and links. Use this to start "
-                "a browser task or move to another page. It returns the new page "
-                "state, so a separate browser_read_page call is not needed "
-                "immediately after it."
+                "Open a URL in the agent's own dedicated browser tab, wait for "
+                "it to render, and return the page title, URL, visible text and "
+                "links. The first navigation of a task creates the agent tab; "
+                "later calls reuse it. It returns the new page state, so a "
+                "separate browser_read_page call is not needed immediately "
+                "after it."
             ),
             script="",
             impl=BROWSER_IMPL,
@@ -133,7 +140,7 @@ def get_browser_tools():
                 ),
                 ArgSpec(
                     name="new_tab", kind="text",
-                    instructions="'true' to open in a new tab, 'false' to reuse the active tab",
+                    instructions="'true' to force a fresh agent tab, 'false' to reuse the agent tab",
                     default="false",
                 ),
             ],
@@ -147,11 +154,10 @@ def get_browser_tools():
         Tool(
             name="browser_read_page",
             description=(
-                "Read the CURRENT browser page without navigating: title, URL, "
-                "cleaned visible text and links. Use it to inspect or extract "
-                "data from the page that is open, such as repository names, "
-                "star counts, dates and descriptions. Reuse the URL from "
-                "HISTORY if the browser's current URL is unknown."
+                "Read only the CURRENT page's title, URL, visible text and "
+                "links. Use it to re-check text after browser_read_full already "
+                "ran, or when interactive elements are not needed. Prefer "
+                "browser_read_full as the first read on an unfamiliar page."
             ),
             script="",
             impl=BROWSER_IMPL,
@@ -175,21 +181,64 @@ def get_browser_tools():
             ],
         ),
         Tool(
-            name="browser_get_accessibility_tree",
+            name="browser_read_full",
             description=(
-                "List the CURRENT page's interactive elements (links, buttons, "
-                "inputs, labels) with roles, accessible names and CSS selectors. "
-                "Use this before browser_interact on an unfamiliar page: find "
-                "the upload button/input here, then pass its selector. This is "
-                "the browser alternative to screen_read_text/OCR."
+                "Read the current page text AND interactive elements in one "
+                "call. Use as the first step on any unfamiliar page before "
+                "interacting. Returns title, URL, visible text, links, and a "
+                "filtered accessibility tree. Replaces calling "
+                "browser_read_page and browser_get_accessibility_tree "
+                "separately. Pass target= to filter elements by label."
             ),
             script="",
             impl=BROWSER_IMPL,
             args=[
                 ArgSpec(
-                    name="max_elements", kind="text",
-                    instructions="Maximum elements to return (20-160)",
-                    default="80",
+                    name="target", kind="text",
+                    instructions="Optional label/role filter, e.g. 'upload' or 'search'",
+                    default="",
+                ),
+                ArgSpec(
+                    name="max_text_chars", kind="text",
+                    instructions="Maximum page-text characters (1000-5000)",
+                    default="3000",
+                ),
+                ArgSpec(
+                    name="max_tree_chars", kind="text",
+                    instructions="Maximum accessibility-tree characters (1000-6000)",
+                    default="3000",
+                ),
+            ],
+            speak="result",
+            examples=[
+                "read the page and show what I can click",
+                "find the upload control and read the page",
+                "inspect this page before acting",
+            ],
+        ),
+        Tool(
+            name="browser_get_accessibility_tree",
+            description=(
+                "List interactive elements with roles, labels and selectors. "
+                "Use when browser_read_full already ran but you need to update "
+                "the element list without re-reading page text. Pass target= "
+                "to return only elements matching a label (upload, submit, "
+                "search etc). Never call this immediately after "
+                "browser_read_full on the same unchanged page — it returns the "
+                "same data."
+            ),
+            script="",
+            impl=BROWSER_IMPL,
+            args=[
+                ArgSpec(
+                    name="target", kind="text",
+                    instructions="Optional label/role filter, case-insensitive",
+                    default="",
+                ),
+                ArgSpec(
+                    name="max_chars", kind="text",
+                    instructions="Maximum tree characters to return (1000-12000)",
+                    default="6000",
                 ),
             ],
             speak="result",
@@ -225,13 +274,11 @@ def get_browser_tools():
         Tool(
             name="browser_interact",
             description=(
-                "Perform ONE interaction on the current page: click a link or "
-                "button, type into a field, submit a search, or scroll. Prefer "
-                "passing a CSS selector and (for typing) a value when known; "
-                "otherwise give a natural-language instruction and Laya will "
-                "choose the element. For file uploads, use browser_upload_file "
-                "after clicking the button that opens file selection. Returns "
-                "the resulting page state."
+                "Perform exactly one click, type or submit. Pass selector= "
+                "directly if you already have it from a prior accessibility "
+                "tree call — this skips the internal tree walk and runs faster. "
+                "Never use for file upload — use browser_upload_file instead. "
+                "Returns the resulting page state."
             ),
             script="",
             impl=BROWSER_IMPL,
@@ -328,7 +375,69 @@ def _render_state(state: dict, max_chars: int) -> str:
     return _clip("\n".join(lines), _MAX_STATE_CHARS)
 
 
-async def _page_state(browser: "BrowserController", max_chars: int) -> tuple[dict, str]:
+def _filter_elements(elements: list, target: str) -> list:
+    """Keep only nodes whose role or label contains ``target``."""
+    needle = str(target or "").strip().lower()
+    if not needle:
+        return elements
+    matched = []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        label = str(el.get("label") or "").lower()
+        role = str(el.get("role") or "").lower()
+        if needle in label or needle in role:
+            matched.append(el)
+    return matched
+
+
+def _render_elements(elements: list, max_chars: int) -> tuple[str, bool]:
+    """Render interactive elements, truncating by characters not count."""
+    lines: list[str] = []
+    for el in elements:
+        if not isinstance(el, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(el.get("label") or "")).strip()
+        if not label:
+            continue
+        role = str(el.get("role") or el.get("tag") or "element")
+        selector = str(el.get("selector") or "")
+        extras = []
+        if el.get("type"):
+            extras.append(f"type={el['type']}")
+        if el.get("href"):
+            extras.append(f"href={str(el['href'])[:100]}")
+        if el.get("disabled"):
+            extras.append("disabled")
+        suffix = (" (" + ", ".join(extras) + ")") if extras else ""
+        lines.append(f"- {role} \"{label[:100]}\"{suffix} -> selector {selector}")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        cut = text[:max_chars].rstrip()
+        text = cut + "\n... [truncated]"
+        return text, True
+    return text, False
+
+
+async def _page_state(browser: "BrowserController", max_chars: int,
+                      force_refresh: bool = False) -> tuple[dict, str]:
+    # BrowserController.get_page_state caches the snapshot while the URL is
+    # unchanged, so a read immediately after navigate/interact/wait is free.
+    getter = getattr(browser, "get_page_state", None)
+    if callable(getter):
+        state = await getter(force_refresh=force_refresh)
+        if state.get("error"):
+            return {"error": str(state["error"])}, "error"
+        method = str(state.get("method") or "cdp")
+        state = {
+            "title": str(state.get("title") or ""),
+            "url": str(state.get("url") or ""),
+            "text": str(state.get("text") or ""),
+            "links": state.get("links") or [],
+        }
+        return state, method
+
     result = await browser.execute_js(_PAGE_STATE_JS)
     if result.get("success"):
         value = result.get("value")
@@ -367,8 +476,9 @@ async def _page_state(browser: "BrowserController", max_chars: int) -> tuple[dic
 
 
 async def _state_output(browser: "BrowserController", url: str = "",
-                        max_chars: int = _MAX_PAGE_CHARS) -> dict[str, Any]:
-    state, method = await _page_state(browser, max_chars)
+                        max_chars: int = _MAX_PAGE_CHARS,
+                        force_refresh: bool = False) -> dict[str, Any]:
+    state, method = await _page_state(browser, max_chars, force_refresh=force_refresh)
     if state.get("error"):
         return {
             "success": False,
@@ -407,7 +517,7 @@ async def _navigate(browser: "BrowserController", args: dict) -> dict[str, Any]:
         }
 
     await asyncio.sleep(1.0)
-    state = await _state_output(browser, url=url)
+    state = await _state_output(browser, url=url, force_refresh=True)
     if new_tab and (
         not state.get("success")
         or str(state.get("url") or "").startswith("about:")
@@ -420,10 +530,12 @@ async def _navigate(browser: "BrowserController", args: dict) -> dict[str, Any]:
             again = await browser.navigate_to(url, new_tab=False)
             if again.get("success", True):
                 await asyncio.sleep(1.0)
-                state = await _state_output(browser, url=url)
+                state = await _state_output(browser, url=url, force_refresh=True)
         except Exception:
             pass
     state["navigation"] = navigation
+    if navigation.get("tab"):
+        state["tab"] = navigation["tab"]
     if state.get("success"):
         state["output"] = f"Navigated to {state.get('url') or url}\n\n{state['output']}"
     return state
@@ -432,7 +544,90 @@ async def _navigate(browser: "BrowserController", args: dict) -> dict[str, Any]:
 async def _read(browser: "BrowserController", args: dict) -> dict[str, Any]:
     max_chars = _int_arg(args, "max_chars", _MAX_PAGE_CHARS, 1000, _MAX_PAGE_CHARS)
     url = _normalise_url(args.get("url") or "")
-    return await _state_output(browser, url=url, max_chars=max_chars)
+    return await _state_output(
+        browser, url=url, max_chars=max_chars, force_refresh=False)
+
+
+def _parse_tree_value(value: Any) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+async def _read_full(browser: "BrowserController", args: dict) -> dict[str, Any]:
+    """Return page text and interactive elements from one parallel read."""
+    target = str(args.get("target") or args.get("query") or "").strip()
+    max_text = _int_arg(
+        args, "max_text_chars", _MAX_READ_FULL_TEXT_CHARS,
+        1000, _MAX_PAGE_CHARS)
+    max_tree = _int_arg(
+        args, "max_tree_chars", _MAX_READ_FULL_TREE_CHARS,
+        1000, _MAX_TREE_CHARS)
+
+    state_task = _page_state(browser, max_text, force_refresh=False)
+    tree_task = browser.execute_js(_A11Y_JS)
+    (state, method), tree_result = await asyncio.gather(state_task, tree_task)
+
+    tree_value = _parse_tree_value(
+        tree_result.get("value") if tree_result.get("success") else None)
+    if state.get("error") and not tree_value:
+        return {
+            "success": False,
+            "output": f"Could not read the page: {state['error']}",
+            "method": method,
+        }
+
+    raw_text = str(state.get("text") or "")
+    text = _clip(raw_text, max_text)
+    links = state.get("links") or []
+    elements = tree_value.get("elements") or []
+    matched = _filter_elements(elements, target)
+    tree_text, tree_truncated = _render_elements(matched, max_tree)
+    title = str(state.get("title") or tree_value.get("title") or "")
+    url = str(state.get("url") or tree_value.get("url") or "")
+
+    lines = [f"Title: {title or '(untitled)'}", f"URL: {url or '(unknown)'}",
+             "", "PAGE TEXT:", text or "(empty)"]
+    rendered_links = []
+    for link in links[:_MAX_LINKS]:
+        if not isinstance(link, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(link.get("text") or "")).strip()
+        href = str(link.get("href") or "").strip()
+        if label and href:
+            rendered_links.append(f"- {label[:120]} -> {href}")
+    if rendered_links:
+        lines.extend(["", "LINKS:"])
+        lines.extend(rendered_links)
+    lines.extend([
+        "",
+        "INTERACTIVE ELEMENTS:"
+        + (f" matching {target!r}" if target else ""),
+        tree_text or "(no interactive elements found)",
+    ])
+
+    result: dict[str, Any] = {
+        "success": True,
+        "output": _clip("\n".join(lines), _MAX_STATE_CHARS),
+        "url": url,
+        "title": title,
+        "text": text,
+        "links": links[:_MAX_LINKS],
+        "elements": matched,
+        "element_count": len(matched),
+        "method": method,
+    }
+    if target:
+        result["target"] = target
+    if len(raw_text) > max_text:
+        result["_truncated_text"] = True
+    if tree_truncated:
+        result["_truncated_tree"] = True
+        result["_truncated"] = True
+    return result
 
 
 _ACTION_PREFIX_RE = re.compile(
@@ -476,57 +671,44 @@ def _pick_element(instruction: str, elements: list) -> Optional[dict]:
 
 
 async def _accessibility_tree(browser: "BrowserController", args: dict) -> dict[str, Any]:
-    """DOM-derived interactive-element snapshot (no OCR, no screenshots)."""
-    max_elements = _int_arg(args, "max_elements", 80, 20, 160)
+    """DOM-derived interactive-element snapshot (no OCR, no screenshots).
+
+    ``target`` filters the tree by role/label in a single call, so the brain
+    gets the exact control instead of the whole page and a retry. The only
+    output cap is ``max_chars`` (characters, not elements).
+    """
+    target = str(args.get("target") or args.get("query") or "").strip()
+    max_chars = _int_arg(args, "max_chars", _MAX_TREE_CHARS, 1000, 12000)
     result = await browser.execute_js(_A11Y_JS)
     if not result.get("success"):
         return {
             "success": False,
             "output": f"Could not read the accessibility tree: {result.get('error') or 'CDP unavailable'}",
         }
-    value = result.get("value")
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except ValueError:
-            value = {}
-    if not isinstance(value, dict):
-        value = {}
+    value = _parse_tree_value(result.get("value"))
     elements = value.get("elements") or []
+    matched = _filter_elements(elements, target)
     title = str(value.get("title") or "")
     url = str(value.get("url") or "")
+    tree_text, truncated = _render_elements(matched, max_chars)
+    header = "INTERACTIVE ELEMENTS:"
+    if target:
+        header += f" matching {target!r}"
     lines = [f"Title: {title or '(untitled)'}", f"URL: {url or '(unknown)'}", "",
-             "INTERACTIVE ELEMENTS:"]
-    shown = 0
-    for el in elements:
-        if not isinstance(el, dict):
-            continue
-        if shown >= max_elements:
-            break
-        label = re.sub(r"\s+", " ", str(el.get("label") or "")).strip()
-        if not label:
-            continue
-        role = str(el.get("role") or el.get("tag") or "element")
-        selector = str(el.get("selector") or "")
-        extras = []
-        if el.get("type"):
-            extras.append(f"type={el['type']}")
-        if el.get("href"):
-            extras.append(f"href={str(el['href'])[:100]}")
-        if el.get("disabled"):
-            extras.append("disabled")
-        suffix = (" (" + ", ".join(extras) + ")") if extras else ""
-        lines.append(f"- {role} \"{label[:100]}\"{suffix} -> selector {selector}")
-        shown += 1
-    if shown == 0:
-        lines.append("(no interactive elements found)")
-    return {
+             header, tree_text or "(no interactive elements found)"]
+    output: dict[str, Any] = {
         "success": True,
         "output": _clip("\n".join(lines), _MAX_STATE_CHARS),
         "url": url,
         "title": title,
-        "element_count": shown,
+        "element_count": len(matched),
+        "total_elements": len(elements),
     }
+    if target:
+        output["target"] = target
+    if truncated:
+        output["_truncated"] = True
+    return output
 
 
 async def _type_or_upload(browser: "BrowserController", selector: str,
@@ -635,7 +817,7 @@ async def _interact(browser: "BrowserController", args: dict) -> dict[str, Any]:
                 return {"success": False, "output": f"Browser interaction failed: {exc}"}
 
     await asyncio.sleep(0.6)
-    state = await _state_output(browser)
+    state = await _state_output(browser, force_refresh=True)
     detail = result.get("output") or result.get("error") or ""
     state["output"] = (
         f"Action: {action or 'interact'}"
@@ -656,7 +838,7 @@ async def _wait(browser: "BrowserController", args: dict) -> dict[str, Any]:
     seconds = max(0.0, min(_MAX_WAIT_S, seconds))
     if seconds:
         await asyncio.sleep(seconds)
-    return await _state_output(browser)
+    return await _state_output(browser, force_refresh=True)
 
 
 # Google Drive upload sequence — the order matters:
@@ -770,15 +952,33 @@ async def browser_upload_file(
         return {"success": False, "output": f"File upload failed: {exc}"}
 
 
+def _tab_kind(browser: "BrowserController") -> str:
+    """Where a browser call acted: the agent tab or the user's browser."""
+    return "agent" if getattr(browser, "_agent_tab_id", None) else "user"
+
+
+def _key_arg(args: dict) -> str:
+    for name in ("url", "instruction", "file_path", "path", "target", "query"):
+        value = str(args.get(name) or "").strip()
+        if value:
+            return value[:60]
+    return ""
+
+
 async def execute_browser_tool(tool_name: str, args: dict,
                                browser: Optional["BrowserController"] = None) -> dict[str, Any]:
     """Execute one browser primitive against the agent's BrowserController."""
     if browser is None:
         return {"success": False, "output": "No browser controller available."}
+
+    t0 = time.perf_counter()
+    tab_before = _tab_kind(browser)
     if tool_name == "browser_navigate":
         operation = _navigate(browser, args)
     elif tool_name == "browser_read_page":
         operation = _read(browser, args)
+    elif tool_name == "browser_read_full":
+        operation = _read_full(browser, args)
     elif tool_name == "browser_get_accessibility_tree":
         operation = _accessibility_tree(browser, args)
     elif tool_name == "browser_interact":
@@ -793,9 +993,9 @@ async def execute_browser_tool(tool_name: str, args: dict,
         return {"success": False, "output": f"Unknown browser op '{tool_name}'"}
 
     try:
-        return await asyncio.wait_for(operation, timeout=_BROWSER_OP_TIMEOUT_S)
+        result = await asyncio.wait_for(operation, timeout=_BROWSER_OP_TIMEOUT_S)
     except asyncio.TimeoutError:
-        return {
+        result = {
             "success": False,
             "timeout": True,
             "output": (
@@ -804,3 +1004,12 @@ async def execute_browser_tool(tool_name: str, args: dict,
                 "remote debugging / use mcp_fetch as a read-only fallback."
             ),
         }
+
+    elapsed = time.perf_counter() - t0
+    tab = str(result.get("tab") or tab_before)
+    log.info(
+        f"{tool_name} '{_key_arg(args)}' → "
+        f"success={result.get('success')} tab={tab} "
+        f"elapsed={elapsed:.2f}s"
+    )
+    return result

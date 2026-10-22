@@ -13,17 +13,19 @@ args:
     default: 5000
     description: Maximum page-text characters to return, between 1000 and 5000.
 description: >
-  Read the current browser page without navigating and return its title, URL,
-  visible text and links. Use to inspect state before interacting and to verify
-  the result of an action. Do not use for native desktop apps, file contents,
-  or pages that have not loaded yet.
+  Read only the current browser page without navigating and return its title,
+  URL, visible text and links. Use to verify the result of an action or to
+  re-check text when the interactive elements are already known. Prefer
+  browser-read-full as the first read on an unfamiliar page. Do not use for
+  native desktop apps, file contents, or pages that have not loaded yet.
 ---
 
 ## When to Use
 
-Use before browser-interact to find the exact link, label or text to act on,
-and after any action when HISTORY needs proof of the resulting page. It is also
-the correct first choice when the current tab URL is uncertain.
+Use after an action when HISTORY needs proof of the resulting page, or when
+the element list is already known and only text changed. It is also the
+correct fallback when the current tab URL is uncertain. On an unfamiliar page,
+use browser-read-full first: it returns text and controls together.
 
 ## When NOT to Use
 
@@ -33,14 +35,14 @@ the correct first choice when the current tab URL is uncertain.
 - Do not use it immediately after browser-navigate unless the returned state is
   stale or truncated.
 - Do not use it to discover CSS selectors for controls; use
-  browser-accessibility for that.
+  browser-read-full or browser-accessibility for that.
 
 ## Step Pattern
 
 1. browser-navigate or browser-wait establishes the page.
-2. browser-read-page extracts the visible text and links.
-3. Use the exact text or URL discovered here in the next step's args.
-4. browser-accessibility then browser-interact when an element must be clicked.
+2. browser-read-full gets text and interactive elements in one call.
+3. Use the exact text or selector discovered there in the next step's args.
+4. browser-interact performs one action with that selector.
 5. browser-read-page again after the action to confirm the effect.
 
 ## Args Detail

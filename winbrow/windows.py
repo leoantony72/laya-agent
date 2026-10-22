@@ -616,188 +616,212 @@ def get_start_apps_cached() -> list[dict[str, str]]:
     return _START_APPS_CACHE
 
 
+_GENERIC_WINDOW_TOKENS = {
+    "microsoft", "google", "windows", "the", "app", "application",
+    "desktop", "studio", "visual",
+}
+
+
+def _window_anchor(name: str, query: str = "") -> str:
+    tokens = re.findall(r"[a-z0-9]+", (name or query or "").lower())
+    useful = [t for t in tokens if t not in _GENERIC_WINDOW_TOKENS and len(t) >= 3]
+    anchor = min(useful, key=len) if useful else (tokens[0] if tokens else "")
+    return rf"\b{re.escape(anchor)}\b" if anchor else r"(?!)"
+
+
+def _window_match_score(w, query: str, canonical: str, exe_name: str) -> int:
+    pname = (w.process_name or "").lower()
+    pbase = re.sub(r"\.exe$", "", pname)
+    pcompact = re.sub(r"[^a-z0-9]", "", pbase)
+    title = (w.title or "").lower()
+
+    candidates: set[str] = set()
+    for value in (query, canonical):
+        norm = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+        if norm:
+            candidates.add(norm)
+            candidates.add(norm.replace(" ", ""))
+    stem = re.sub(r"\.exe$", "", (exe_name or "").lower())
+    if stem:
+        candidates.add(stem)
+        candidates.add(re.sub(r"(?:32|64)$", "", stem))
+    candidates = {c for c in candidates if len(c) >= 3}
+
+    if pbase and (pbase in candidates or pcompact in candidates):
+        return 4
+    if pbase and any(
+            pbase.startswith(c) or c.startswith(pbase) for c in candidates):
+        return 3
+    if (title and _window_anchor(canonical, query)
+            and re.search(_window_anchor(canonical, query), title, re.I)
+            and not any(b in pname for b in ("chrome", "msedge", "brave",
+                                             "firefox", "opera"))):
+        return 2
+    return 0
+
+
 def resolve_app_launch_target(app_name: str) -> Optional[str]:
-    """Resolve an application name to an executable path, shell:AppsFolder URI, or protocol."""
-    name_clean = str(app_name or "").strip().lower()
-    if not name_clean:
+    """Resolve a spoken app name to an exe path, shortcut, AppID or protocol."""
+    from .apps import clean_query, resolve_app
+    name = clean_query(app_name)
+    if not name:
         return None
+    match = resolve_app(name)
+    return match.entry.target if match is not None else None
 
-    local_app_data = os.environ.get("LOCALAPPDATA", "")
-    app_data = os.environ.get("APPDATA", "")
-    program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
-    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
 
-    known_paths = {
-        "chrome": [
-            f"{program_files}\\Google\\Chrome\\Application\\chrome.exe",
-            f"{program_files_x86}\\Google\\Chrome\\Application\\chrome.exe",
-            f"{local_app_data}\\Google\\Chrome\\Application\\chrome.exe",
-        ],
-        "brave": [
-            f"{local_app_data}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-            f"{program_files}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-            f"{program_files_x86}\\BraveSoftware\\Brave-Browser\\Application\\brave.exe",
-        ],
-        "edge": [
-            f"{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe",
-            f"{program_files}\\Microsoft\\Edge\\Application\\msedge.exe",
-        ],
-        "msedge": [
-            f"{program_files_x86}\\Microsoft\\Edge\\Application\\msedge.exe",
-            f"{program_files}\\Microsoft\\Edge\\Application\\msedge.exe",
-        ],
-        "firefox": [
-            f"{program_files}\\Mozilla Firefox\\firefox.exe",
-            f"{program_files_x86}\\Mozilla Firefox\\firefox.exe",
-        ],
-        "telegram": [
-            f"{app_data}\\Telegram Desktop\\Telegram.exe",
-            f"{local_app_data}\\Programs\\Telegram Desktop\\Telegram.exe",
-            f"{program_files}\\Telegram Desktop\\Telegram.exe",
-        ],
-        "code": [
-            f"{local_app_data}\\Programs\\Microsoft VS Code\\Code.exe",
-            f"{program_files}\\Microsoft VS Code\\Code.exe",
-            "code",
-        ],
-        "vscode": [
-            f"{local_app_data}\\Programs\\Microsoft VS Code\\Code.exe",
-            f"{program_files}\\Microsoft VS Code\\Code.exe",
-            "code",
-        ],
-        "notepad": ["notepad.exe"],
-        "calc": ["calc.exe"],
-        "calculator": ["calc.exe"],
-        "spotify": [
-            f"{app_data}\\Spotify\\Spotify.exe",
-        ],
-    }
+def _app_launch_script(target: str) -> str:
+    quoted = "'" + str(target).replace("'", "''") + "'"
+    return f"""
+    $ErrorActionPreference = 'Stop'
+    $target = {quoted}
+    try {{
+        $isShell = $target -like 'shell:*'
+        $isProtocol = $target -match '^[a-zA-Z][a-zA-Z0-9+.-]*:'
+        if ($isShell -or ($isProtocol -and -not (Test-Path -LiteralPath $target))) {{
+            Start-Process -FilePath $target | Out-Null
+            Write-Output "__PID__:0"
+        }} else {{
+            $p = Start-Process -FilePath $target -PassThru -ErrorAction Stop
+            if ($p -and $p.Id) {{ Write-Output ("__PID__:" + $p.Id) }}
+            else {{ Write-Output "__PID__:0" }}
+        }}
+    }} catch {{
+        Write-Output ("__ERR__:" + $_.Exception.Message)
+    }}
+    """
 
-    if name_clean in known_paths:
-        for candidate in known_paths[name_clean]:
-            if os.path.exists(candidate) or candidate in ("notepad.exe", "calc.exe", "code"):
-                return candidate
 
-    # Search StartApps (covers Windows Store apps, e.g. Telegram Desktop, WhatsApp, etc.)
-    apps = get_start_apps_cached()
-    for a in apps:
-        aname = a.get("Name", "").lower()
-        if aname == name_clean:
-            return f"shell:AppsFolder\\{a.get('AppID')}"
-    for a in apps:
-        aname = a.get("Name", "").lower()
-        if name_clean in aname or aname.startswith(name_clean):
-            return f"shell:AppsFolder\\{a.get('AppID')}"
-
-    # Protocol fallbacks
-    proto_map = {
-        "telegram": "tg://",
-        "spotify": "spotify:",
-        "whatsapp": "whatsapp:",
-        "discord": "discord:",
-        "slack": "slack:",
-    }
-    if name_clean in proto_map:
-        return proto_map[name_clean]
-
-    return None
+def _process_matches(exe_name: str, canonical: str) -> bool:
+    stem = re.sub(r"\.exe$", "", (exe_name or "").lower())
+    stem = re.sub(r"(?:32|64)$", "", stem)
+    fallback = re.sub(r"[^a-z0-9]+", "", (canonical or "").lower())
+    if not stem and not fallback:
+        return False
+    for proc in psutil.process_iter(["name"]):
+        try:
+            pname = (proc.info.get("name") or "").lower()
+            pbase = re.sub(r"\.exe$", "", pname)
+            pcompact = re.sub(r"[^a-z0-9]", "", pbase)
+            if stem and (pbase.startswith(stem) or stem.startswith(pbase)):
+                return True
+            if fallback and (pcompact == fallback or pcompact.startswith(fallback)):
+                return True
+        except Exception:
+            continue
+    return False
 
 
 async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
-    """Activate window if running, or launch executable and ensure focus."""
-    name_clean = str(app_name or "").strip()
-    if not name_clean:
+    """Activate a running app, or launch the resolved installed app."""
+    raw = str(app_name or "").strip()
+    if not raw:
         return {"success": False, "output": "Missing application name"}
 
-    # 1. First check if a window for this app is already open.
-    # Matching is ranked and anchored: an exact process base name wins
-    # ("code" → Code.exe), a prefix match next, then a word-boundary title
-    # hit. "code" must never match OpenCode.exe / barcode-anything —
-    # unanchored substring matching caused exactly that misfire.
+    from .apps import clean_query, resolve_app, resolve_shortcut_target, suggestions
+
+    query = clean_query(raw)
+    match = await asyncio.to_thread(resolve_app, query)
+    canonical = match.entry.name if match is not None else query
+    exe_name = match.entry.exe_name if match is not None else ""
+
+    # 1. Focus an existing window before launching a second copy.
+    # Exact process base wins ("code" → Code.exe), then prefix, then an
+    # anchored title hit. "code" must never match OpenCode.exe.
     try:
         from .computer.driver import ComputerDriver
         driver = ComputerDriver(guard_screen=False)
-        wins = driver.list_windows()
-        name_lower = name_clean.lower()
-        base = re.sub(r"\.exe$", "", name_lower)
-        pat = re.compile(rf"\b{re.escape(base)}\b", re.I)
-        match, match_score = None, 0
-        for w in wins:
-            pname = (w.process_name or "").lower()
-            pbase = re.sub(r"\.exe$", "", pname)
-            title = (w.title or "").lower()
-            score = 0
-            if pbase == base:
-                score = 4
-            elif pname.startswith(name_lower):
-                score = 3
-            elif title and pat.search(title) and not any(
-                    b in pname for b in ("chrome", "msedge", "brave",
-                                         "firefox", "opera")):
-                score = 2
-            if score > match_score:
-                match, match_score = w, score
-        if match is not None:
-            driver.focus_window(match.hwnd)
+        best, best_score = None, 0
+        for w in driver.list_windows():
+            score = _window_match_score(w, query, canonical, exe_name)
+            if score > best_score:
+                best, best_score = w, score
+        if best is not None:
+            driver.focus_window(best.hwnd)
             await asyncio.sleep(0.2)
-            return {"success": True, "output": f"Activated {match.process_name or name_clean}", "window": match.to_dict()}
+            return {
+                "success": True,
+                "output": f"Activated {best.process_name or canonical}",
+                "window": best.to_dict(),
+            }
     except Exception as e:
         log.debug(f"Native focus check error: {e}")
 
-    # 2. If not running, resolve target and launch it
-    target = resolve_app_launch_target(name_clean)
-    launched = False
-
-    if target:
+    # 2. No app matched: never launch a guess.
+    if match is None:
+        literal = None
         try:
-            os.startfile(target)
-            launched = True
-            log.info(f"Launched {name_clean} via os.startfile('{target}')")
-        except Exception as e:
-            log.debug(f"os.startfile failed for {target}: {e}")
+            import shutil
+            literal = shutil.which(query) or shutil.which(query + ".exe")
+        except Exception:
+            literal = None
+        if not literal:
+            options = await asyncio.to_thread(suggestions, query)
+            hint = ""
+            if options:
+                hint = " Did you mean " + ", ".join(options) + "?"
+            return {
+                "success": False,
+                "output": f"I couldn't find an installed app called '{query}'.{hint}",
+            }
 
-    if not launched:
-        script = f"""
-        $name = "{name_clean}"
-        $app = Get-StartApps | Where-Object {{ $_.Name -like "*$name*" }} | Select-Object -First 1
-        if ($app) {{
-            $target = "shell:AppsFolder\" + $app.AppID
-            Start-Process $target -ErrorAction SilentlyContinue
-            return "Launched $name"
-        }}
-        $exe = (Get-Command $name -ErrorAction SilentlyContinue).Source
-        if (-not $exe) {{
-            $exe = $name
-        }}
-        Start-Process $exe -ErrorAction SilentlyContinue
-        return "Launched $name"
-        """
-        res = await run_powershell(script)
+    target = match.entry.target if match is not None else literal
+    if match is not None and match.entry.kind == "shortcut":
+        resolved = await asyncio.to_thread(resolve_shortcut_target, target) or ""
+        if resolved:
+            exe_name = os.path.basename(resolved)
 
-    # 3. Wait for the window to appear and bring it to the foreground
+    res = await run_powershell(_app_launch_script(target))
+    stdout = str(res.get("stdout") or "")
+    stderr = str(res.get("stderr") or "").strip()
+    if "__ERR__:" in stdout:
+        detail = stdout.split("__ERR__:", 1)[1].strip()
+        return {"success": False,
+                "output": f"Couldn't launch {canonical}: {detail}"}
+    if not res.get("success", False):
+        detail = stderr or "launch command failed"
+        return {"success": False,
+                "output": f"Couldn't launch {canonical}: {detail}"}
+    launch_pid = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.startswith("__PID__:"):
+            try:
+                value = int(line.split(":", 1)[1])
+                launch_pid = value if value > 0 else None
+            except ValueError:
+                launch_pid = None
+    log.info(f"Launch request for {canonical} -> {target} (pid={launch_pid})")
+
+    # 3. Verify the app actually started; never claim success blindly.
     try:
         from .computer.driver import ComputerDriver
         driver = ComputerDriver(guard_screen=False)
         w_res = driver.wait_for_window(
-            rf"\b{re.escape(name_clean)}\b", timeout=4.0)
+            _window_anchor(canonical, query), timeout=5.0)
         if w_res.get("success") and w_res.get("window"):
-            hwnd = w_res["window"]["hwnd"]
-            driver.focus_window(hwnd)
+            driver.focus_window(w_res["window"]["hwnd"])
             await asyncio.sleep(0.25)
-            return {"success": True, "output": f"Launched and focused {name_clean}", "window": w_res.get("window")}
+            return {
+                "success": True,
+                "output": f"Launched and focused {canonical}",
+                "window": w_res.get("window"),
+            }
+    except AttributeError:
+        pass
     except Exception as e:
         log.debug(f"Window wait/focus after launch error: {e}")
 
-    # Fallback verification: check if process is running
-    for p in psutil.process_iter(["name"]):
-        try:
-            pname = (p.info.get("name") or "").lower()
-            if name_clean in pname or pname.startswith(name_clean):
-                return {"success": True, "output": f"Launched {name_clean}"}
-        except Exception:
-            pass
-
-    return {"success": True, "output": f"Launched {name_clean}"}
+    if launch_pid and psutil.pid_exists(launch_pid):
+        return {"success": True, "output": f"Launched {canonical}"}
+    if _process_matches(exe_name, canonical):
+        return {"success": True, "output": f"Launched {canonical}"}
+    if match is not None and match.entry.kind in ("appid", "protocol"):
+        return {"success": True, "output": f"Launched {canonical}"}
+    return {
+        "success": False,
+        "output": f"I started {canonical}, but couldn't confirm its window appeared.",
+    }
 
 
 async def clean_desktop_to_folder() -> dict[str, Any]:

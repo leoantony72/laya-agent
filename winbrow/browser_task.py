@@ -414,6 +414,28 @@ _BrowserCDP_CLIENT = _BrowserCDP()
 # Cooldown so repeated calls don't spam the opt-in tab while the user decides.
 _INSPECT_OPENED_AT = 0.0
 
+# Page content snapshot used by browser_read_page / browser_read_full. Kept in
+# the controller so its result can be cached between steps.
+_PAGE_STATE_JS = r"""
+(() => {
+  const content = document.querySelector('main, [role="main"], article, #content');
+  const bodyText = document.body ? (document.body.innerText || '') : '';
+  const mainText = content ? (content.innerText || '') : '';
+  const text = mainText.length > 200 ? mainText : bodyText;
+  const seen = new Set();
+  const links = [];
+  for (const a of document.querySelectorAll('a[href]')) {
+    const href = a.href || '';
+    const label = (a.innerText || a.getAttribute('aria-label') || '').trim();
+    if (!href.startsWith('http') || !label || seen.has(href)) continue;
+    seen.add(href);
+    links.push({text: label.slice(0, 160), href: href});
+    if (links.length >= 200) break;
+  }
+  return {title: document.title || '', url: location.href || '', text, links};
+})()
+"""
+
 
 class _HttpPageConn:
     """Short-lived per-page WebSocket (legacy HTTP-discovery mode)."""
@@ -540,26 +562,104 @@ class BrowserController:
         # "auto" picks whichever is running; can override to "chrome" or "edge"
         self.preferred_browser = preferred_browser
         self._current_tab_id: Optional[str] = None
+        # The agent's dedicated tab for the current brain session. Set on the
+        # first navigation and reused by every later browser_* call.
+        self._agent_tab_id: Optional[str] = None
         # Set when a browser task starts: its first navigation gets a fresh tab
-        # instead of taking over the tab the user is currently on.
+        # instead of taking over the tab the user is currently on. Kept for
+        # older callers/tests; reset_session() is the authoritative reset.
         self._task_tab_pending = False
+        # Last page snapshot, reused while the URL is unchanged.
+        self._last_page_state: Optional[dict[str, Any]] = None
+        self._last_page_state_url: Optional[str] = None
+        # True when the most recent get_or_create_agent_tab opened a new tab.
+        self._agent_tab_created = False
 
     # ── Task tab scope ─────────────────────────────────────────────────────
 
-    def begin_task(self) -> None:
-        """Mark the start of a browser task.
+    def reset_session(self) -> None:
+        """Start a fresh browser session (new task → new agent tab).
 
-        Every task must work in its own tab. Rather than opening a blank tab
-        up front (a read-only task such as "what does this page say" still
-        needs the tab in front of the user), the first navigation of the task
-        opens the dedicated tab; later steps reuse it because `_open_tab`
-        records it as `_current_tab_id`.
+        Called at the beginning of every brain loop run. The previous agent
+        tab is left open so the user can inspect the result; only the
+        reference is cleared.
         """
-        self._task_tab_pending = True
+        self._agent_tab_id = None
+        self._task_tab_pending = False
+        self._agent_tab_created = False
+        self._last_page_state = None
+        self._last_page_state_url = None
+
+    def begin_task(self) -> None:
+        """Backwards-compatible alias for reset_session()."""
+        self.reset_session()
 
     def end_task(self) -> None:
-        """Clear the task-tab scope so the next task starts a fresh tab."""
-        self._task_tab_pending = False
+        """Clear the task scope without closing the agent tab."""
+        self.reset_session()
+
+    async def _list_tabs(self) -> list[dict[str, Any]]:
+        """Page tabs, ignoring the transport details."""
+        _, tabs = await self._tabs()
+        return tabs
+
+    async def _open_new_tab(self) -> Optional[str]:
+        """Open a blank tab and return its id, or None when CDP is unavailable."""
+        tab = await self._open_tab("about:blank")
+        if not tab:
+            return None
+        return str(tab.get("id") or "") or None
+
+    async def get_or_create_agent_tab(self) -> Optional[str]:
+        """Return the agent's dedicated tab id.
+
+        Creates a new tab on first call per session and never returns a tab
+        that existed before the current session started. If the agent tab was
+        closed, a fresh one is created.
+        """
+        if self._agent_tab_id is not None:
+            tabs = await self._list_tabs()
+            if any(t.get("id") == self._agent_tab_id for t in tabs):
+                self._agent_tab_created = False
+                return self._agent_tab_id
+            # Tab was closed by the user — fall through and recreate it.
+            self._agent_tab_id = None
+
+        tab_id = await self._open_new_tab()
+        self._agent_tab_id = tab_id
+        self._agent_tab_created = bool(tab_id)
+        return tab_id
+
+    async def _navigate_tab(self, tab_id: str, url: str) -> dict[str, Any]:
+        """Navigate one specific tab via CDP."""
+        _, tabs = await self._tabs()
+        target = next((t for t in tabs if t.get("id") == tab_id), None)
+        if not target and self._agent_tab_created:
+            # A just-created tab can take a moment to appear in Target.getTargets.
+            for _ in range(6):
+                await asyncio.sleep(0.2)
+                _, tabs = await self._tabs()
+                target = next((t for t in tabs if t.get("id") == tab_id), None)
+                if target:
+                    break
+        if not target:
+            return {
+                "success": False,
+                "error": f"Agent tab {tab_id} is no longer open",
+                "url": url,
+            }
+        self._current_tab_id = tab_id
+        await self._activate_tab(tab_id)
+        async with self._page_conn(target) as conn:
+            await conn.call("Page.navigate", {"url": url}, timeout=5)
+        await asyncio.sleep(0.5)
+        return {
+            "success": True,
+            "method": "cdp_navigate",
+            "url": url,
+            "tab_id": tab_id,
+            "tab": "new" if self._agent_tab_created else "agent",
+        }
 
     # ── Detection ──────────────────────────────────────────────────────────
 
@@ -612,7 +712,18 @@ class BrowserController:
         return ("none", [])
 
     def _pick_tab(self, tabs: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
-        """Prefer the remembered tab, else the first non-internal page."""
+        """Prefer the agent tab, then the remembered tab, then a page tab.
+
+        During a brain session the agent tab is the ONLY valid target: if it
+        has been closed, return None instead of silently taking over one of
+        the user's tabs.
+        """
+        agent_tab_id = getattr(self, "_agent_tab_id", None)
+        if agent_tab_id:
+            for t in tabs:
+                if t.get("id") == agent_tab_id:
+                    return t
+            return None
         if getattr(self, "_current_tab_id", None):
             for t in tabs:
                 if t.get("id") == self._current_tab_id:
@@ -858,53 +969,50 @@ class BrowserController:
         }
 
     async def navigate_to(self, url: str, new_tab: bool = False) -> dict[str, Any]:
-        """Navigate the active tab to a URL, or open a new tab first."""
+        """Navigate the agent's dedicated tab, creating it on first use.
+
+        The user's pre-existing tabs are never navigated. ``new_tab=True``
+        forces a fresh agent tab (useful when comparing two sites).
+        """
         if not url.startswith(("http://", "https://", "file://")):
             url = "https://" + url
 
-        # The first navigation of a browser task opens its own tab so the page
-        # the user is working in is never replaced. Later navigations in the
-        # same task reuse that tab (remembered as _current_tab_id).
-        if not new_tab and self._task_tab_pending:
-            log.info(f"Browser task start: opening a new tab for {url}")
-            new_tab = True
+        if new_tab:
+            self._agent_tab_id = None
         self._task_tab_pending = False
 
-        # Ensure browser with CDP is running
+        # Ensure browser with CDP is running (launches a window/tab if none).
         if not _cdp_available():
             await self.ensure_browser_open()
 
-        # Try CDP first (fastest, most reliable, no extra windows)
-        backend, page_tabs = await self._tabs()
-        if backend != "none":
-            if new_tab:
-                # Open a new tab cleanly via CDP
-                new_tab_resp = await self._open_tab(url)
-                if new_tab_resp:
-                    await asyncio.sleep(0.5)
-                    return {"success": True, "method": "cdp_new_tab", "url": url}
-            else:
-                target = self._pick_tab(page_tabs)
-                if target:
-                    self._current_tab_id = target["id"]
-                    await self._activate_tab(target["id"])
-                    try:
-                        async with self._page_conn(target) as conn:
-                            await conn.call("Page.navigate", {"url": url}, timeout=5)
-                        await asyncio.sleep(0.5)
-                        return {"success": True, "method": "cdp_navigate", "url": url}
-                    except Exception as e:
-                        log.debug(f"CDP Page.navigate failed: {e}")
-                else:
-                    # No page tab existed; open one cleanly via CDP
-                    new_tab_resp = await self._open_tab(url)
-                    if new_tab_resp:
-                        await asyncio.sleep(0.5)
-                        return {"success": True, "method": "cdp_new_tab", "url": url}
+        # Always route through the agent's own tab.
+        tab_id = await self.get_or_create_agent_tab()
+        if tab_id:
+            try:
+                navigation = await self._navigate_tab(tab_id, url)
+                if navigation.get("success"):
+                    return navigation
+                log.debug(
+                    f"Agent tab navigation failed: {navigation.get('error')}")
+            except Exception as e:
+                log.debug(f"CDP Page.navigate failed on agent tab: {e}")
 
-        # Fallback only when CDP completely unavailable
+        # CDP is up but tab creation failed: try opening the URL directly.
+        backend, _page_tabs = await self._tabs()
+        if backend != "none":
+            new_tab_resp = await self._open_tab(url)
+            if new_tab_resp:
+                self._agent_tab_id = str(new_tab_resp.get("id") or "") or None
+                self._agent_tab_created = True
+                await asyncio.sleep(0.5)
+                return {
+                    "success": True, "method": "cdp_new_tab", "url": url,
+                    "tab": "new",
+                }
+
+        # Fallback only when CDP is completely unavailable.
         safe_url = url.replace('"', '%22').replace('{', '{{').replace('}', '}}')
-        if new_tab:
+        if new_tab or self._agent_tab_id is None:
             focus_keys = '$ws.SendKeys("^t")\n            Start-Sleep -Milliseconds 300'
         else:
             focus_keys = '$ws.SendKeys("^l")\n            Start-Sleep -Milliseconds 200'
@@ -1060,6 +1168,71 @@ class BrowserController:
             "url": url_match.group(0) if url_match else "Unknown",
             "method": "clipboard",
         }
+
+    # ── Page state cache ───────────────────────────────────────────────────
+
+    async def _get_current_url(self) -> str:
+        """URL of the tab the agent is currently allowed to read."""
+        _, tabs = await self._tabs()
+        target = self._pick_tab(tabs)
+        return str((target or {}).get("url") or "")
+
+    async def _fetch_page_state(self) -> dict[str, Any]:
+        """Fetch a fresh title/url/text/links snapshot via CDP."""
+        result = await self.execute_js(_PAGE_STATE_JS)
+        if result.get("success"):
+            value = result.get("value")
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    value = {"text": value}
+            if isinstance(value, dict):
+                state = {
+                    "title": str(value.get("title") or ""),
+                    "url": str(value.get("url") or ""),
+                    "text": str(value.get("text") or ""),
+                    "links": value.get("links") or [],
+                }
+                if state["text"] or state["title"] or state["url"] or state["links"]:
+                    state["method"] = "cdp"
+                    return state
+
+        fallback = await self.read_page_text()
+        if fallback.get("success"):
+            state = {
+                "title": "",
+                "url": "",
+                "text": str(fallback.get("text") or ""),
+                "links": [],
+                "method": "read_page_text",
+            }
+            try:
+                state["url"] = await self._get_current_url()
+            except Exception:
+                pass
+            return state
+
+        error = result.get("error") or fallback.get("error") or "Could not read the page"
+        return {"error": str(error)}
+
+    async def get_page_state(self, force_refresh: bool = False) -> dict[str, Any]:
+        """Return the page snapshot, reusing it while the URL is unchanged."""
+        current_url = await self._get_current_url()
+        if (
+            not force_refresh
+            and self._last_page_state is not None
+            and self._last_page_state_url == current_url
+        ):
+            cached = dict(self._last_page_state)
+            cached["_cached"] = True
+            return cached
+
+        state = await self._fetch_page_state()
+        if not state.get("error"):
+            self._last_page_state = state
+            self._last_page_state_url = str(state.get("url") or current_url)
+        return state
 
     async def screenshot(self, save_path: Optional[str] = None) -> dict[str, Any]:
         """Capture screenshot of the active browser tab via CDP."""
@@ -1753,7 +1926,7 @@ class BrowserController:
         engine = LayaUltrafastEngine(self)
         # Same task-tab guarantee as the brain loop: nothing may overwrite the
         # tab the user is working in.
-        self.begin_task()
+        self.reset_session()
         try:
             res = await engine.run_task(goal=goal, max_steps=max_steps)
         finally:

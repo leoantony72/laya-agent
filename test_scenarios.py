@@ -109,6 +109,7 @@ SCENARIOS = [
     # ── Browser ──
     ("open the sunshine tab", ["web_search", "laya_ultrafast_browser"], ["navigate"], None),
     ("search for cheap flights", ["web_search", "laya_ultrafast_browser"], [], None),
+    ("play timeless song in yt", ["laya_ultrafast_browser"], ["browser_brain"], None),
     # ── Installer (M3) ──
     ("install spotify", ["app_install"], [], None),
     ("uninstall spotify", ["app_uninstall"], [], None),

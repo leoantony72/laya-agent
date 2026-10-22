@@ -43,7 +43,7 @@ from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
 from .registry import Tool, ToolRegistry
 from .resolvers import resolve_file, resolve_folder
-from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter, _strip_conversational_prefix, autocorrect_utterance, _tokens, _fuzzy_in, _SEARCH_VERBS, _WEB_LOCS, _LOCAL_FIND, _LAUNCH_APPS, _COMMON_APPS, is_multi_step_intent
+from .router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter, _strip_conversational_prefix, autocorrect_utterance, _tokens, _fuzzy_in, _SEARCH_VERBS, _WEB_LOCS, _LOCAL_FIND, _LAUNCH_APPS, _COMMON_APPS, is_multi_step_intent, _is_media_control, _play_browser_goal
 from .windows import WindowsContext, get_current_windows_context, run_powershell, set_windows_volume
 
 log = logging.getLogger("winbrow.agent")
@@ -260,8 +260,8 @@ def _is_known_task(utterance: str) -> bool:
     if "dark mode" in lower or "light mode" in lower or "toggle theme" in lower or "switch theme" in lower:
         return True
     
-    # Media playback
-    if any(w in lower for w in ["play", "pause", "next song", "previous song", "skip track", "media"]):
+    # Media playback controls, or a play/watch-content browser request.
+    if _is_media_control(lower) or _play_browser_goal(cleaned):
         return True
     
     # Direct URL
@@ -550,7 +550,7 @@ class WinBrowAgent:
             max_steps = 20
         # Each task gets its own tab: the first navigation opens a fresh one so
         # the page the user is working in is never hijacked.
-        self.browser.begin_task()
+        self.browser.reset_session()
         try:
             result = await self.brain.handle(
                 contextualized, ctx, session, emit=emit, max_steps=max_steps,
@@ -721,7 +721,46 @@ class WinBrowAgent:
             "success": True,
         }
 
-    async def _dispatch_tool_execution(self, route: "Route", utterance: str, session_id: str) -> dict:
+    async def _run_browser_goal(
+        self,
+        goal: str,
+        ctx: Optional[WindowsContext] = None,
+        session: Optional[SessionMemory] = None,
+        emit: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Run a browser goal through the brain first, ultrafast only as fallback."""
+        ctx = ctx or self.get_context()
+        session = session or self.session
+        if self.gateway.available:
+            try:
+                brain_res, _resolutions = await self.handle_browser_task(
+                    goal, ctx, session, emit=emit,
+                )
+                return brain_res.to_dict()
+            except GatewayUnavailable:
+                log.warning("Browser brain unavailable; using ultrafast fallback.")
+            except Exception as e:
+                log.warning(f"Browser brain failed ({e}); using ultrafast fallback.")
+        out = await self.browser.run_ultrafast_task(goal)
+        return {
+            "type": "browser",
+            "tool": "laya_ultrafast_browser",
+            "success": out.get("success", True),
+            "output": out.get("final_answer") or str(out.get("steps", [])),
+            "steps": out.get("steps", []),
+            "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
+            "method": out.get("method", "laya_ultrafast"),
+        }
+
+    async def _dispatch_tool_execution(
+        self,
+        route: "Route",
+        utterance: str,
+        session_id: str,
+        ctx: Optional[WindowsContext] = None,
+        session: Optional[SessionMemory] = None,
+        emit: Optional[Any] = None,
+    ) -> dict:
         """Shared tool dispatch: fast specials first, single gated funnel else."""
         if route.tool.name == "volume_set_level":
             level_arg = route.args.get("level", "50")
@@ -735,7 +774,12 @@ class WinBrowAgent:
                 "output": out_msg,
                 "elapsed_ms": 1.0,
             }
-        if route.tool.name in ("laya_ultrafast_browser", "web_search"):
+        if route.tool.name == "laya_ultrafast_browser":
+            goal = route.args.get("goal") or route.args.get("query") or utterance
+            return await self._run_browser_goal(
+                goal, ctx=ctx, session=session, emit=emit,
+            )
+        if route.tool.name == "web_search":
             goal = route.args.get("goal") or route.args.get("query") or utterance
             out = await self.browser.run_ultrafast_task(goal)
             return {
@@ -1381,8 +1425,14 @@ class WinBrowAgent:
         # 2. Dispatch
         if route.kind == "tool" and route.tool:
             result["execution"] = await self._dispatch_tool_execution(
-                route, utterance, session_id,
+                route, utterance, session_id, ctx=ctx, session=session, emit=emit,
             )
+            if route.tool.name == "laya_ultrafast_browser" and \
+                    result["execution"].get("type") == "brain":
+                result["route"]["kind"] = "browser"
+                result["route"]["tool_name"] = "browser_brain"
+                result["route"]["tier"] = "browser_brain"
+                route.tier = "browser_brain"
 
         elif route.kind == NEW_ACTION:
             # Brain first (context-aware multi-step + follow-ups). Falls back to
@@ -1392,6 +1442,8 @@ class WinBrowAgent:
                     contextualized, resolutions = session.resolve_references(utterance)
                     if resolutions:
                         log.info(f"Session resolved references: {resolutions}")
+                    # Every brain run starts a fresh browser session tab.
+                    self.browser.reset_session()
                     brain_res = await self.brain.handle(
                         contextualized, ctx, session, emit=emit,
                     )
@@ -1431,7 +1483,14 @@ class WinBrowAgent:
                                  f"({route2.tool.name if route2.tool else None})")
                         result["execution"] = await self._dispatch_tool_execution(
                             route2, result["utterance"], session_id,
+                            ctx=ctx, session=session, emit=emit,
                         )
+                        if route2.tool and route2.tool.name == "laya_ultrafast_browser" and \
+                                result["execution"].get("type") == "brain":
+                            result["route"]["kind"] = "browser"
+                            result["route"]["tool_name"] = "browser_brain"
+                            result["route"]["tier"] = "browser_brain"
+                            route2.tier = "browser_brain"
                     else:
                         log.warning(f"Brain failed ({e}); trying generator tier.")
                         result["execution"] = await self._generator_fallback(

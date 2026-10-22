@@ -6,7 +6,8 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from winbrow import trace as trace_mod
 from winbrow.agent import WinBrowAgent, _is_browser_intent
@@ -14,7 +15,7 @@ from winbrow.cli import main as cli_main
 from winbrow.last_opened import ContextMemory
 from winbrow.pshost import get_host
 from winbrow.registry import ToolRegistry
-from winbrow.router import CHAT, NEW_ACTION, STOP, WinBrowRouter
+from winbrow.router import CHAT, NEW_ACTION, STOP, Route, WinBrowRouter
 from winbrow.windows import WindowsContext, get_current_windows_context, _parse_volume_level
 
 
@@ -128,6 +129,31 @@ class TestWinBrowRegistryAndRouter(unittest.TestCase):
         route = asyncio.run(self.router.route("turn on dark mode", self.ctx))
         self.assertEqual(route.tool_name, "toggle_dark_mode")
         self.assertEqual(route.args.get("mode"), "dark")
+
+    def test_play_song_on_youtube_beats_media_keys(self):
+        self._mock_laya(error=RuntimeError("Laya unavailable"))
+        route = asyncio.run(self.router.route(
+            "play timeless song in yt", self.ctx))
+        self.assertEqual(route.tool_name, "laya_ultrafast_browser")
+        self.assertIn("timeless", route.args.get("goal", ""))
+
+    def test_laya_media_choice_overridden_for_play_content(self):
+        self._mock_laya(laya_answer("media_playback", 0.95))
+        route = asyncio.run(self.router.route(
+            "play timeless song in yt", self.ctx))
+        self.assertEqual(route.tool_name, "laya_ultrafast_browser")
+
+    def test_transport_control_still_uses_media_keys(self):
+        self._mock_laya(error=RuntimeError("Laya unavailable"))
+        for utterance, operation in (
+            ("pause the music", "play_pause"),
+            ("play", "play_pause"),
+            ("next song", "next"),
+            ("previous track", "prev"),
+        ):
+            route = asyncio.run(self.router.route(utterance, self.ctx))
+            self.assertEqual(route.tool_name, "media_playback", utterance)
+            self.assertEqual(route.args.get("operation"), operation, utterance)
 
     # -- fallback: only exact intents, never phrase-mapped tools -------
     def _fallback(self, text):
@@ -435,6 +461,89 @@ class TestWinBrowRegistryAndRouter(unittest.TestCase):
                 route = asyncio.run(
                     self.router.route("something vague here", self.ctx))
         self.assertEqual(route.kind, NEW_ACTION)
+
+class _FakeBrainResult:
+    def to_dict(self):
+        return {
+            "type": "brain",
+            "kind": "action",
+            "success": True,
+            "output": "brain done",
+            "steps": [],
+        }
+
+
+class TestBrowserBrainFirst(unittest.TestCase):
+    def setUp(self):
+        self.ctx = WindowsContext(
+            active_app="Google Chrome",
+            active_title="Google Chrome",
+            running_apps=["chrome"],
+            volume_level=50,
+        )
+        self.session = SimpleNamespace()
+
+    def _agent(self, available=True):
+        agent = WinBrowAgent.__new__(WinBrowAgent)
+        agent.gateway = SimpleNamespace(available=available)
+        agent.session = self.session
+        agent.get_context = lambda: self.ctx
+        agent.browser = SimpleNamespace(
+            run_ultrafast_task=AsyncMock(return_value={
+                "success": True,
+                "final_answer": "ultrafast done",
+                "steps": [],
+                "method": "stub",
+            })
+        )
+        agent.handle_browser_task = AsyncMock(
+            return_value=(_FakeBrainResult(), {}))
+        return agent
+
+    def _route(self, goal):
+        return Route(
+            kind="tool",
+            tool=SimpleNamespace(name="laya_ultrafast_browser"),
+            args={"goal": goal},
+        )
+
+    def test_ultrafast_route_runs_brain_first(self):
+        agent = self._agent(available=True)
+        execution = asyncio.run(agent._dispatch_tool_execution(
+            self._route("play timeless song in yt"),
+            "play timeless song in yt", "sid",
+            ctx=self.ctx, session=self.session,
+        ))
+        agent.handle_browser_task.assert_awaited_once()
+        agent.browser.run_ultrafast_task.assert_not_awaited()
+        self.assertEqual(execution.get("type"), "brain")
+        self.assertEqual(execution.get("output"), "brain done")
+
+    def test_ultrafast_is_fallback_when_brain_fails(self):
+        agent = self._agent(available=True)
+        agent.handle_browser_task = AsyncMock(
+            side_effect=RuntimeError("provider down"))
+        execution = asyncio.run(agent._dispatch_tool_execution(
+            self._route("play timeless song in yt"),
+            "play timeless song in yt", "sid",
+            ctx=self.ctx, session=self.session,
+        ))
+        agent.handle_browser_task.assert_awaited_once()
+        agent.browser.run_ultrafast_task.assert_awaited_once()
+        self.assertEqual(execution.get("type"), "browser")
+        self.assertEqual(execution.get("output"), "ultrafast done")
+
+    def test_ultrafast_skips_brain_when_unavailable(self):
+        agent = self._agent(available=False)
+        execution = asyncio.run(agent._dispatch_tool_execution(
+            self._route("play timeless song in yt"),
+            "play timeless song in yt", "sid",
+            ctx=self.ctx, session=self.session,
+        ))
+        agent.handle_browser_task.assert_not_awaited()
+        agent.browser.run_ultrafast_task.assert_awaited_once()
+        self.assertEqual(execution.get("type"), "browser")
+
 
 if __name__ == "__main__":
     unittest.main()

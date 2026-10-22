@@ -263,6 +263,57 @@ def _strip_conversational_prefix(text: str) -> str:
     return cleaned
 
 
+_LAUNCH_PREFIXES = (
+    "bring up ", "switch to ", "focus ", "launch ", "start ", "open ",
+    "run ",
+)
+_APP_PHRASE_REJECT = re.compile(r'[\\/:*?"<>|]')
+_APP_FILE_EXT = re.compile(r"\.[a-z0-9]{1,5}$", re.I)
+
+
+def _clean_app_phrase(text: str) -> str:
+    cleaned = _strip_conversational_prefix(text.strip())
+    low = cleaned.lower()
+    for prefix in _LAUNCH_PREFIXES:
+        if low.startswith(prefix):
+            name = cleaned[len(prefix):].strip()
+            name = re.sub(
+                r"\s+(?:please|pls|thanks|thank\s+you|for\s+me|now)\s*$",
+                "", name, flags=re.I)
+            name = re.sub(r"\s+(?:app|application|program)\s*$", "",
+                          name, flags=re.I)
+            return name.strip(" \t.,!?;:\"'()[]{}")
+    return ""
+
+
+def _app_tool_arg(match, phrase: str) -> str:
+    """Keep the established alias values ("vscode" → "code") when defined."""
+    key = (phrase or "").strip().lower()
+    return _LAUNCH_APPS.get(key, match.entry.name)
+
+
+def _app_launch_match(text: str):
+    name = _clean_app_phrase(text)
+    low = name.lower()
+    if (not name or _mentions_folder(low)
+            or _APP_PHRASE_REJECT.search(name)
+            or re.search(r"\b(?:file|and|then)\b|[,;]", low)):
+        return None
+    try:
+        from .apps import resolve_app
+        match = resolve_app(name, include_store=False)
+    except Exception:
+        return None
+    if match is None:
+        return None
+    # A dot normally means a filename ("open report.pdf"), but real
+    # product names exist too (paint.net, node.js). Trust only an exact
+    # catalog hit so files never get routed as apps.
+    if _APP_FILE_EXT.search(name) and match.score < 0.98:
+        return None
+    return match
+
+
 def _levenshtein(a: str, b: str) -> int:
     if a == b:
         return 0
@@ -325,6 +376,69 @@ _LOCAL_FIND = frozenset({
     "file", "files", "folder", "folders", "disk", "desktop", "downloads",
     "documents", "page", "window",
 })
+
+# "play timeless song in yt" is a content request, not a media key.
+_PLAY_REQUEST_RE = re.compile(
+    r"^(?:play|watch|listen\s+to|stream|put\s+on)\s+(.+)$", re.I)
+_YT_GOAL_RE = re.compile(r"\b(?:youtube|you\s+tube|yt)\b", re.I)
+_NON_YT_MEDIA_SITE_RE = re.compile(
+    r"\b(?:spotify|soundcloud|apple\s+music|amazon\s+music|deezer|"
+    r"pandora|tidal|vimeo|dailymotion)\b", re.I)
+_MEDIA_FILLER_WORDS = {
+    "the", "a", "an", "some", "my", "this", "that", "it", "me", "please",
+    "now", "for", "to", "in", "on", "from", "at", "of", "with",
+}
+_MEDIA_ALLOWED_WORDS = {
+    "play", "pause", "resume", "stop", "next", "previous", "prev", "skip",
+    "music", "song", "songs", "track", "tracks", "media", "playback",
+    "video", "videos", "listen", "stream",
+}
+
+
+def _is_media_control(text: str) -> bool:
+    """True only for transport-control phrasing, not "play <content>"."""
+    lower = _strip_conversational_prefix(str(text or "").strip()).lower()
+    lower = re.sub(r"\b(?:please|now)\b", " ", lower)
+    tokens = _tokens(lower)
+    if not tokens:
+        return False
+    if re.search(r"\bplay\s*(?:/|\s)\s*pause\b|\btoggle\s+(?:play|pause)\b",
+                 lower):
+        return True
+    if any(t in {"next", "previous", "prev", "skip"} for t in tokens) and any(
+            t in {"song", "songs", "track", "tracks", "music", "media"}
+            for t in tokens):
+        return True
+    if "media" in tokens and any(
+            t in {"play", "pause", "resume", "stop", "next", "previous", "skip"}
+            for t in tokens):
+        return True
+    meaningful = [t for t in tokens if t not in _MEDIA_FILLER_WORDS]
+    return bool(meaningful) and all(
+        t in _MEDIA_ALLOWED_WORDS for t in meaningful)
+
+
+def _play_browser_goal(text: str) -> Optional[str]:
+    """Return a YouTube goal when "play/watch ..." names actual content."""
+    cleaned = _strip_conversational_prefix(str(text or "").strip())
+    cleaned = re.sub(r"^please\s+", "", cleaned, flags=re.I)
+    if _is_media_control(cleaned):
+        return None
+    match = _PLAY_REQUEST_RE.match(cleaned)
+    if match is None:
+        return None
+    content = match.group(1)
+    tokens = [t for t in _tokens(content) if t not in _MEDIA_FILLER_WORDS]
+    content_tokens = [
+        t for t in tokens if t not in {"youtube", "you", "tube", "yt"}
+    ]
+    if not content_tokens:
+        return None
+    if _YT_GOAL_RE.search(cleaned):
+        return cleaned
+    if _NON_YT_MEDIA_SITE_RE.search(cleaned):
+        return None
+    return f"{cleaned} on youtube"
 
 # Volume nudges that reference a conversation antecedent ("make it louder",
 # "turn it up a bit") belong to the brain — only standalone nudges fast-path.
@@ -626,6 +740,9 @@ def autocorrect_utterance(
     if "wikipedia" in low_all or " wiki " in f" {low_all} " or \
             low_all.strip().startswith("wiki ") or "http" in low_all or "www." in low_all:
         return text
+    app_match = _app_launch_match(text)
+    if app_match is not None and app_match.score >= 0.9:
+        return text
     vocab = set(_COMMAND_VOCAB)
     for item in extra or []:
         for tok in re.split(r"\W+", item.lower()):
@@ -646,6 +763,11 @@ def autocorrect_utterance(
             continue
         low = stripped.lower()
         if low in _FUNCTION_WORDS:
+            out.append(part)
+            continue
+        # Product names and filenames with symbols are not typos:
+        # notepad++, paint.net, node.js, report.pdf.
+        if re.search(r"[+#]|\w\.\w", low):
             out.append(part)
             continue
         hit = _closest_word(stripped, vocab)
@@ -898,6 +1020,8 @@ class WinBrowRouter:
                 result = await self._worker.apredict(corrected, questions, self.timeout)
                 self._consecutive_timeouts = 0
                 routed = self._route_from_answers(result, corrected, t0, memory=memory)
+                routed = self._prefer_app_over_folder(routed, corrected)
+                routed = self._prefer_play_browser(routed, corrected)
                 if routed.kind != NEW_ACTION and routed.confidence >= 0.6:
                     return routed
             except asyncio.TimeoutError:
@@ -1037,13 +1161,65 @@ class WinBrowRouter:
             tier="laya",
         )
 
+    def _prefer_app_over_folder(self, routed: Route, text: str) -> Route:
+        """Upgrade an open_folder choice when the name is really an app.
+
+        Laya can pick open_folder for "open cursor" because a folder with
+        that name exists; installed apps must win unless the user explicitly
+        said folder/directory/path.
+        """
+        if routed.kind != "tool" or routed.tool is None:
+            return routed
+        if routed.tool.name != "open_folder":
+            return routed
+        cleaned = _strip_conversational_prefix(text.strip())
+        if _mentions_folder(cleaned.lower()):
+            return routed
+        match = _app_launch_match(cleaned)
+        if match is None or match.score < 0.9:
+            return routed
+        tool = self.registry.get("app_focus_or_launch")
+        if tool is None:
+            return routed
+        return Route(kind="tool", tool=tool,
+                     args={"app_name": _app_tool_arg(
+                         match, _clean_app_phrase(cleaned))},
+                     confidence=max(routed.confidence, 0.9),
+                     probabilities=routed.probabilities,
+                     latency_ms=routed.latency_ms, tier=routed.tier)
+
+    def _prefer_play_browser(self, routed: Route, text: str) -> Route:
+        """Laya can hear "play" and choose a transport key. Named content
+        ("play timeless song in yt") belongs to the browser instead."""
+        if routed.kind != "tool" or routed.tool is None:
+            return routed
+        if routed.tool.name not in ("media_playback", "web_search"):
+            return routed
+        goal = _play_browser_goal(text)
+        if not goal:
+            return routed
+        tool = self.registry.get("laya_ultrafast_browser")
+        args = {"goal": goal}
+        if tool is None:
+            tool = self.registry.get("web_search")
+            args = {"query": goal}
+        if tool is None:
+            return routed
+        return Route(kind="tool", tool=tool, args=args,
+                     confidence=max(routed.confidence, 0.94),
+                     probabilities=routed.probabilities,
+                     latency_ms=routed.latency_ms, tier=routed.tier)
+
     def _extract_text_arg(self, utterance: str, tool_name: str, arg_name: str, memory=None) -> str:
         text = _strip_conversational_prefix(utterance.strip())
         lower = text.lower()
         if tool_name == "web_search":
             return web_search_query(text)
         elif tool_name == "app_focus_or_launch":
-            for prefix in ["open ", "launch ", "switch to ", "focus ", "bring up ", "start "]:
+            name = _clean_app_phrase(text)
+            if name:
+                return name
+            for prefix in ["switch to ", "bring up ", "open ", "launch ", "focus ", "start "]:
                 if lower.startswith(prefix):
                     return text[len(prefix):].strip()
             return text
@@ -1319,6 +1495,19 @@ class WinBrowRouter:
             t = self.registry.get("lock_screen")
             return Route(kind="tool", tool=t, args={}, confidence=0.95, latency_ms=elapsed_ms, tier="heuristic")
 
+        # --- APP LAUNCH (installed-app index wins over same-named folders:
+        # "open cursor" means the editor, not D:\cursor) ---
+        app_match = _app_launch_match(cleaned)
+        if app_match is not None and app_match.score >= 0.88:
+            t = self.registry.get("app_focus_or_launch")
+            if t:
+                return Route(
+                    kind="tool", tool=t,
+                    args={"app_name": _app_tool_arg(
+                        app_match, _clean_app_phrase(cleaned))},
+                    confidence=0.93, latency_ms=elapsed_ms,
+                    tier="heuristic")
+
         # --- OPEN FOLDER (real directories only) ---
         folder_arg = self._extract_text_arg(text, "open_folder", "folder", memory=memory)
         if folder_arg:
@@ -1347,6 +1536,20 @@ class WinBrowRouter:
                 t = self.registry.get("close_folder_window")
                 if t:
                     return Route(kind="tool", tool=t, args={"folder": hit}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+
+        # --- PLAY/WATCH CONTENT (YouTube, not the media transport key) ---
+        play_goal = _play_browser_goal(cleaned)
+        if play_goal:
+            t = self.registry.get("laya_ultrafast_browser")
+            if t:
+                return Route(kind="tool", tool=t, args={"goal": play_goal},
+                             confidence=0.95, latency_ms=elapsed_ms,
+                             tier="heuristic")
+            t = self.registry.get("web_search")
+            if t:
+                return Route(kind="tool", tool=t, args={"query": play_goal},
+                             confidence=0.9, latency_ms=elapsed_ms,
+                             tier="heuristic")
 
         # --- ULTRAFAST BROWSER TASKS (flights, booking, shopping, form fill, deep search & extract) ---
         _ULTRAFAST_KEYWORDS = [
@@ -1519,8 +1722,9 @@ class WinBrowRouter:
                 mode = "dark" if "dark" in lower else ("light" if "light" in lower else "toggle")
                 return Route(kind="tool", tool=t, args={"mode": mode}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
 
-        # --- MEDIA PLAYBACK ---
-        if any(w in lower for w in ["play", "pause", "next song", "previous song", "skip track", "media"]):
+        # --- MEDIA PLAYBACK (transport keys only; "play <title>" is handled
+        # by the browser branch above) ---
+        if _is_media_control(lower):
             t = self.registry.get("media_playback")
             if t:
                 if "next" in lower or "skip" in lower: op = "next"

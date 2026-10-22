@@ -83,8 +83,9 @@ FIVE UNIVERSAL RULES — no exceptions:
     deciding the next step. If HISTORY does not confirm success, correct course;
     do not proceed as if the action worked.
   RULE 3 — SEARCH BEFORE YOU ACT. Never click something you have not seen in
-    HISTORY. Use browser_read_page or browser_get_accessibility_tree to locate
-    the element, link or URL first.
+    HISTORY. Use browser_read_full to locate the element, link or URL first
+    (browser_read_page / browser_get_accessibility_tree when you only need one
+    view).
   RULE 4 — SELF-CORRECT, DON'T REPEAT. If an action fails or lands on the wrong
     page, do not emit the same action again. Diagnose why and try a different
     approach. A _warning in HISTORY means the last action needs verification.
@@ -174,19 +175,23 @@ SKILL RULES:
  14. If the request is ambiguous, use kind=clarify with one short question.
  15. Multi-part requests: work through EVERY part. Never emit done while any
      part is missing from HISTORY.
- 16. Browser research: browser_navigate to open a URL, browser_read_page for
-     the current page, browser_interact for ONE click/type/submit, browser_wait
-     while content loads. Each returns the page state. Write findings to the
-     requested file, then read it back before declaring done.
+ 16. Browser research: browser_navigate to open a URL, browser_read_full for
+     page text plus interactive elements, browser_interact for ONE
+     click/type/submit, browser_wait while content loads. Each returns the page
+     state. Write findings to the requested file, then read it back before
+     declaring done.
  17. DONE CONDITION for file/program tasks: the file exists AND its behavior
      has been verified (run a build/test, or read it back) with the expected
      result visible in HISTORY. Creating the folder or writing the file is NOT
      done.
- 18. Browser elements: before clicking or typing into an unfamiliar page, use
-     browser_get_accessibility_tree and pass its selector to browser_interact.
-     For ALL file uploads, click the upload trigger, then call
-     browser_upload_file with the absolute path. Never type a file path into an
-     input field. Never use screen_read_text for browser content.
+ 18. Use browser_read_full as the first step on any unfamiliar page — it
+     returns page text and interactive elements in one call. Only call
+     browser_read_page or browser_get_accessibility_tree separately when you
+     need to update just one of those views. Pass the selector from that read
+     directly to browser_interact. For ALL file uploads, click the upload
+     trigger, then call browser_upload_file with the absolute path. Never type
+     a file path into an input field. Never use screen_read_text for browser
+     content.
  19. Reading a document (PDF, PPTX, DOCX, XLSX/XLS, CSV, Markdown, HTML, JSON,
      XML, EPUB, TXT): call read_document(path, max_chars=40000) ONCE. Never OCR
      a document or open it in an app just to read it. The returned text is in
@@ -277,6 +282,27 @@ def build_system_blocks(skills_metadata: str) -> list[dict]:
     return blocks
 
 
+BROWSER_BREVITY = (
+    "You are on a browser turn. The page state is in HISTORY. "
+    "Emit the next single action immediately. Do not evaluate "
+    "alternative approaches unless HISTORY shows a failure."
+)
+
+
+def _entry_skill(entry) -> str:
+    if isinstance(entry, dict):
+        step = entry.get("step")
+        if isinstance(step, dict):
+            return str(step.get("skill") or "")
+        return str(entry.get("skill") or "")
+    return str(getattr(entry, "skill", "") or "")
+
+
+def is_browser_turn(history: list) -> bool:
+    """True when the most recent executed step was a browser skill."""
+    return bool(history) and _entry_skill(history[-1]).startswith("browser_")
+
+
 def build_planner_message(goal: str, history: list, steps_remaining=None,
                           skill_detail: str | None = None) -> str:
     """Compose the planner user message from raw history (compressed)."""
@@ -294,7 +320,10 @@ def build_planner_message(goal: str, history: list, steps_remaining=None,
             "SKILL DETAIL (full instructions for the skill you just chose — "
             f"read before acting):\n{skill_detail}"
         )
-    parts.append("What is the single best next action? Output ONLY the JSON object.")
+    question = "What is the single best next action? Output ONLY the JSON object."
+    if is_browser_turn(history):
+        question = f"{BROWSER_BREVITY}\n{question}"
+    parts.append(question)
     return "\n\n".join(part for part in parts if part)
 
 
@@ -302,7 +331,8 @@ def build_loop_messages(utterance: str, history_block: str, context_block: str,
                         memory_block: str, skills_block: str,
                         tried_block: str = "", steps_remaining=None,
                         skills_metadata: str = "",
-                        skill_detail: str | None = None) -> list[dict]:
+                        skill_detail: str | None = None,
+                        browser_turn: bool = False) -> list[dict]:
     """Planner messages with cached system blocks and optional SKILL DETAIL.
 
     `skills_block` is the legacy per-turn tool catalog. The brain now passes an
@@ -328,7 +358,10 @@ def build_loop_messages(utterance: str, history_block: str, context_block: str,
         )
     if skills_block:
         parts.append(f"OTHER TOOLS:\n{skills_block}")
-    parts.append("What is the single best next action? Output ONLY the JSON object.")
+    question = "What is the single best next action? Output ONLY the JSON object."
+    if browser_turn:
+        question = f"{BROWSER_BREVITY}\n{question}"
+    parts.append(question)
 
     return [
         {"role": "system", "content": build_system_blocks(skills_metadata)},

@@ -28,6 +28,7 @@ log = logging.getLogger("winbrow.ultrafast")
 
 # Play/watch-style goals: the engine must click into a video, not just search.
 _PLAY_INTENT_KW = ("play", "watch", "video", "song", "music", "listen")
+_YT_GOAL_RE = re.compile(r"\b(?:youtube|you\s+tube|yt)\b", re.IGNORECASE)
 _YT_WATCH_RE = re.compile(r"youtube\.com/watch|youtu\.be/", re.IGNORECASE)
 # Stable selectors for the first video result on a YouTube results page.
 # (Double quotes inside: the click executor interpolates selectors into
@@ -47,8 +48,11 @@ def _clean_video_query(goal: str) -> str:
         r"(?:me\s+)?(?:a\s+|an\s+|some\s+|the\s+|for\s+)?",
         "", q,
     )
-    q = re.sub(r"\b(?:on|from)\s+youtube\b", " ", q)
-    q = re.sub(r"\byoutube\b", " ", q)
+    q = re.sub(
+        r"\b(?:on|from|in)\s+(?:youtube|you\s+tube|yt)(?:\s+music)?\b",
+        " ", q,
+    )
+    q = re.sub(r"\b(?:youtube|you\s+tube|yt)(?:\s+music)?\b", " ", q)
     q = re.sub(r"\b(?:video|videos|clip|clips)\s+(?:about|on|for|of)\b", " ", q)
     q = re.sub(r"\b(?:about|entitled|called)\b", " ", q)
     q = re.sub(r"\s*\b(?:video|videos|song|songs)\b\s*$", "", q)
@@ -1049,7 +1053,7 @@ class LayaUltrafastEngine:
             q = m.group(1).strip() if m and m.group(1).strip() else cleaned_query
             target_url = "https://www.amazon.com/s?k=" + urllib.parse.quote_plus(q)
         # YouTube search (play/watch goals get a cleaned query + later click a video)
-        elif "youtube" in goal_lower:
+        elif _YT_GOAL_RE.search(goal_lower):
             q = _clean_video_query(goal)
             target_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
         else:

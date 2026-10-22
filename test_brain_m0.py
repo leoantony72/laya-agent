@@ -325,7 +325,9 @@ class TestHistoryCompression(unittest.TestCase):
         self.assertIn("Step 1: browser_read_page → ✓", block)
         self.assertIn("--- last 5 steps in full ---", block)
         self.assertIn("Step 8:", block)
-        self.assertLess(len(block), 5000)
+        # Older browser steps keep URL/title only; the last three keep up to
+        # 2000 (and the newest 3000) characters of page state.
+        self.assertLess(len(block), 8000)
 
     def test_tried_services_tracks_dead_ends(self):
         history = [

@@ -45,6 +45,7 @@ from .model_gateway import (
     GatewayUnavailable,
     ModelGateway,
     extract_json_object,
+    get_reasoning_config,
 )
 from . import prompt as prompts
 from .skill_registry import (
@@ -282,14 +283,16 @@ def _completion_gap(utterance: str, history: List[BrainStepResult]) -> str:
     if uploads:
         last_upload = uploads[-1]
         verified = any(
-            s.success and s.skill in ("browser_wait", "browser_read_page")
+            s.success and s.skill in (
+                "browser_wait", "browser_read_page", "browser_read_full",
+            )
             for s in history[last_upload + 1:]
         )
         if not verified:
             return (
                 "HISTORY shows browser_upload_file set the file, but no "
-                "browser_wait or browser_read_page followed it. Verify the "
-                "upload completed before emitting done."
+                "browser_wait or browser_read_page/read_full followed it. "
+                "Verify the upload completed before emitting done."
             )
     if _looks_multi_part(utterance) and len(ok_steps) == 1:
         return (
@@ -538,9 +541,10 @@ class AgentBrain:
                 steps_remaining=remaining,
                 skills_metadata=system_catalog,
                 skill_detail=skill_detail,
+                browser_turn=prompts.is_browser_turn(history),
             )
             try:
-                plan = await self._ask_plan(messages, emit)
+                plan = await self._ask_plan(messages, emit, history=history)
             except GatewayUnavailable as e:
                 if not history:
                     raise
@@ -556,7 +560,7 @@ class AgentBrain:
                 log.warning(f"Planner error mid-task ({e}); retrying once.")
                 await asyncio.sleep(1.5)
                 try:
-                    plan = await self._ask_plan(messages, emit)
+                    plan = await self._ask_plan(messages, emit, history=history)
                 except (GatewayUnavailable, GatewayError) as e2:
                     log.warning(f"Planner error mid-task after retry ({e2}); finalizing.")
                     return self._partial_finalize(
@@ -865,21 +869,34 @@ class AgentBrain:
         ) or ""
 
     # ------------------------------------------------------------------ planning
-    async def _ask_plan(self, messages: list, emit: Optional[Callable]) -> dict:
+    async def _ask_plan(self, messages: list, emit: Optional[Callable],
+                        history: Optional[List[BrainStepResult]] = None) -> dict:
         """One planner call → parsed JSON plan. Retries once on parse failure."""
         t0 = time.perf_counter()
+        reasoning_config = get_reasoning_config(history or [])
+        reasoning = (
+            {"max_tokens": reasoning_config["reasoning_max"]}
+            if reasoning_config.get("reasoning_max", 0) > 0
+            else {"enabled": False}
+        )
         for attempt in range(2):
-            resp = await self.gateway.chat(
-                messages,
-                json_schema=prompts.PLANNER_JSON_SCHEMA,
-                # Some reasoning models ignore reasoning.max_tokens and spend
-                # most of max_tokens thinking. A 16k total budget leaves room
-                # for the JSON plan even after ~14k reasoning tokens. The local
-                # context guard clamps this when prompt + reply would exceed an
-                # 8192-token window.
-                temperature=PLANNER_CALL_CONFIG["temperature"],
-                max_tokens=PLANNER_CALL_CONFIG["max_tokens"],
-            )
+            chat_kwargs = {
+                "json_schema": prompts.PLANNER_JSON_SCHEMA,
+                # Reasoning models spend max_tokens on hidden thinking first.
+                # Browser turns get a tighter budget (see get_reasoning_config)
+                # so the JSON plan is never starved by over-thinking.
+                "temperature": PLANNER_CALL_CONFIG["temperature"],
+                "max_tokens": reasoning_config["max_tokens"],
+                "reasoning": reasoning,
+            }
+            try:
+                resp = await self.gateway.chat(messages, **chat_kwargs)
+            except TypeError as exc:
+                # Older/third-party gateways may not accept a reasoning policy.
+                if "reasoning" not in str(exc):
+                    raise
+                chat_kwargs.pop("reasoning", None)
+                resp = await self.gateway.chat(messages, **chat_kwargs)
             plan = extract_json_object(resp.content)
             if plan:
                 if isinstance(plan, list):
@@ -1226,6 +1243,22 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
                     "Verify this is the right page before proceeding."
                 )
 
+    if skill == "browser_get_accessibility_tree":
+        if result.get("_truncated"):
+            warnings.append(
+                "Accessibility tree was truncated. "
+                "Retry with a more specific target= value "
+                "to find the element you need."
+            )
+
+    if skill == "browser_read_full":
+        if result.get("_truncated_tree"):
+            warnings.append(
+                "Interactive element list was truncated. Retry with "
+                "browser_get_accessibility_tree and a more specific target= "
+                "value to find the element you need."
+            )
+
     if skill == "screen_read_text":
         if result.get("success") and not str(result.get("text") or "").strip():
             warnings.append(
@@ -1236,7 +1269,7 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
         if not result.get("success"):
             warnings.append(
                 "OCR failed. If this is a browser task, use "
-                "browser_read_page or browser_get_accessibility_tree "
+                "browser_read_full or browser_get_accessibility_tree "
                 "instead — OCR is not needed for browser content."
             )
 

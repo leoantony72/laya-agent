@@ -503,5 +503,54 @@
     "uses": 0,
     "last_used": 1792647996.9581435,
     "source": "brain"
+  },
+  {
+    "id": "would-you-be-kinf-enough-to-open-youtube-and-play-the-latest",
+    "name": "would you be kinf enough to open youtube and play the latest",
+    "utterance": "would you be kinf enough to open youtube and play the latest video of pewdiepie",
+    "steps": [
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://www.youtube.com/@PewDiePie/videos"
+        }
+      },
+      {
+        "skill": "browser_read_full",
+        "args": {}
+      },
+      {
+        "skill": "browser_wait",
+        "args": {
+          "seconds": "3"
+        }
+      },
+      {
+        "skill": "browser_get_accessibility_tree",
+        "args": {
+          "target": "video"
+        }
+      },
+      {
+        "skill": "browser_get_accessibility_tree",
+        "args": {
+          "target": "I seriously should NOT be dropping"
+        }
+      },
+      {
+        "skill": "browser_interact",
+        "args": {
+          "selector": "[data-winbrow-id=\"w124\"]"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: browser_navigate -> browser_read_full -> browser_wait -> browser_get_accessibility_tree -> browser_get_accessibility_tree -> browser_interact. Use when the request resembles: would you be kinf enough to open youtube and play the latest video of pewdiepie",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792687927.8564713,
+    "uses": 0,
+    "last_used": 1792687927.8564713,
+    "source": "brain"
   }
 ]

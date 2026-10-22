@@ -47,6 +47,7 @@ log = logging.getLogger("winbrow.brain.skills")
 PREFERRED_ORDER = (
     "browser_navigate",
     "browser_read_page",
+    "browser_read_full",
     "browser_interact",
     "browser_wait",
     "browser_upload_file",
@@ -66,10 +67,10 @@ PREFERRED_ORDER = (
 )
 
 META_DESC_LIMIT = 4000
-CORE_SKILL_KEYS = frozenset(PREFERRED_ORDER[:14])
-META_SKILL_KEYS = frozenset(PREFERRED_ORDER[14:])
+CORE_SKILL_KEYS = frozenset(PREFERRED_ORDER[:15])
+META_SKILL_KEYS = frozenset(PREFERRED_ORDER[15:])
 # (core, meta, learned) description budgets. The first ladder rung that fits
-# under META_DESC_LIMIT wins, so the core 14 keep the richest triggers.
+# under META_DESC_LIMIT wins, so the core 15 keep the richest triggers.
 _DESC_LADDER = (
     (200, 130, 100),
     (180, 120, 100),

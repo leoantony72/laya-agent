@@ -12,6 +12,7 @@ python-multipart
 # Optional but recommended (search/vector memory, UIA, voice, skills)
 chromadb
 comtypes
+rapidfuzz>=3.9
 sounddevice
 onnxruntime
 pyyaml

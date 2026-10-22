@@ -72,6 +72,36 @@ PLANNER_CALL_CONFIG = {
     "temperature": float(os.environ.get("WINBROW_PLANNER_TEMPERATURE", "1")),
 }
 
+
+def _history_skill(entry: Any) -> str:
+    if isinstance(entry, dict):
+        step = entry.get("step")
+        if isinstance(step, dict):
+            return str(step.get("skill") or "")
+        return str(entry.get("skill") or "")
+    return str(getattr(entry, "skill", "") or "")
+
+
+def get_reasoning_config(history: List[Any]) -> dict:
+    """Per-turn planner budget: browser decisions get less thinking room.
+
+    Browser turns are mostly "read state → pick one element". A reasoning
+    model that spends 10k+ tokens evaluating alternatives can exhaust
+    max_tokens and return empty content, so cap reasoning when the recent
+    history is entirely browser work.
+    """
+    recent_skills = [_history_skill(h) for h in (history or [])[-3:]]
+    recent_skills = [s for s in recent_skills if s]
+    browser_heavy = bool(recent_skills) and all(
+        s.startswith("browser_") for s in recent_skills
+    )
+    if browser_heavy:
+        return {"max_tokens": 8000, "reasoning_max": 600}
+    return {
+        "max_tokens": PLANNER_CALL_CONFIG["max_tokens"],
+        "reasoning_max": REASONING_MAX_TOKENS,
+    }
+
 # Built-in local brain: llama.cpp server started by server.py (winbrow/llm.py)
 BUILTIN_LOCAL_ENDPOINT = "http://127.0.0.1:8080"
 BUILTIN_LOCAL_MODEL = "qwen2.5-0.5b-instruct"
