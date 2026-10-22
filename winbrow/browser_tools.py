@@ -45,8 +45,7 @@ _MAX_READ_FULL_TREE_CHARS = 3000
 _A11Y_JS = r"""
 (() => {
   const out = [];
-  document.querySelectorAll('[data-winbrow-id]').forEach(
-    el => el.removeAttribute('data-winbrow-id'));
+  if (!window.__winbrowIdSeq) window.__winbrowIdSeq = 0;
   const implicitRole = {
     a: 'link', button: 'button', input: 'textbox', textarea: 'textbox',
     select: 'combobox', option: 'option', img: 'img', form: 'form',
@@ -56,7 +55,6 @@ _A11Y_JS = r"""
     'a[href], button, input, textarea, select, [role], [aria-label], ' +
     '[onclick], [contenteditable="true"], summary, label'
   );
-  let n = 0;
   for (const el of nodes) {
     const tag = (el.tagName || '').toLowerCase();
     const isInput = tag === 'input' || tag === 'textarea' || tag === 'select';
@@ -73,8 +71,11 @@ _A11Y_JS = r"""
                         : (isInput ? (el.value || '') : el.innerText)) || '';
     const label = raw.replace(/\s+/g, ' ').trim().slice(0, 120);
     if (!label) continue;
-    const ref = 'w' + n;
-    el.setAttribute('data-winbrow-id', ref);
+    let ref = el.getAttribute('data-winbrow-id');
+    if (!ref) {
+      ref = 'w' + (window.__winbrowIdSeq++);
+      el.setAttribute('data-winbrow-id', ref);
+    }
     out.push({
       ref: ref,
       role: el.getAttribute('role') || implicitRole[tag] || tag,
@@ -85,7 +86,6 @@ _A11Y_JS = r"""
       disabled: !!(el.disabled || el.getAttribute('aria-disabled') === 'true'),
       selector: '[data-winbrow-id="' + ref + '"]'
     });
-    n++;
   }
   return {
     title: document.title || '',

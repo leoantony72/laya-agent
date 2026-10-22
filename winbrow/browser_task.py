@@ -1729,12 +1729,70 @@ class BrowserController:
         return {"success": False, "error": result.get("error", "CDP unavailable")}
 
     async def click_element(self, selector: str) -> dict[str, Any]:
-        """Click a DOM element by CSS selector via CDP."""
-        code = f"""
-        const el = document.querySelector('{selector}');
-        if (el) {{ el.click(); 'Clicked: {selector}' }} else {{ 'Element not found: {selector}' }}
+        """Click a DOM element by CSS selector, preferring a trusted CDP click.
+
+        A synthetic ``el.click()`` is ignored by some apps (notably Google
+        Drive's New/upload menu). Locate the element, scroll it into view, then
+        dispatch real mouse events at its center. JS click remains a fallback
+        for elements that reject hit-testing.
         """
-        return await self.execute_js(code)
+        locate = f"""
+        (() => {{
+          const el = document.querySelector({json.dumps(selector)});
+          if (!el) return null;
+          try {{ el.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (e) {{}}
+          const r = el.getBoundingClientRect();
+          return {{
+            x: r.left + r.width / 2,
+            y: r.top + r.height / 2,
+            width: r.width,
+            height: r.height
+          }};
+        }})()
+        """
+        located = await self.execute_js(locate)
+        if not located.get("success"):
+            return {
+                "success": False,
+                "error": located.get("error", "CDP unavailable"),
+            }
+        rect = located.get("value")
+        if not isinstance(rect, dict):
+            return {"success": False, "error": f"Element not found: {selector}"}
+        width = float(rect.get("width") or 0)
+        height = float(rect.get("height") or 0)
+        if width < 2 or height < 2:
+            return {"success": False, "error": f"Element not visible: {selector}"}
+
+        x = int(round(float(rect.get("x") or 0)))
+        y = int(round(float(rect.get("y") or 0)))
+        clicked = await self.click_at(x, y)
+        if clicked.get("success"):
+            clicked["output"] = f"Clicked: {selector} (trusted CDP at {x},{y})"
+            return clicked
+
+        fallback = await self.execute_js(f"""
+        (() => {{
+          const el = document.querySelector({json.dumps(selector)});
+          if (!el) return false;
+          el.click();
+          return true;
+        }})()
+        """)
+        if fallback.get("success") and fallback.get("value") is True:
+            return {
+                "success": True,
+                "output": f"Clicked: {selector} (JS fallback)",
+                "method": "js_click_fallback",
+            }
+        return {
+            "success": False,
+            "error": (
+                clicked.get("error")
+                or fallback.get("error")
+                or f"Click failed: {selector}"
+            ),
+        }
 
     async def type_in_element(self, selector: str, text: str) -> dict[str, Any]:
         """

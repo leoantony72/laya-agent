@@ -723,6 +723,46 @@ class TestBrowserTools(unittest.TestCase):
         self.assertIn("dashboard", block)
 
 
+class TestClickElement(unittest.TestCase):
+    """Element clicks must use real CDP input, not only a synthetic JS click."""
+
+    class FakeController:
+        def __init__(self, rect):
+            self.rect = rect
+            self.clicks = []
+            self.js_calls = []
+
+        async def execute_js(self, code):
+            self.js_calls.append(code)
+            if "getBoundingClientRect" in code:
+                return {"success": True, "value": self.rect}
+            return {"success": True, "value": True}
+
+        async def click_at(self, x, y):
+            self.clicks.append((x, y))
+            return {"success": True, "method": "cdp_chrome"}
+
+    def test_clicks_element_center_with_trusted_input(self):
+        from winbrow.browser_task import BrowserController
+
+        browser = self.FakeController({
+            "x": 120.4, "y": 33.6, "width": 40, "height": 20})
+        out = run(BrowserController.click_element(
+            browser, '[data-winbrow-id="w15"]'))
+        self.assertTrue(out["success"], out)
+        self.assertEqual(browser.clicks, [(120, 34)])
+        self.assertIn("trusted CDP", out["output"])
+
+    def test_missing_element_is_a_failure(self):
+        from winbrow.browser_task import BrowserController
+
+        browser = self.FakeController(None)
+        out = run(BrowserController.click_element(browser, "#missing"))
+        self.assertFalse(out["success"])
+        self.assertIn("not found", out["error"])
+        self.assertEqual(browser.clicks, [])
+
+
 class TestBrowserTaskTabs(unittest.TestCase):
     """A browser task must open its own tab, never reuse the user's tab."""
 

@@ -25,6 +25,15 @@ DOCUMENT_READ_SKILLS = frozenset({
 DOCUMENT_STEP_LIMIT = 30_000
 DOCUMENT_TOTAL_BUDGET = 60_000
 
+# File searches return a one-line header followed by the matching paths. The
+# paths are the useful part and must survive compression, otherwise the planner
+# has to re-run the search later just to recover the file it already found.
+FILE_LIST_SKILLS = frozenset({
+    "find_files",
+    "find_large_files",
+})
+FILE_LIST_STEP_LIMIT = 2_000
+
 # Browser page snapshots are the biggest per-step history cost. Keep the last
 # three readable and strip page text from everything older; only the newest
 # step gets the full decision context.
@@ -224,8 +233,11 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
     lines: List[str] = []
 
     for i, entry in enumerate(history[:older_count]):
-        if _skill_of(entry) in BROWSER_SKILLS:
+        skill = _skill_of(entry)
+        if skill in BROWSER_SKILLS:
             outcome = _compact_browser_outcome(entry)
+        elif skill in FILE_LIST_SKILLS:
+            outcome = _output_of(entry)[:FILE_LIST_STEP_LIMIT]
         else:
             outcome = _output_of(entry)[:OUTCOME_LIMIT].split("\n")[0]
         warning = _warning_of(entry)
@@ -267,7 +279,11 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
 
 def _recent_output_limits(recent: List[Any]) -> List[int]:
     """Per-step output caps, giving document reads a newest-first budget."""
-    limits = [RECENT_OUTPUT_LIMIT] * len(recent)
+    limits = [
+        FILE_LIST_STEP_LIMIT if _skill_of(entry) in FILE_LIST_SKILLS
+        else RECENT_OUTPUT_LIMIT
+        for entry in recent
+    ]
     remaining = DOCUMENT_TOTAL_BUDGET
     for idx in range(len(recent) - 1, -1, -1):
         if _skill_of(recent[idx]) not in DOCUMENT_READ_SKILLS or remaining <= 0:

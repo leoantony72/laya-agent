@@ -329,6 +329,25 @@ class TestHistoryCompression(unittest.TestCase):
         # 2000 (and the newest 3000) characters of page state.
         self.assertLess(len(block), 8000)
 
+    def test_old_file_search_keeps_matching_paths(self):
+        history = [{
+            "step": {"skill": "find_files",
+                     "args": {"search_term": "LDMseminar"}},
+            "result": {
+                "success": True,
+                "output": (
+                    "Found 2 file(s) matching 'LDMseminar':\n"
+                    "C:\\Users\\USER\\Downloads\\LDM seminar.pptx  (13.2 MB)\n"
+                    "C:\\Users\\USER\\Desktop\\LDMseminar_report.txt  (9.2 KB)"
+                ),
+            },
+        }]
+        history.extend(self._history(6))
+        block = format_history(history)
+        self.assertIn("Step 1: find_files", block)
+        self.assertIn("LDM seminar.pptx", block)
+        self.assertIn("LDMseminar_report.txt", block)
+
     def test_tried_services_tracks_dead_ends(self):
         history = [
             {"step": {"skill": "browser_navigate",

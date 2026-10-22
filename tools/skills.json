@@ -552,5 +552,90 @@
     "uses": 0,
     "last_used": 1792687927.8564713,
     "source": "brain"
+  },
+  {
+    "id": "can-you-upload-the-ldmseminar-pptx-file-in-the-google-drive",
+    "name": "can you upload the LDMseminar pptx file in the google drive",
+    "utterance": "can you upload the LDMseminar pptx file in the google drive",
+    "steps": [
+      {
+        "skill": "find_files",
+        "args": {
+          "search_term": "LDMseminar"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://drive.google.com"
+        }
+      },
+      {
+        "skill": "browser_read_full",
+        "args": {}
+      },
+      {
+        "skill": "browser_get_accessibility_tree",
+        "args": {
+          "target": "new"
+        }
+      },
+      {
+        "skill": "browser_interact",
+        "args": {
+          "selector": "[data-winbrow-id=\"w13\"]"
+        }
+      },
+      {
+        "skill": "browser_get_accessibility_tree",
+        "args": {
+          "target": "upload"
+        }
+      },
+      {
+        "skill": "browser_interact",
+        "args": {
+          "selector": "[data-winbrow-id=\"w213\"]"
+        }
+      },
+      {
+        "skill": "browser_upload_file",
+        "args": {
+          "file_path": "C:\\Users\\USER\\Downloads\\LDM seminar.pptx"
+        }
+      },
+      {
+        "skill": "browser_wait",
+        "args": {
+          "seconds": "5"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://drive.google.com/drive/u/0/search?q=LDM%20seminar.pptx"
+        }
+      },
+      {
+        "skill": "browser_wait",
+        "args": {
+          "seconds": "4"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://drive.google.com/drive/u/0/recent"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: find_files -> browser_navigate -> browser_read_full -> browser_get_accessibility_tree -> browser_interact -> browser_get_accessibility_tree -> browser_interact -> browser_upload_file -> browser_wait -> browser_navigate -> browser_wait -> browser_navigate -> browser_navigate -> browser_navigate -> browser_wait -> browser_get_accessibility_tree -> browser_read_full. Use when the request resembles: can you upload the LDMseminar pptx file in the google drive",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792689872.4320123,
+    "uses": 0,
+    "last_used": 1792689872.4320123,
+    "source": "brain"
   }
 ]

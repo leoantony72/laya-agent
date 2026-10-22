@@ -808,6 +808,9 @@ class AgentBrain:
                     done_sigs.add(sig)
                     consecutive_failures = 0
                     last_failed_skill = ""
+                    # Only consecutive re-emissions of a completed step should
+                    # trip the repeat guard. A real step in between is progress.
+                    repeats.clear()
                     continue
 
                 consecutive_failures = (

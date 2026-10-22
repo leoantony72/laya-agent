@@ -859,6 +859,40 @@ class TestClosedLoop(unittest.TestCase):
         self.assertIn("ALREADY SUCCEEDED",
                       brain.gateway.messages_seen[2][1]["content"])
 
+    def test_repeat_guard_resets_after_real_progress(self):
+        """Repeats separated by successful work must not stop the task."""
+        exec_calls = []
+
+        async def executor(name, args):
+            exec_calls.append(name)
+            return {"success": True, "output": f"did {name}"}
+
+        folder = "C:\\Users\\USER\\Desktop\\chicken-go"
+        brain = self._brain([
+            {"kind": "action", "step": {
+                "skill": "mcp_filesystem_create_directory", "args": {"path": folder}}},
+            {"kind": "action", "step": {
+                "skill": "mcp_filesystem_create_directory", "args": {"path": folder}}},
+            {"kind": "action", "step": {
+                "skill": "quick_note", "args": {"content": "one"}}},
+            {"kind": "action", "step": {
+                "skill": "mcp_filesystem_create_directory", "args": {"path": folder}}},
+            {"kind": "action", "step": {
+                "skill": "quick_note", "args": {"content": "two"}}},
+            {"kind": "action", "step": {
+                "skill": "mcp_filesystem_create_directory", "args": {"path": folder}}},
+            {"kind": "action", "step": {
+                "skill": "quick_note", "args": {"content": "three"}}},
+            {"kind": "done", "summary": "Folder and notes ready."},
+        ], executor)
+        res = run(brain.handle(
+            "create a folder and three notes", Ctx(), Session()))
+        self.assertTrue(res.success, res.response)
+        self.assertEqual(exec_calls, [
+            "mcp_filesystem_create_directory", "quick_note",
+            "quick_note", "quick_note",
+        ])
+
     def test_transient_planner_error_retries_then_continues(self):
         """A 429 mid-task gets one retry instead of silently ending the task."""
         async def executor(name, args):
