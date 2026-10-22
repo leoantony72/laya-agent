@@ -1322,10 +1322,22 @@ class BrowserController:
                 # The tab must be active or Chromium may swallow the input.
                 with contextlib.suppress(Exception):
                     await conn.call("Page.bringToFront", timeout=3)
+                # Never show the native Windows file picker for agent clicks.
+                # The page's file input is still created; browser_upload_file
+                # writes the path onto it via DOM.setFileInputFiles.
+                with contextlib.suppress(Exception):
+                    await conn.call(
+                        "Page.setInterceptFileChooserDialog",
+                        {"enabled": True},
+                        timeout=3,
+                    )
                 for ev in events:
                     # Brave occasionally omits a reply for mouseMoved.
                     with contextlib.suppress(Exception):
                         await conn.call("Input.dispatchMouseEvent", ev, timeout=3)
+                # Keep the interception session alive while the renderer
+                # processes the click and requests a file chooser.
+                await asyncio.sleep(0.2)
             return {"success": True, "x": int(x), "y": int(y), "method": f"cdp_{backend}"}
         except Exception as e:
             return {"success": False, "error": str(e)}

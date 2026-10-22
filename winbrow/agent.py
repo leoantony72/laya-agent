@@ -29,7 +29,11 @@ from .brain import AgentBrain, GatewayUnavailable, ModelGateway
 from .brain.agent_loop import COMPUTER_SKILL_DISPATCH, _ctx_block
 from .brain.model_gateway import extract_json_object
 from .brain.prompts import build_chat_messages
-from .memory.skills import MissingSkillParameters, parameterize_steps
+from .memory.skills import (
+    MissingSkillParameters,
+    parameterize_steps,
+    suggest_skill_name,
+)
 from .computer import COMPUTER_IMPL, get_computer_tools
 from .computer.tools import execute_computer_tool
 from .adapters import ADAPTER_IMPL, get_adapter_tools
@@ -651,7 +655,8 @@ class WinBrowAgent:
                 + f". Use when the request resembles: {utterance[:160]}"
             )
             self.skills.save(
-                name=utterance[:60], utterance=utterance, steps=steps,
+                name=suggest_skill_name(steps, utterance),
+                utterance=utterance, steps=steps,
                 source="brain", description=description,
                 parameters=[p.to_dict() for p in params],
                 status="proposed",

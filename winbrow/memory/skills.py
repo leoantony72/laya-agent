@@ -30,6 +30,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
 
 log = logging.getLogger("winbrow.memory.skills")
 
@@ -64,6 +65,83 @@ def _canon_tokens(text: str) -> set[str]:
 def _slugify(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return s[:60] or "skill"
+
+
+_SITE_NAMES = (
+    ("drive.google.com", "Google Drive"),
+    ("docs.google.com", "Google Docs"),
+    ("onedrive.live.com", "OneDrive"),
+    ("dropbox.com", "Dropbox"),
+    ("aspose.app", "Aspose"),
+)
+
+
+def _site_from_steps(steps: List[dict]) -> str:
+    for step in steps:
+        args = step.get("args") or {}
+        raw = str(args.get("url") or "").strip()
+        if not raw:
+            continue
+        if "://" not in raw:
+            raw = "https://" + raw
+        try:
+            host = (urlsplit(raw).hostname or "").lower()
+        except ValueError:
+            continue
+        if host.startswith("www."):
+            host = host[4:]
+        for domain, label in _SITE_NAMES:
+            if host == domain or host.endswith("." + domain):
+                return label
+    return ""
+
+
+def suggest_skill_name(steps: List[dict], utterance: str = "") -> str:
+    """Return a reusable, intent-based label instead of the raw request.
+
+    Captured skills are matched by their utterance/triggers, so the human-facing
+    name can describe the workflow generically and stay useful for every file
+    or folder, not just the one used during capture.
+    """
+    skills = [
+        str(step.get("skill") or "").strip()
+        for step in steps
+        if str(step.get("skill") or "").strip()
+    ]
+    if not skills:
+        return "Captured workflow"
+
+    names = set(skills)
+    site = _site_from_steps(steps)
+    if "browser_upload_file" in names:
+        return f"Upload a file to {site}" if site else "Upload a file in the browser"
+    if "download_file" in names:
+        if "mcp_filesystem_move_file" in names:
+            return "Download a file to a folder"
+        return "Download a file"
+    if "mcp_filesystem_move_file" in names:
+        return "Move a file to a folder"
+    if "mcp_filesystem_copy_file" in names:
+        return "Copy a file to a folder"
+    if "read_document" in names and names & {
+        "create_text_file", "mcp_filesystem_write_file",
+    }:
+        return "Create a document from a file"
+    if "browser_navigate" in names and names & {
+        "browser_read_full", "browser_read_page",
+    }:
+        return "Read a web page"
+    if names == {"run_command"}:
+        return "Run a command"
+
+    readable: List[str] = []
+    for skill in skills:
+        label = skill.replace("_", " ")
+        if label not in readable:
+            readable.append(label)
+        if len(readable) == 3:
+            break
+    return ("Run " + ", then ".join(readable))[:80]
 
 
 @dataclass
@@ -190,8 +268,8 @@ class SkillRecord:
 
 _WIN_ABS_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
 _BARE_FILENAME_RE = re.compile(r"^[^\\/\s]+\.[A-Za-z0-9]{1,8}$")
-_PATH_ARG_KEYS = {"path", "folder", "destination", "source", "target",
-                  "file", "filename", "name", "dir", "directory"}
+_PATH_ARG_KEYS = {"path", "file_path", "folder", "destination", "source",
+                  "target", "file", "filename", "name", "dir", "directory"}
 
 
 def _param_description(key: str, is_file: bool) -> str:
@@ -245,7 +323,13 @@ def parameterize_steps(
                 continue
             haystack = value.lower().replace("/", "\\")
             basename = re.split(r"[\\/]", haystack.rstrip("\\"))[-1]
-            basename_hit = len(basename) >= 4 and basename in low_utterance
+            stem = basename.rsplit(".", 1)[0]
+            norm_utterance = re.sub(r"[\s_\-]+", "", low_utterance)
+            basename_hit = any(
+                len(candidate) >= 4
+                and re.sub(r"[\s_\-]+", "", candidate) in norm_utterance
+                for candidate in (basename, stem)
+            )
             if haystack not in low_utterance and not basename_hit:
                 continue
             file_like = is_file or bool(re.search(r"\.[A-Za-z0-9]{1,8}$", basename))

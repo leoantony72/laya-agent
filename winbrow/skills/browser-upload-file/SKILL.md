@@ -7,10 +7,11 @@ args:
     required: true
     description: Absolute path of the file to upload, e.g. C:\Docs\report.pptx.
 description: >
-  Set an absolute file path on the active page's file input via CDP, bypassing
-  the OS file picker. Use for every upload, always after browser-interact
-  clicks the button that opens file selection. Do not use it before the trigger
-  is clicked, or to type a path into a text field.
+  Set an absolute file path on the active page's file input via CDP. The click
+  that opens the upload control is intercepted, so the native Windows file
+  picker never appears. Use for every upload, always after browser-interact
+  clicks the button that reveals the file input. Do not use it before the
+  trigger is clicked, or to type a path into a text field.
 ---
 
 ## When to Use
@@ -59,7 +60,8 @@ Online PPTX viewers, first option that works:
   find-files first; never pass a relative name or a `~` path.
 - The file input not found error means the upload trigger was not clicked yet.
   Go back to step 3, click the trigger, then retry the upload once.
-- The file picker dialog is never used; this skill talks to the page directly.
+- The native file picker is intercepted and never displayed; this skill talks
+  to the page's file input directly.
 
 ## Output Shape
 

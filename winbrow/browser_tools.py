@@ -854,15 +854,18 @@ async def _wait(browser: "BrowserController", args: dict) -> dict[str, Any]:
 # Drive keeps its <input type="file"> hidden until the upload menu item is
 # clicked. Typing a path into the input with browser_interact therefore fails
 # or targets nothing; the input must be activated first, then set over CDP.
+# The click is sent with CDP Input while Page.setInterceptFileChooserDialog is
+# enabled, so Chrome does not display the native Windows file picker.
 async def browser_upload_file(
     file_path: str,
     browser: Optional["BrowserController"] = None,
 ) -> dict[str, Any]:
     """Set a file on the page's active file input via CDP.
 
-    The OS file picker cannot be driven by CDP. DOM.setFileInputFiles writes
-    the selected file directly onto the input element (hidden inputs included),
-    which is the only reliable way to upload without the dialog.
+    Agent clicks intercept the native file chooser, so no Windows dialog is
+    shown. DOM.setFileInputFiles writes the selected file directly onto the
+    input element (hidden inputs included), which is the reliable way to upload
+    without driving an OS dialog.
     """
     path = str(file_path or "").strip().strip('"')
     if not path or not os.path.isfile(path):

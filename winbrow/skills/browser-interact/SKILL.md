@@ -35,7 +35,8 @@ pass it directly so no second tree walk is needed.
 ## When NOT to Use
 
 - Do not use it to set a file on an upload input; click the upload trigger here
-  and then call browser-upload-file with the absolute path.
+  (the native file picker is intercepted and suppressed) and then call
+  browser-upload-file with the absolute path.
 - Do not type a file path into a visible text field as an upload workaround.
 - Do not use it for navigation when the URL is already known; use
   browser-navigate.

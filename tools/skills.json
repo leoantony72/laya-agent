@@ -554,8 +554,8 @@
     "source": "brain"
   },
   {
-    "id": "can-you-upload-the-ldmseminar-pptx-file-in-the-google-drive",
-    "name": "can you upload the LDMseminar pptx file in the google drive",
+    "id": "upload-a-file-to-google-drive",
+    "name": "Upload a file to Google Drive",
     "utterance": "can you upload the LDMseminar pptx file in the google drive",
     "steps": [
       {

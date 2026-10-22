@@ -31,7 +31,7 @@ from winbrow.brain.model_gateway import (GatewayResponse, GatewayUnavailable,
 from winbrow.memory.skills import (MAX_STEPS, MATCH_THRESHOLD, SkillMemory,
                                    SkillRecord, SkillStep,
                                    MissingSkillParameters, match_score,
-                                   parameterize_steps)
+                                   parameterize_steps, suggest_skill_name)
 from winbrow.adapters.base import AdapterOp
 from winbrow.adapters.manager import (ADAPTER_IMPL, ADAPTER_TOOLS,
                                       adapter_for_app, execute_adapter_tool,
@@ -184,6 +184,45 @@ class TestSkillMemory(unittest.TestCase):
         self.assertEqual(out[1]["args"]["path"], "{{file_path}}")
         self.assertEqual(out[2]["args"]["app_name"], "code")
         self.assertEqual([p.name for p in params], ["folder_path", "file_path"])
+
+    def test_parameterize_upload_path_matches_fuzzy_filename(self):
+        steps = [{
+            "skill": "browser_upload_file",
+            "args": {"file_path": "C:\\Users\\USER\\Downloads\\LDM seminar.pptx"},
+        }]
+        out, params = parameterize_steps(
+            steps, "can you upload the LDMseminar pptx file to Google Drive")
+        self.assertEqual(out[0]["args"]["file_path"], "{{file_path}}")
+        self.assertEqual([p.name for p in params], ["file_path"])
+
+    def test_upload_skill_name_is_generic(self):
+        steps = [
+            {"skill": "find_files", "args": {"search_term": "LDMseminar"}},
+            {"skill": "browser_navigate",
+             "args": {"url": "https://drive.google.com"}},
+            {"skill": "browser_upload_file",
+             "args": {"file_path": "C:\\Users\\USER\\Downloads\\LDM seminar.pptx"}},
+        ]
+        name = suggest_skill_name(
+            steps, "can you upload the LDMseminar pptx file in the google drive")
+        self.assertEqual(name, "Upload a file to Google Drive")
+        self.assertNotIn("LDMseminar", name)
+
+    def test_non_upload_skill_names_are_intent_based(self):
+        self.assertEqual(
+            suggest_skill_name([
+                {"skill": "find_files", "args": {"search_term": "x"}},
+                {"skill": "mcp_filesystem_move_file", "args": {}},
+            ], "move x to papers"),
+            "Move a file to a folder",
+        )
+        self.assertEqual(
+            suggest_skill_name([
+                {"skill": "read_document", "args": {}},
+                {"skill": "create_text_file", "args": {}},
+            ], "summarize x"),
+            "Create a document from a file",
+        )
 
 
 class TestAdapterOps(unittest.TestCase):
@@ -806,6 +845,29 @@ class TestBrowserTaskTabs(unittest.TestCase):
 
         browser._page_conn = page_conn
 
+    def test_click_at_intercepts_native_file_chooser(self):
+        from contextlib import asynccontextmanager
+
+        browser = self._controller()
+        calls = []
+
+        class _Conn:
+            async def call(self, method, params=None, timeout=None):
+                calls.append((method, params))
+                return {"result": {}}
+
+        @asynccontextmanager
+        async def page_conn(tab):
+            yield _Conn()
+
+        browser._page_conn = page_conn
+        out = run(browser.click_at(10, 20))
+        self.assertTrue(out["success"], out)
+        self.assertIn(
+            ("Page.setInterceptFileChooserDialog", {"enabled": True}),
+            calls,
+        )
+
     def test_first_navigation_of_task_opens_a_new_tab(self):
         from unittest.mock import patch
 
@@ -1080,8 +1142,9 @@ class TestAgentWiring(unittest.TestCase):
         res = run(self.agent.execute(
             "open project x in-vscode and prepare", session_id="m2t2"))
         self.assertTrue(res["execution"].get("success"))
-        rec = self.skills.get("open-project-x-in-vscode-and-prepare".replace('_', '-')[:60])
+        rec = self.skills.get("run-vscode-open-then-computer-scroll")
         self.assertIsNotNone(rec)
+        self.assertNotIn("project x", rec.name)
         self.assertEqual(len(rec.steps), 2)
         self.assertEqual(rec.source, "brain")
         self.assertEqual(rec.status, "proposed")
