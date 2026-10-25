@@ -18,8 +18,8 @@ Three levels:
   3. registry tools (MCP, native, learned) → name index in the cached prompt,
      full schema synthesized on demand by build_tool_detail()
 
-Malformed frontmatter raises SkillRegistryError at startup instead of failing
-silently in the middle of a task.
+Malformed frontmatter is logged and skipped per file so one broken skill never
+takes the whole registry (and therefore WinBrow startup) down.
 """
 
 from __future__ import annotations
@@ -200,6 +200,12 @@ def _load_skill_file(path: Path, folder_name: str, source: str = "folder") -> Sk
     )
 
 
+def load_skill_file(path: str | Path, source: str = "folder") -> SkillMeta:
+    """Parse one SKILL.md file. Public wrapper used by hot-reload code."""
+    skill_path = Path(path)
+    return _load_skill_file(skill_path, skill_path.parent.name, source=source)
+
+
 # ---------------------------------------------------------------------------
 # A. Load metadata (called once at startup)
 # ---------------------------------------------------------------------------
@@ -215,14 +221,19 @@ def load_skill_registry(
 ) -> dict[str, SkillMeta]:
     """Return ``{dispatcher_key: SkillMeta}`` for every SKILL.md.
 
-    Raises SkillRegistryError on malformed frontmatter so broken skills fail
-    loud at startup, not silently mid-task. Missing skills_dir is not fatal:
-    the brain falls back to the runtime tool index only.
+    A missing skills directory is created so generated skills have a home.
+    Malformed files are logged and skipped individually; they never crash
+    startup or hide the other valid skills. Duplicate dispatcher keys keep the
+    first (curated) definition and log the conflict.
     """
     root = Path(skills_dir).expanduser().resolve()
     if not root.exists():
-        log.warning(f"Skills directory not found: {root}")
-        return {}
+        log.warning(f"Skills directory not found: {root}; creating it.")
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning(f"Could not create skills directory {root}: {exc}")
+            return {}
 
     registry: dict[str, SkillMeta] = {}
     for path in sorted(root.rglob("SKILL.md")):
@@ -230,13 +241,18 @@ def load_skill_registry(
         # curated skill with the same dispatcher key always wins.
         if "learned" in path.relative_to(root).parts[:-2]:
             continue
-        meta = _load_skill_file(path, path.parent.name)
+        try:
+            meta = _load_skill_file(path, path.parent.name)
+        except SkillRegistryError as exc:
+            log.warning(f"Skipping malformed skill {path}: {exc}")
+            continue
         if meta.skill in registry:
             other = registry[meta.skill]
-            raise SkillRegistryError(
-                f"Duplicate dispatcher key '{meta.skill}': {path} and "
-                f"{other.skill_md_path}"
+            log.warning(
+                f"Skipping duplicate dispatcher key '{meta.skill}' at {path}; "
+                f"already registered from {other.skill_md_path}"
             )
+            continue
         registry[meta.skill] = meta
 
     if sync_learned:
@@ -251,7 +267,11 @@ def load_skill_registry(
         rel_parts = path.relative_to(root).parts
         if len(rel_parts) < 3 or rel_parts[0] != "learned":
             continue
-        meta = _load_skill_file(path, path.parent.name, source="learned")
+        try:
+            meta = _load_skill_file(path, path.parent.name, source="learned")
+        except SkillRegistryError as exc:
+            log.warning(f"Skipping malformed learned skill {path}: {exc}")
+            continue
         if meta.skill in registry:
             # A curated folder or an older learned entry already owns the key.
             log.debug(
@@ -277,14 +297,40 @@ def _skill_args_label(args: Iterable[ArgDef]) -> str:
     return "{" + ", ".join(parts) + "}" if parts else "{}"
 
 
-def _clip(text: str, limit: int) -> str:
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def _complete_clip(text: str, limit: int) -> str:
+    """Shorten a description without ever cutting mid-sentence.
+
+    Metadata descriptions are the planner's only view of a skill, so a
+    half-written trigger ("Use when the user wants to uplo...") is worse than
+    a slightly longer line. Keep the longest run of complete sentences that
+    fits; if even the first sentence exceeds the budget, keep that sentence
+    whole and let the ladder try a smaller one elsewhere.
+    """
     text = " ".join((text or "").split())
+    if not text:
+        return ""
+    if text[-1] not in ".!?":
+        text += "."
     if len(text) <= limit:
         return text
-    cut = text[:limit].rstrip()
-    if " " in cut:
-        cut = cut.rsplit(" ", 1)[0]
-    return cut.rstrip(".,;:") + "..."
+
+    sentences = [part for part in _SENTENCE_SPLIT_RE.split(text) if part]
+    chosen = ""
+    for sentence in sentences:
+        candidate = f"{chosen} {sentence}".strip()
+        if chosen and len(candidate) > limit:
+            break
+        chosen = candidate
+        if len(chosen) >= limit:
+            break
+    if not chosen:
+        chosen = sentences[0]
+    if chosen[-1] not in ".!?":
+        chosen += "."
+    return chosen
 
 
 def _ordered(registry: dict[str, SkillMeta]) -> list[SkillMeta]:
@@ -311,7 +357,7 @@ def _render_skills_metadata(
         limit = _desc_limit(meta, core, meta_limit, learned)
         lines.append(f"{meta.skill}  {_skill_args_label(meta.args)}")
         wrapped = textwrap.fill(
-            _clip(meta.description, limit),
+            _complete_clip(meta.description, limit),
             width=76,
             initial_indent="  ",
             subsequent_indent="  ",
@@ -331,8 +377,9 @@ def build_skills_metadata(
     """Compact metadata-only list injected into the cached system prompt.
 
     Core skills get the richest trigger text; meta and learned skills get a
-    shorter line. Budget: under 4,000 characters (~1,000 tokens) whenever the
-    registry is the standard skill set.
+    shorter line. Descriptions are truncated only at sentence boundaries and
+    always end with terminal punctuation — never with "...". Budget: under
+    4,000 characters (~1,000 tokens) whenever the registry is the standard set.
     """
     if not registry:
         return ""

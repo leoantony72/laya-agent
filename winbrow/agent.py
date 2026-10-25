@@ -23,7 +23,7 @@ import re
 import time
 from typing import Any, Optional
 
-from .browser_task import BrowserController
+from .browser_task import BrowserController, note_browser_from_text
 from .browser_tools import BROWSER_IMPL, execute_browser_tool, get_browser_tools
 from .brain import AgentBrain, GatewayUnavailable, ModelGateway
 from .brain.agent_loop import COMPUTER_SKILL_DISPATCH, _ctx_block
@@ -68,7 +68,8 @@ BROWSER_KEYWORDS = [
     "fill", "submit", "download from", "open website", "go to",
     "show me", "find me", "get me", "look for", "browse to",
     "amazon", "youtube", "twitter", "instagram", "linkedin", "github",
-    "google flights", "booking.com", "airbnb", "expedia",
+    "google flights", "booking.com", "airbnb", "expedia", "instagram", "google drive", "facebook",
+    "flipkart", "discord", "twitter",
 ]
 
 
@@ -342,6 +343,41 @@ class WinBrowAgent:
         )
 
     # ------------------------------------------------------------------ shared skill executor
+    async def _open_requested_browser(self, app_name: str) -> dict[str, Any]:
+        """Open/focus a browser the user named, keeping it under agent control.
+
+        Launching Chrome via Start-Process and then browsing in the default
+        browser (Brave) is what made "open chrome and go to ..." use the wrong
+        window. Remember the requested browser and bring it up with CDP when it
+        is not already running; return {} when the name is not a browser.
+        """
+        from .browser_task import canonical_browser, set_preferred_browser
+
+        requested = canonical_browser(app_name)
+        if not requested:
+            return {}
+        set_preferred_browser(requested)
+        try:
+            launched = await self.browser.launch_with_cdp(url="", guide=False)
+        except Exception as e:
+            log.debug(f"Requested-browser launch failed for {app_name}: {e}")
+            return {}
+        if not launched.get("cdp_backend"):
+            # The requested browser is already running without remote
+            # debugging. Fall back to normal focus/launch behavior.
+            return {}
+        return {
+            "success": True,
+            "output": (
+                launched.get("message")
+                or launched.get("stdout")
+                or f"Opened {app_name} with browser control"
+            ),
+            "method": launched.get("method", ""),
+            "cdp_backend": launched.get("cdp_backend"),
+            "elapsed_ms": 20.0,
+        }
+
     async def run_skill(self, tool_name: str, args: dict[str, str],
                         utterance: str = "", session_id: Optional[str] = None) -> dict[str, Any]:
         """Execute one registry tool by name — the single dispatch point shared
@@ -415,7 +451,27 @@ class WinBrowAgent:
                 "method": out.get("method", "laya_ultrafast"),
             }
         if tool_name == "app_focus_or_launch":
-            app_name = str(args.get("app_name", "notepad")).strip()
+            app_name = str(args.get("app_name") or args.get("app") or "").strip()
+            if not app_name:
+                # Never guess an app: the old "notepad" default launched an
+                # unrelated window when the planner omitted the argument.
+                return {
+                    "type": "tool_execution",
+                    "tool": tool_name,
+                    "success": False,
+                    "output": (
+                        "No application was named. Say which app to open "
+                        "(for example 'open Chrome' or 'open Notepad')."
+                    ),
+                    "elapsed_ms": 0.0,
+                }
+            browser_out = await self._open_requested_browser(app_name)
+            if browser_out:
+                browser_out.update({
+                    "type": "tool_execution",
+                    "tool": tool_name,
+                })
+                return browser_out
             from .windows import focus_or_launch_app
             out = await focus_or_launch_app(app_name)
             return {
@@ -425,6 +481,17 @@ class WinBrowAgent:
                 "output": out.get("output", f"Focused {app_name}"),
                 "elapsed_ms": 15.0,
             }
+        if tool_name == "open_common_app":
+            app_name = str(args.get("app") or "").strip()
+            browser_out = await self._open_requested_browser(app_name)
+            if browser_out:
+                browser_out.update({
+                    "type": "tool_execution",
+                    "tool": tool_name,
+                    "is_learned": False,
+                    "script": "",
+                })
+                return browser_out
         if tool_name == "type_text":
             text = str(args.get("text", ""))
             # Ensure target application is focused before typing
@@ -555,6 +622,7 @@ class WinBrowAgent:
         # Each task gets its own tab: the first navigation opens a fresh one so
         # the page the user is working in is never hijacked.
         self.browser.reset_session()
+        note_browser_from_text(utterance)
         try:
             result = await self.brain.handle(
                 contextualized, ctx, session, emit=emit, max_steps=max_steps,
@@ -1449,6 +1517,7 @@ class WinBrowAgent:
                         log.info(f"Session resolved references: {resolutions}")
                     # Every brain run starts a fresh browser session tab.
                     self.browser.reset_session()
+                    note_browser_from_text(utterance)
                     brain_res = await self.brain.handle(
                         contextualized, ctx, session, emit=emit,
                     )

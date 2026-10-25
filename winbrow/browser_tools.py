@@ -426,16 +426,18 @@ async def _page_state(browser: "BrowserController", max_chars: int,
     # unchanged, so a read immediately after navigate/interact/wait is free.
     getter = getattr(browser, "get_page_state", None)
     if callable(getter):
-        state = await getter(force_refresh=force_refresh)
-        if state.get("error"):
-            return {"error": str(state["error"])}, "error"
-        method = str(state.get("method") or "cdp")
+        raw_state = await getter(force_refresh=force_refresh)
+        if raw_state.get("error"):
+            return {"error": str(raw_state["error"])}, "error"
+        method = str(raw_state.get("method") or "cdp")
         state = {
-            "title": str(state.get("title") or ""),
-            "url": str(state.get("url") or ""),
-            "text": str(state.get("text") or ""),
-            "links": state.get("links") or [],
+            "title": str(raw_state.get("title") or ""),
+            "url": str(raw_state.get("url") or ""),
+            "text": str(raw_state.get("text") or ""),
+            "links": raw_state.get("links") or [],
         }
+        if raw_state.get("_blank"):
+            state["_blank"] = True
         return state, method
 
     result = await browser.execute_js(_PAGE_STATE_JS)
@@ -487,13 +489,22 @@ async def _state_output(browser: "BrowserController", url: str = "",
         }
     if url and not state.get("url"):
         state["url"] = url
-    return {
+    result = {
         "success": True,
         "output": _render_state(state, max_chars),
         "url": state.get("url", ""),
         "title": state.get("title", ""),
+        "text": state.get("text", ""),
+        "links": state.get("links") or [],
         "method": method,
     }
+    if state.get("_blank"):
+        result["_blank"] = True
+        result["_warning"] = (
+            "The page is still blank (no title or text yet). It may be loading. "
+            "Call browser_wait(seconds=2) and read again before acting."
+        )
+    return result
 
 
 async def _navigate(browser: "BrowserController", args: dict) -> dict[str, Any]:
@@ -536,8 +547,14 @@ async def _navigate(browser: "BrowserController", args: dict) -> dict[str, Any]:
     state["navigation"] = navigation
     if navigation.get("tab"):
         state["tab"] = navigation["tab"]
+    browser_name = str(navigation.get("browser") or "").strip()
+    if browser_name:
+        state["browser"] = browser_name
     if state.get("success"):
-        state["output"] = f"Navigated to {state.get('url') or url}\n\n{state['output']}"
+        via = f" ({browser_name})" if browser_name else ""
+        state["output"] = (
+            f"Navigated to {state.get('url') or url}{via}\n\n{state['output']}"
+        )
     return state
 
 

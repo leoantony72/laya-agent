@@ -147,9 +147,62 @@ def _process_running(name: str) -> bool:
         return False
 
 
+_BROWSER_ALIASES = {
+    "chrome": "chrome",
+    "google chrome": "chrome",
+    "googlechrome": "chrome",
+    "brave": "brave",
+    "brave browser": "brave",
+    "edge": "msedge",
+    "msedge": "msedge",
+    "microsoft edge": "msedge",
+}
+
+# Set when the user explicitly asked for a browser ("open Chrome and ...").
+# "auto" keeps the old default-browser-first behavior.
+_PREFERRED_BROWSER = "auto"
+
+
+def canonical_browser(name: str) -> str:
+    """Map a spoken browser name to brave/chrome/msedge, or '' when unknown."""
+    key = re.sub(r"\s+", " ", str(name or "").strip().lower().replace("_", " "))
+    return _BROWSER_ALIASES.get(key, "")
+
+
+def set_preferred_browser(name: str) -> str:
+    """Remember the browser the user asked for; '' / 'auto' clears it."""
+    global _PREFERRED_BROWSER
+    canonical = canonical_browser(name)
+    _PREFERRED_BROWSER = canonical or "auto"
+    return _PREFERRED_BROWSER
+
+
+def _preferred_browser() -> str:
+    return _PREFERRED_BROWSER if _PREFERRED_BROWSER in ("brave", "chrome", "msedge") else ""
+
+
+# "open chrome and ...", "go to x.com in brave", "use microsoft edge"
+_BROWSER_IN_REQUEST_RE = re.compile(
+    r"\b(?:open|launch|start|use|with|in)\s+"
+    r"(google chrome|chrome|brave(?:\s+browser)?|microsoft edge|msedge|edge)\b",
+    re.IGNORECASE,
+)
+
+
+def note_browser_from_text(text: str) -> str:
+    """Set the task browser when the goal explicitly names one."""
+    match = _BROWSER_IN_REQUEST_RE.search(str(text or ""))
+    if not match:
+        return ""
+    return set_preferred_browser(match.group(1))
+
+
 def _browser_order() -> list[str]:
-    """Default browser first, then the rest."""
+    """Requested browser first, else the default browser, then the rest."""
     order = ["brave", "chrome", "msedge"]
+    preferred = _preferred_browser()
+    if preferred:
+        return [preferred] + [b for b in order if b != preferred]
     default = get_default_browser()
     if default in order:
         order = [default] + [b for b in order if b != default]
@@ -162,6 +215,14 @@ def _running_browser() -> str:
         if _process_running(name):
             return name
     return ""
+
+
+def _cdp_browser_hint() -> str:
+    """Display name of the browser most likely serving CDP right now."""
+    name = _preferred_browser()
+    if not (name and _process_running(name)):
+        name = _running_browser()
+    return _display_name(name) if name else ""
 
 
 def _setup_hint(name: str = "") -> str:
@@ -253,7 +314,13 @@ def _devtools_ws_endpoint() -> Optional[str]:
     disables the HTTP /json endpoints and writes port + ws path to this file in
     the profile root instead.
     """
-    for name in _browser_order():
+    order = _browser_order()
+    preferred = _preferred_browser()
+    if preferred and not _process_running(preferred):
+        # The user asked for a browser that is not running. Do not silently
+        # attach to a different one; let the caller launch the requested one.
+        order = [preferred]
+    for name in order:
         port_file = os.path.join(_user_data_dir(name), "DevToolsActivePort")
         if not os.path.isfile(port_file):
             continue
@@ -432,9 +499,48 @@ _PAGE_STATE_JS = r"""
     links.push({text: label.slice(0, 160), href: href});
     if (links.length >= 200) break;
   }
-  return {title: document.title || '', url: location.href || '', text, links};
+  return {title: document.title || '', url: location.href || '', text, links,
+          ready: document.readyState || ''};
 })()
 """
+
+# A snapshot taken while a navigation is still committing has the new URL but
+# an empty title/body ("(untitled)" + "(empty)"). Reading it once and caching it
+# hides the real page forever (URL-keyed cache), so blank snapshots are retried
+# for a few seconds and never cached.
+_PAGE_READY_WAIT_S = 3.0
+_PAGE_READY_POLL_S = 0.4
+
+
+def _coerce_page_state(result: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalize the Runtime.evaluate payload into a page-state dict."""
+    if not result.get("success"):
+        return None
+    value = result.get("value")
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            value = {"text": value}
+    if not isinstance(value, dict):
+        return None
+    return {
+        "title": str(value.get("title") or ""),
+        "url": str(value.get("url") or ""),
+        "text": str(value.get("text") or ""),
+        "links": value.get("links") or [],
+    }
+
+
+def _state_is_blank(state: dict[str, Any]) -> bool:
+    """True when a snapshot has no usable content (page not rendered yet)."""
+    if not isinstance(state, dict) or state.get("error"):
+        return False
+    return not (
+        str(state.get("title") or "").strip()
+        or str(state.get("text") or "").strip()
+        or state.get("links")
+    )
 
 
 class _HttpPageConn:
@@ -589,6 +695,8 @@ class BrowserController:
         self._agent_tab_created = False
         self._last_page_state = None
         self._last_page_state_url = None
+        # A browser named in one task must not silently steer the next one.
+        set_preferred_browser("")
 
     def begin_task(self) -> None:
         """Backwards-compatible alias for reset_session()."""
@@ -991,6 +1099,7 @@ class BrowserController:
             try:
                 navigation = await self._navigate_tab(tab_id, url)
                 if navigation.get("success"):
+                    navigation.setdefault("browser", _cdp_browser_hint())
                     return navigation
                 log.debug(
                     f"Agent tab navigation failed: {navigation.get('error')}")
@@ -1007,7 +1116,7 @@ class BrowserController:
                 await asyncio.sleep(0.5)
                 return {
                     "success": True, "method": "cdp_new_tab", "url": url,
-                    "tab": "new",
+                    "tab": "new", "browser": _cdp_browser_hint(),
                 }
 
         # Fallback only when CDP is completely unavailable.
@@ -1045,7 +1154,10 @@ class BrowserController:
             return "Opened {url}"
         }}
         """
-        return await run_powershell(script)
+        out = await run_powershell(script)
+        if isinstance(out, dict):
+            out.setdefault("browser", _cdp_browser_hint())
+        return out
 
     async def open_url(self, url: str, new_window: bool = False) -> dict[str, Any]:
         """Open a URL (alias for navigate_to)."""
@@ -1178,25 +1290,42 @@ class BrowserController:
         return str((target or {}).get("url") or "")
 
     async def _fetch_page_state(self) -> dict[str, Any]:
-        """Fetch a fresh title/url/text/links snapshot via CDP."""
-        result = await self.execute_js(_PAGE_STATE_JS)
-        if result.get("success"):
-            value = result.get("value")
-            if isinstance(value, str):
-                try:
-                    value = json.loads(value)
-                except ValueError:
-                    value = {"text": value}
-            if isinstance(value, dict):
-                state = {
-                    "title": str(value.get("title") or ""),
-                    "url": str(value.get("url") or ""),
-                    "text": str(value.get("text") or ""),
-                    "links": value.get("links") or [],
-                }
-                if state["text"] or state["title"] or state["url"] or state["links"]:
-                    state["method"] = "cdp"
-                    return state
+        """Fetch a fresh title/url/text/links snapshot via CDP.
+
+        Slow or client-rendered pages report an empty title/body for a moment
+        after navigation. Keep polling briefly instead of returning (and
+        caching) that half-built snapshot.
+        """
+        deadline = time.monotonic() + _PAGE_READY_WAIT_S
+        state: Optional[dict[str, Any]] = None
+        result: dict[str, Any] = {}
+        while True:
+            result = await self.execute_js(_PAGE_STATE_JS)
+            state = _coerce_page_state(result)
+            if state is None:
+                # The execution context often disappears mid-navigation; retry
+                # instead of reporting the whole navigation as unreadable.
+                if time.monotonic() >= deadline:
+                    break
+                await asyncio.sleep(_PAGE_READY_POLL_S)
+                continue
+            if not _state_is_blank(state):
+                state["method"] = "cdp"
+                return state
+            # Only real web pages are expected to grow content; about:blank and
+            # internal pages legitimately stay empty.
+            if not state["url"].startswith(("http://", "https://", "file://")):
+                break
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(_PAGE_READY_POLL_S)
+
+        if state is not None:
+            state["method"] = "cdp"
+            if _state_is_blank(state):
+                # Render it for the caller, but flag it so it is not cached.
+                state["_blank"] = True
+            return state
 
         fallback = await self.read_page_text()
         if fallback.get("success"):
@@ -1211,27 +1340,38 @@ class BrowserController:
                 state["url"] = await self._get_current_url()
             except Exception:
                 pass
+            if not state["text"].strip():
+                state["_blank"] = True
             return state
 
         error = result.get("error") or fallback.get("error") or "Could not read the page"
         return {"error": str(error)}
 
     async def get_page_state(self, force_refresh: bool = False) -> dict[str, Any]:
-        """Return the page snapshot, reusing it while the URL is unchanged."""
+        """Return the page snapshot, reusing it while the URL is unchanged.
+
+        Blank snapshots are never served from or written to the cache: a single
+        early read after navigate used to poison every later same-URL read.
+        """
         current_url = await self._get_current_url()
         if (
             not force_refresh
             and self._last_page_state is not None
             and self._last_page_state_url == current_url
+            and not _state_is_blank(self._last_page_state)
         ):
             cached = dict(self._last_page_state)
             cached["_cached"] = True
             return cached
 
         state = await self._fetch_page_state()
-        if not state.get("error"):
+        if not state.get("error") and not _state_is_blank(state):
             self._last_page_state = state
             self._last_page_state_url = str(state.get("url") or current_url)
+        elif _state_is_blank(state):
+            # Drop a previously cached good snapshot too: the page changed.
+            self._last_page_state = None
+            self._last_page_state_url = None
         return state
 
     async def screenshot(self, save_path: Optional[str] = None) -> dict[str, Any]:
@@ -1516,16 +1656,20 @@ class BrowserController:
         """
         backend = _cdp_backend()
         if backend:
+            label = _cdp_browser_hint() or "the running browser"
+            msg = f"Attached to {label} over CDP (real profile)"
             return {"success": True, "method": f"attach_{backend}", "cdp_backend": backend,
-                    "stdout": "Attached to the running browser over CDP (real profile)",
-                    "message": "Attached to the running browser over CDP (real profile)"}
+                    "stdout": msg, "message": msg}
 
         if os.environ.get("WINBROW_BROWSER_MODE", "").lower() == "separate":
             return await self._launch_separate_profile(url)
 
         running = _running_browser()
-        browser = running or get_default_browser() or "brave"
-        if running:
+        preferred = _preferred_browser()
+        # Honour an explicit "open Chrome" even when another Chromium browser
+        # (usually the OS default) is already running without a debugging port.
+        browser = preferred or running or get_default_browser() or "brave"
+        if running and (not preferred or preferred == running):
             # Already open without CDP -> turn the one-time opt-in on for the
             # user automatically when guided; manual hint as fallback.
             hint = _setup_hint(running)
@@ -1550,6 +1694,7 @@ class BrowserController:
                 exe = _find_browser_exe(name)
                 if exe:
                     browser = name
+                    set_preferred_browser(name)
                     break
         if not exe:
             return {"success": False, "method": "error", "cdp_backend": None,
@@ -1950,9 +2095,10 @@ class BrowserController:
 
         Simple "open/go to <site>" goals are handed to the user's own browser
         window (new tab, no CDP). Interactive tasks attach to the user's
-        default-profile browser over CDP (same window, same logins) — with a
+        default-profile browser over CDP (same window, same logins) - with a
         one-time remote-debugging opt-in when it has not been enabled yet.
         """
+        note_browser_from_text(goal)
         # Plain navigation: open a tab in the user's own browser window.
         nav_url = _plain_nav_url(goal)
         if nav_url:
@@ -1997,6 +2143,7 @@ class BrowserController:
         # Same task-tab guarantee as the brain loop: nothing may overwrite the
         # tab the user is working in.
         self.reset_session()
+        note_browser_from_text(goal)
         try:
             res = await engine.run_task(goal=goal, max_steps=max_steps)
         finally:

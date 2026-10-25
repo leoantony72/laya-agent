@@ -57,6 +57,11 @@ from .skill_registry import (
     load_skill_registry,
     resolve_skill_key,
 )
+from .skill_writer import (
+    analyse_task_for_skill,
+    register_skill_in_registry,
+    write_skill_to_disk,
+)
 from ..computer.tools import screen_read_text
 from ..policy import PolicyError, validate_script_safety
 from ..registry import ArgSpec, Tool
@@ -80,9 +85,28 @@ SKILLS_DIR = os.environ.get("WINBROW_SKILLS_DIR") or str(
 SKILL_REGISTRY: dict[str, SkillMeta] = load_skill_registry(SKILLS_DIR)
 SKILLS_METADATA: str = build_skills_metadata(SKILL_REGISTRY)
 
+# Background skill-analysis tasks. Keep strong references until they finish:
+# asyncio only holds a weak reference to a task, so a fire-and-forget task can
+# be garbage-collected before it writes the SKILL.md.
+_SKILL_WRITER_TASKS: set[asyncio.Task] = set()
+
 # 10 was too tight for real multi-step work (find a file → open a site →
 # upload → verify). Env-tunable for latency-sensitive setups.
 MAX_STEPS_DEFAULT = int(os.environ.get("WINBROW_MAX_STEPS", "20"))
+
+# Read-only observations are idempotent: a second identical call is a valid
+# "look again" (the page may have loaded since), not a redundant repeat. The
+# completed-step guard must not skip these or short-circuit them with the first
+# (possibly stale) result.
+REPEATABLE_SKILLS = frozenset({
+    "browser_read_page",
+    "browser_read_full",
+    "browser_get_accessibility_tree",
+    "browser_wait",
+    "screen_read_text",
+    "current_time",
+})
+
 # Warn the planner when the action budget is nearly exhausted so it can finish
 # or ask the user instead of silently hitting the hard stop.
 STEP_WARN_REMAINING = max(1, int(os.environ.get("WINBROW_STEP_WARN", "5")))
@@ -463,6 +487,72 @@ class AgentBrain:
             self._registry_tools(ctx), full_mcp_names=True
         )
 
+    # ------------------------------------------------------- skill persistence
+    def _fire_skill_writer(
+        self, goal: str, history: List[BrainStepResult],
+    ) -> None:
+        """Start background skill analysis without delaying the task result.
+
+        The user sees the completed answer first; the writer runs concurrently.
+        Only runs with at least three successful executed steps are eligible,
+        which keeps trivial commands from spending a model call.
+        """
+        if os.environ.get("WINBROW_SKILL_WRITER", "1").strip() == "0":
+            return
+        successful = [
+            step for step in history
+            if step.success and not step.skill.startswith("_")
+        ]
+        if len(successful) < 3:
+            return
+        try:
+            task = asyncio.create_task(
+                self._maybe_save_skill(goal, list(history))
+            )
+        except RuntimeError:
+            # No running event loop (rare direct/CLI caller): skip silently.
+            return
+        _SKILL_WRITER_TASKS.add(task)
+        task.add_done_callback(_SKILL_WRITER_TASKS.discard)
+
+    async def _maybe_save_skill(
+        self, goal: str, history: List[BrainStepResult],
+    ) -> None:
+        """Background task: analyse a completed run and persist a skill.
+
+        Catches and logs every exception so a failed analysis can never crash
+        the brain loop or surface an error to the user.
+        """
+        global SKILLS_METADATA
+        try:
+            existing = sorted(
+                set(self.skill_registry)
+                | {meta.name for meta in self.skill_registry.values()}
+            )
+            candidate = await analyse_task_for_skill(
+                goal=goal,
+                history=history,
+                existing_skill_names=existing,
+                gateway=self.gateway,
+            )
+            if not candidate.should_save:
+                log.info(f"skill_writer: skipped — {candidate.reason}")
+                return
+
+            path = await write_skill_to_disk(candidate, self.skills_dir)
+            await register_skill_in_registry(
+                candidate.skill_key, self.skill_registry, self.skills_dir,
+            )
+            # Refresh the live cached block immediately so the next planner
+            # turn can choose the new skill without restarting WinBrow.
+            self.skills_metadata = build_skills_metadata(self.skill_registry)
+            SKILLS_METADATA = self.skills_metadata
+            log.info(
+                f"skill_writer: saved '{candidate.name}' → {path}"
+            )
+        except Exception as exc:
+            log.warning(f"skill_writer: failed silently — {exc}")
+
     # ------------------------------------------------------------------ main entry
     async def handle(
         self,
@@ -615,6 +705,8 @@ class AgentBrain:
                         if isinstance(plan.get("evidence"), dict) else {}
                     )
                     result.response = text or self._history_summary(history) or "Done."
+                    if result.complete:
+                        self._fire_skill_writer(utterance, list(history))
                     return result
                 result.kind = "chat"
                 result.success = True
@@ -672,6 +764,8 @@ class AgentBrain:
                     if isinstance(plan.get("evidence"), dict) else {}
                 )
                 result.response = text or self._history_summary(history) or "Done."
+                if result.complete:
+                    self._fire_skill_writer(utterance, list(history))
                 return result
 
             steps = _extract_steps(plan)
@@ -710,7 +804,9 @@ class AgentBrain:
                 # A small model sometimes re-emits a step that already
                 # succeeded (e.g. create_directory). Re-running it wastes the
                 # budget and hides the rest of the task; nudge it forward.
-                if sig in done_sigs:
+                # Reads/waits are exempt: re-reading is how the planner sees a
+                # page that finished loading after the first read.
+                if sig in done_sigs and skill not in REPEATABLE_SKILLS:
                     repeats[sig] = repeats.get(sig, 0) + 1
                     if repeats[sig] >= 3:
                         result.kind = "action"
@@ -1246,6 +1342,18 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
                     "Verify this is the right page before proceeding."
                 )
 
+    if skill in ("browser_navigate", "browser_read_page",
+                 "browser_read_full", "browser_wait"):
+        if (result.get("success")
+                and not str(result.get("title") or "").strip()
+                and not str(result.get("text") or "").strip()
+                and not result.get("links")):
+            warnings.append(
+                "The page returned no title and no text, so it is probably "
+                "still loading. Wait 2 seconds and read it again before "
+                "clicking or typing."
+            )
+
     if skill == "browser_get_accessibility_tree":
         if result.get("_truncated"):
             warnings.append(
@@ -1286,6 +1394,9 @@ def annotate_result(skill: str, args: dict, raw_result: dict) -> dict:
         warnings.append(f"This step failed: {str(detail)[:300]}")
 
     if warnings:
+        existing = str(result.get("_warning") or "").strip()
+        if existing:
+            warnings = [existing] + [w for w in warnings if w not in existing]
         result["_warning"] = " ".join(warnings)
     return result
 

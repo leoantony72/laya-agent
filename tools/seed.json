@@ -88,9 +88,9 @@
       {
         "name": "app_name",
         "kind": "text",
-        "instructions": "Which application to open or focus?",
+        "instructions": "Which application to open or focus? Required — never guess.",
         "criteria": {},
-        "default": "notepad"
+        "default": ""
       }
     ],
     "script": "\n            $target = \"{{app_name}}\".Trim()\n            $browsers = @('chrome', 'msedge', 'brave', 'firefox', 'iexplore', 'opera')\n            $proc = Get-Process | Where-Object {\n                $_.ProcessName -ieq $target\n            } | Select-Object -First 1\n            if (-not $proc) {\n                $proc = Get-Process | Where-Object {\n                    ($_.MainWindowTitle -match ('\\b' + [regex]::Escape($target) + '\\b') -and\n                     $browsers -notcontains $_.ProcessName.ToLower())\n                } | Select-Object -First 1\n            }\n            if ($proc -and $proc.MainWindowHandle -ne 0) {\n                $ws = New-Object -ComObject WScript.Shell\n                $ws.AppActivate($proc.Id) | Out-Null\n                return \"Brought $($proc.ProcessName) to focus\"\n            } else {\n                $exe = $target\n                $app = Get-StartApps | Where-Object { $_.Name -like \"*$target*\" } | Select-Object -First 1\n                if ($app) {\n                    $exe = \"shell:AppsFolder\\\" + $app.AppID\n                } elseif ($target -ieq \"telegram\") {\n                    $exe = \"tg://\"\n                }\n                Start-Process $exe -ErrorAction SilentlyContinue\n                return \"Launched $target\"\n            }\n            ",
@@ -454,11 +454,11 @@
   },
   {
     "name": "open_common_app",
-    "description": "Quickly open common Windows applications: Calculator, Paint, Snipping Tool, Terminal, Command Prompt, Notepad, WordPad, Control Panel, Task Manager, or Settings.",
+    "description": "Quickly open common Windows applications: Calculator, Paint, Snipping Tool, Terminal, Command Prompt, Notepad, WordPad, Control Panel, Task Manager, Settings, Chrome, Edge, or Brave.",
     "examples": [
       "open calculator",
       "open paint",
-      "open snipping tool"
+      "open chrome"
     ],
     "scope": null,
     "args": [
@@ -467,6 +467,9 @@
         "kind": "enum",
         "instructions": "Which application to open?",
         "criteria": {
+          "chrome": "open chrome, google chrome",
+          "edge": "open edge, microsoft edge",
+          "brave": "open brave, brave browser",
           "calculator": "open calculator, calc",
           "paint": "open paint, mspaint, drawing app",
           "snip": "open snipping tool, screen snip, screenshot tool",
@@ -486,7 +489,7 @@
         "default": "calculator"
       }
     ],
-    "script": "\n            python -c \"\nimport subprocess, sys\napp_map = {\n    'calculator': 'calc',\n    'paint': 'mspaint',\n    'snip': 'SnippingTool',\n    'terminal': 'wt',\n    'cmd': 'cmd',\n    'notepad': 'notepad',\n    'wordpad': 'wordpad',\n    'control': 'control',\n    'taskmgr': 'taskmgr',\n    'settings': 'ms-settings:',\n    'explorer': 'explorer',\n    'magnifier': 'magnify',\n    'charmap': 'charmap',\n    'regedit': 'regedit',\n    'msconfig': 'msconfig'\n}\nexe = app_map.get(r'{{app}}')\nif exe:\n    try:\n        subprocess.Popen(exe, shell=True)\n        print('Opened ' + r'{{app}}')\n    except Exception as e:\n        print('Failed to open ' + r'{{app}}' + ': ' + str(e))\nelse:\n    print('Unknown application: ' + r'{{app}}')\n\"\n            ",
+    "script": "\n            python -c \"\nimport subprocess, sys\napp_map = {\n    'chrome': 'chrome',\n    'edge': 'msedge',\n    'brave': 'brave',\n    'calculator': 'calc',\n    'paint': 'mspaint',\n    'snip': 'SnippingTool',\n    'terminal': 'wt',\n    'cmd': 'cmd',\n    'notepad': 'notepad',\n    'wordpad': 'wordpad',\n    'control': 'control',\n    'taskmgr': 'taskmgr',\n    'settings': 'ms-settings:',\n    'explorer': 'explorer',\n    'magnifier': 'magnify',\n    'charmap': 'charmap',\n    'regedit': 'regedit',\n    'msconfig': 'msconfig'\n}\nexe = app_map.get(r'{{app}}')\nif exe:\n    try:\n        subprocess.Popen(exe, shell=True)\n        print('Opened ' + r'{{app}}')\n    except Exception as e:\n        print('Failed to open ' + r'{{app}}' + ': ' + str(e))\nelse:\n    print('Unknown application: ' + r'{{app}}')\n\"\n            ",
     "speak": "done"
   },
   {

@@ -1,0 +1,212 @@
+---
+knowledge: 01-system-architecture
+last_verified: 2026-10-25
+source_files:
+  - server.py
+  - run.py
+  - start.bat
+  - winbrow/agent.py
+  - winbrow/__main__.py
+  - winbrow/cli.py
+  - winbrow/registry.py
+  - winbrow/permissions.py
+  - winbrow/policy.py
+  - winbrow/brain/__init__.py
+  - winbrow/brain/model_gateway.py
+  - requirements.txt
+  - .env.example
+---
+
+# 01 — System Architecture
+
+Verified 2026-10-25 against the working tree (HEAD `b82cfb2`, plus uncommitted skill-writer work).
+
+## 1. What WinBrow is
+
+A Windows-first personal automation agent:
+
+- **Input:** typed text via FastAPI/Web UI, or speech via `python -m winbrow.voice`.
+- **Understanding:** procedural replay → MCP shortcuts → browser fast path → Laya/heuristic router →
+  cloud planner ("brain") → generated PowerShell.
+- **Action:** raw CDP for browsers; Win32/UIA/pyautogui/OCR for desktop; PowerShell for system ops;
+  app adapters for compound Office/Adobe/editor workflows.
+- **Memory:** SQLite episodic store, per-session reference memory, approved replay plans, learned tools,
+  and markdown skills for the planner.
+
+## 2. Entry points
+
+| Entry | File | What it does |
+|---|---|---|
+| Web server | `server.py` | FastAPI app; imports and constructs `WinBrowAgent()` at module import (`:74`) |
+| REST execute | `server.py:317` | `POST /api/execute` → `agent.execute(...)` |
+| REST browser | `server.py:691` | `POST /api/browser` → `BrowserController` actions |
+| WebSocket | `server.py:768` | `/ws` live events/broadcast |
+| Launchers | `run.py`, `start.bat` | Start uvicorn/server |
+| CLI | `winbrow/cli.py` | `python -m winbrow observe` (UIA tree/context dump) |
+| Voice | `winbrow/voice.py` | `python -m winbrow.voice` (wake word or push-to-talk) |
+| Direct API | `winbrow.agent.WinBrowAgent.execute()` (`:1033`) | Full command pipeline |
+
+`server.py` loads `.env` itself (`_load_env_file`, `:39`) before reading keys. It does **not**
+pass `ask_user_fn` into `WinBrowAgent`, so clarification cannot block interactively; the result
+is `needs_input=True`.
+
+## 3. Startup sequence (`server.py:126-205`)
+
+1. Download/ensure Whisper (and any missing models) in an executor (`:140`).
+2. If `uses_builtin_local_server()`, ensure llama.cpp and start `QwenLLM` (`:148-159`).
+3. Log brain provider status; cloud is used when `OPENROUTER_API_KEY` is present (`:161-167`).
+4. Warm the persistent PowerShell host (`run_powershell("Write-Output warm")`, `:171`).
+5. Start the proactive `Observer` background loop (`:175-183`).
+6. Start preload-only MCP connections in the background (`:185-205`).
+7. Shutdown closes MCP, observer, LLM, and the PowerShell host (`:233+`).
+
+## 4. Architectural decisions
+
+### 4.1 Raw CDP instead of a browser framework
+
+Browser control is implemented directly against Chrome DevTools Protocol in
+`winbrow/browser_task.py`. Two transports:
+
+- **HTTP backend:** `GET /json/version`, `GET /json/list`, `PUT /json/new`, `GET /json/activate`,
+  then a fresh page WebSocket per operation.
+- **Consent-mode WebSocket backend:** one persistent browser-level socket discovered through
+  `<User Data>/DevToolsActivePort`, with `Target.attachToTarget {flatten: true}` and `sessionId`
+  multiplexing.
+
+Decision rationale visible in code/comments: avoid a heavy framework, use the user's real browser
+and logins, and survive Chromium's remote-debugging consent changes. Cost: every operation is
+hand-rolled, and `websockets` is an undeclared dependency.
+
+### 4.2 Precedence over a monolithic "System 1/2"
+
+`WinBrowAgent.execute()` implements a ladder (details in `04-request-data-flow.md`):
+
+1. Permission yes/no interception.
+2. Procedural replay (`tools/skills.json`, approved only).
+3. Context capture.
+4. MCP direct shortcuts (dictionary, Wikipedia, git, time, PDF, local text files).
+5. Browser fast path → brain loop; ultrafast one-shot only if the brain is unavailable.
+6. `WinBrowRouter.route()` — Laya first, then heuristics, then optional Ollama.
+7. Tool dispatch, or NEW_ACTION → brain → generator fallback.
+
+### 4.3 One dispatch funnel
+
+Every tool call, whether from a heuristic, replay, or the brain, goes through
+`WinBrowAgent.run_skill()` (`winbrow/agent.py:346`). It:
+
+1. Looks up the `Tool`.
+2. Renders script templates up front so the permission gate can tier by **content**.
+3. Calls `permissions.gate(...)` (`:362`).
+4. Dispatches by `tool.impl`: `computer`, `adapter`, `shell`, `document`, `browser`, `installer`,
+   `mcp`, or a rendered PowerShell template.
+
+This is the single place to add a new executor.
+
+### 4.4 Progressive-disclosure skills
+
+The planner sees only skill metadata (name/args/description). The full `SKILL.md` body is injected
+as `SKILL DETAIL` on the turn after it selects that skill (`brain/prompt.py:128-134`). This keeps
+per-turn prompt cost low. Details in `03-skill-system.md`.
+
+### 4.5 Two independent skill memories
+
+- **Brain skills:** `winbrow/skills/*/SKILL.md`, generated by `brain/skill_writer.py`, hot-reloaded
+  into `brain/skill_registry.py`.
+- **Procedural replay:** `tools/skills.json`, captured from successful brain plans, matched by
+  Jaccard token overlap, only `approved` records replay.
+
+They share the word "skill" but no storage, no matching, and no lifecycle. Do not merge them.
+
+### 4.6 Cloud-first brain, optional local fallback
+
+`brain/model_gateway.py` defaults to OpenRouter `deepseek/deepseek-v4.1-flash`, provider `relace`,
+planner `max_tokens=16000`, `temperature=1`, reasoning cap 2000. Browser-heavy turns drop to
+8000 total / 600 reasoning. Local llama.cpp/Qwen is opt-in.
+
+### 4.7 Windows-native execution
+
+- PowerShell is the universal system layer (`winbrow/windows.py`, `pshost.py`, `shell.py`).
+- Native input is `ctypes` Win32 + lazy `pyautogui` (`computer/driver.py`).
+- UIA is `comtypes` (`computer/uia.py`).
+- OCR is pytesseract first, then Windows WinRT OCR through PowerShell (`computer/tools.py`).
+- App adapters use CLI/COM/JSX, not pywinauto.
+
+## 5. Component dependency sketch
+
+```
+server.py
+  └─ WinBrowAgent (agent.py)
+       ├─ ToolRegistry (registry.py) ── policy.py / windows.py
+       ├─ WinBrowRouter (router.py) ── Laya worker, small_llm.py, resolvers.py
+       ├─ AgentBrain (brain/agent_loop.py) ── model_gateway.py, prompt.py, skill_registry.py
+       ├─ BrowserController (browser_task.py) ── HTTP /json or CDP WebSocket
+       ├─ PermissionManager (permissions.py) ── policy.py
+       ├─ SessionMemory + MemoryStore (memory/)
+       ├─ SkillMemory (memory/skills.py) ── tools/skills.json
+       ├─ ScriptGenerator (generator.py)
+       └─ MCP hub (mcp.py)
+```
+
+Import-time risks: `agent.py` imports browser, computer, adapters, installer, shell, document,
+generator, registry, router, memory, permissions, and MCP modules at top level. A failure in any
+of them prevents the server from starting.
+
+## 6. Configuration
+
+Important environment variables (full list in `.env.example` and the knowledge files):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `OPENROUTER_API_KEY` | empty | Enables the cloud brain |
+| `WINBROW_BRAIN_MODEL` | `deepseek/deepseek-v4.1-flash` | Planner model |
+| `WINBROW_BRAIN_PROVIDER` | `auto` | `auto` / `local` / `qwen` / `openrouter` / `openai` |
+| `WINBROW_MAX_STEPS` | `20` | Brain action budget |
+| `WINBROW_STEP_TIMEOUT` | `120` | Per-action timeout (seconds) |
+| `WINBROW_STEP_WARN` | `5` | Steps-remaining warning threshold |
+| `WINBROW_REASONING_MAX_TOKENS` | `2000` | Reasoning cap for structured calls |
+| `WINBROW_PLANNER_MAX_TOKENS` | `16000` | Planner total budget |
+| `WINBROW_BYPASS_CONFIRM` | unset | **Bypasses all permission tiers** |
+| `WINBROW_AUTO_APPROVE_T2` | unset | Auto-remembers T2 actions |
+| `WINBROW_BROWSER_MODE` | unset | `separate` uses a throwaway CDP profile |
+| `WINBROW_DISABLE_LAYA` | unset | Disables Laya in the router (not in ultrafast) |
+| `WINBROW_ROUTER_LLM` | unset | Enables the Ollama router tier |
+| `WINBROW_LOCAL_LLM` | unset | Starts local llama.cpp/Qwen |
+| `WINBROW_SKILLS_DIR` | `tools` | Overrides replay-skill storage |
+| `WINBROW_PERMISSIONS_DIR` | `tools` | Overrides `permissions.json` |
+| `WINBROW_TTS` | `1` | SAPI speech enabled by default |
+| `WINBROW_CLOUD_VISION` | unset | Enables the VLM grounding rung |
+
+## 7. Dependencies and environment
+
+`requirements.txt` includes: `laya`, `fastapi[standard]`, `uvicorn[standard]`, `pyautogui`,
+`mss`, `psutil`, `Pillow`, `pytesseract`, `jinja2`, `python-multipart`, `chromadb`, `comtypes`,
+`rapidfuzz`, `sounddevice`, `onnxruntime`, `pyyaml`, `markitdown[...]`.
+
+Not declared but used: **`websockets`** (browser CDP), optional `win32com` (shortcut resolution),
+optional `uiautomation` (CLI observe fallback). `psutil` is a hard import in `windows.py`.
+
+Default data locations:
+
+| Path | Contents |
+|---|---|
+| `data/memory.db` | SQLite episodic memory + FTS5 |
+| `data/chroma/` | Optional vector store |
+| `data/observe/` | VLM budget, dismissed suggestions |
+| `tools/seed.json` | Built-in script tools |
+| `tools/learned.json` | Generated/persisted tools |
+| `tools/skills.json` | Procedural replay records |
+| `tools/permissions.json` | Remembered T2 allowlist + pending |
+| `tools/session_state.json` | Last 5 sessions/turns/entities |
+| `tools/mcp_servers.json` | MCP server specs |
+| `tools/mcp_cache.json` | Cached MCP tool catalogs |
+| `logs/trace.jsonl` | Stage/command trace |
+
+## 8. Boundaries and invariants
+
+- Do not bypass `run_skill()` for a registry tool; that skips permissions.
+- Do not persist T3 approvals; T3 is confirm-every-time by design.
+- Do not let the agent tab logic silently fall back to the user's tab.
+- Do not treat `policy.py` as a sandbox; it is a regex blocklist with known gaps.
+- Do not assume `screen_read_text` runs for every desktop action.
+- Do not assume the two skill systems are interchangeable.
+- Do not assume tests cover live CDP/UIA/COM behavior.

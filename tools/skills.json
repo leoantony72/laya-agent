@@ -637,5 +637,87 @@
     "uses": 0,
     "last_used": 1792689872.4320123,
     "source": "brain"
+  },
+  {
+    "id": "run-find-files-then-open-file",
+    "name": "Run find files, then open file",
+    "utterance": "find resume with leoantony on it and open them",
+    "steps": [
+      {
+        "skill": "find_files",
+        "args": {
+          "search_term": "leoantony"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "{{file_path}}"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "C:\\Users\\USER\\Desktop\\Resume\\LeoAntonyCV.pdf"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "C:\\Users\\USER\\Desktop\\Resume\\LeoAntonyCV1pg.pdf"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "C:\\Users\\USER\\Downloads\\pdf tests\\Leoantony (1).pdf"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "{{file_path_2}}"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "{{file_path_3}}"
+        }
+      },
+      {
+        "skill": "open_file",
+        "args": {
+          "target": "C:\\Users\\USER\\Downloads\\pdf tests\\Resume-Leo-Antony-Harvey-Nash.pdf"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: find_files -> open_file -> open_file -> open_file -> open_file -> open_file -> open_file -> open_file. Use when the request resembles: find resume with leoantony on it and open them",
+    "triggers": [],
+    "parameters": [
+      {
+        "name": "file_path",
+        "description": "File path for 'target' from the new request.",
+        "required": true,
+        "default": ""
+      },
+      {
+        "name": "file_path_2",
+        "description": "File path for 'target' from the new request.",
+        "required": true,
+        "default": ""
+      },
+      {
+        "name": "file_path_3",
+        "description": "File path for 'target' from the new request.",
+        "required": true,
+        "default": ""
+      }
+    ],
+    "status": "proposed",
+    "created": 1792817930.5365696,
+    "uses": 0,
+    "last_used": 1792818065.1313612,
+    "source": "brain"
   }
 ]

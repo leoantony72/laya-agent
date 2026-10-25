@@ -1,0 +1,32 @@
+# Session Log
+
+Append-only. The `Stop` hook (`.agent/hooks/post-session.py`) adds one entry per session.
+Permanent findings belong in `.agent/knowledge/`; this file is chronological context.
+
+## 2026-10-25 — Knowledge base bootstrap
+
+- **Scope:** Read the `winbrow/` codebase, then build `AGENT.md`, six knowledge files, task memory,
+  and the post-session hook.
+- **Key findings:**
+  - Browser control is raw CDP (HTTP `/json/*` or one consent-mode WebSocket via
+    `DevToolsActivePort`), not Playwright/pydoll/Selenium.
+  - There are two independent skill systems: brain markdown skills (`winbrow/skills/*/SKILL.md`,
+    progressive disclosure, writer-generated) and procedural replay (`tools/skills.json`, approved
+    records only, Jaccard ≥ 0.66).
+  - Uncommitted work adds the post-session skill writer and its hot-reload path.
+  - `WinBrowAgent.run_skill()` is the single permission + dispatch funnel.
+  - The current tree is Windows-first: PowerShell/COM/UIA + ctypes, with a cloud-first planner.
+- **Verified issue count:** 58 (`05-known-issues.md`; browser 20, desktop 14, routing/generation 14,
+  IO/memory/voice 10).
+- **Documented decisions:** 12 (`06-recent-changes-and-decisions.md`).
+- **Verification:** Source inspection only. No live CDP, UIA, COM, voice, or end-to-end task was run.
+  No test suite was executed for this bootstrap; do not claim otherwise.
+- **Stale knowledge:** none at bootstrap. `stale.md` is created only by the hook when a source file
+  is newer than a knowledge file's `last_verified` date.
+
+## 2026-10-25 10:52 - session
+
+- **Summary:** Bootstrap verification: knowledge files, hook, and settings validated; no stale knowledge.
+- **Changed files:** `M tools/skills.json`, `M winbrow/agent.py`, `M winbrow/brain/agent_loop.py`, `M winbrow/brain/skill_registry.py`, `?? .agent/`, `?? AGENT.md`, `?? winbrow/brain/skill_writer.py`, `?? winbrow/tests/`
+- **Knowledge:** 6 file(s) present; 0 stale
+- **Auto-refresh:** not needed: no stale knowledge
