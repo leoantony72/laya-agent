@@ -72,6 +72,12 @@ User Voice / Text Utterance + Live Windows Context (Active App, Running Apps)
    - Optional helpers for DOCX/PDF/PPTX/XLSX/EPUB, CSV charts, images, GIFs, video, transcripts, duplicates, invoices, raffles, Google Workspace, Outline, and PostgreSQL.
    - **Integrations** panel for Gemini, PostgreSQL, NotebookLM, Google Workspace, Outline, n8n, Mercury, and Pixelbin. Secrets stay local and are masked after saving.
 
+7. **Automatic Scoped Subagents**
+   - For independent research, file-analysis, drafting, review, or verification work, `delegate_task` hands pieces to focused child planners automatically. The user can still ask explicitly (“use subagents to…”).
+   - Profiles: researcher, file-analyst, writer, code-reviewer, verifier, general.
+   - Child tools are filtered, child actions still pass the parent permission gate, and browser/write work is serialized. Recent runs appear in the **Subagents** panel.
+
+
 
 ---
 

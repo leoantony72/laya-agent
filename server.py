@@ -41,6 +41,7 @@ from winbrow.integrations import (
     save_integration,
     test_integration,
 )
+from winbrow.subagents import list_profiles as list_subagent_profiles
 
 
 def _load_env_file() -> None:
@@ -737,6 +738,24 @@ async def google_oauth_endpoint():
     """Run the installed-app OAuth flow. Local desktop only; blocks until done."""
     result = await asyncio.to_thread(google_oauth)
     return JSONResponse(result, status_code=200 if result.get("ok") else 400)
+
+
+# ---------------------------------------------------------------------------
+# Subagents (scoped child planners + recent runs)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/subagents")
+async def get_subagents():
+    """Return the profile catalog and recent subagent runs."""
+    recent = []
+    try:
+        recent = agent.subagents.recent(limit=20)
+    except Exception as exc:
+        log.debug(f"Subagent history unavailable: {exc}")
+    return JSONResponse({
+        "profiles": list_subagent_profiles(),
+        "runs": recent,
+    })
 
 
 # ---------------------------------------------------------------------------

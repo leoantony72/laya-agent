@@ -43,6 +43,23 @@ DONE — all six phases implemented; focused tests passing.
 - `node` compile of both inline scripts → 2 scripts, 0 syntax errors.
 - `load_skill_registry` → 65 total, 43 playbooks.
 
+## Subagents (2026-10-26)
+
+- Added `winbrow/subagents.py` and `winbrow/skills/delegate-task/SKILL.md`.
+- `delegate_task` (T1) spawns scoped `AgentBrain` children with filtered skill
+  and tool registries; child actions still use the parent permission gate.
+- Delegation is automatic by default; `WINBROW_SUBAGENTS=0` disables it and
+  `WINBROW_SUBAGENTS_EXPLICIT=1` requires an explicit request. Independent
+  research/review candidates are forced into the brain before the browser fast
+  path.
+- Profiles: researcher, file-analyst, writer, code-reviewer, verifier, general.
+- Only `file-analyst` is parallel-safe; browser/write profiles are serialized.
+- Runs persist to `data/subagents.json` and surface in the **Subagents** panel
+  plus `GET /api/subagents`.
+- Tests: 37 in `winbrow/tests` pass; 48 core tests (`test_brain_m0`,
+  `test_syntax`) pass. Real-model subagent execution was not run (no provider
+  key); a scripted gateway covers the child-brain path.
+
 ## Next actions
 
 - Install optional packages as needed: `pip install -r

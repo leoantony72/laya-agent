@@ -63,6 +63,7 @@ TOOL_TIERS: Dict[str, str] = {
     "browser_upload_file": T1,
     "browser_read_page": T0, "browser_read_full": T0,
     "browser_get_accessibility_tree": T0,
+    "delegate_task": T1,
     "vscode_open": T1, "vscode_install_extension": T2, "vscode_run_command": T1,
     "notepad_open": T1, "paint_open_image": T1, "office_open_doc": T1,
     "quick_note": T1,

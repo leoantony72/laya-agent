@@ -64,6 +64,7 @@ PREFERRED_ORDER = (
     "recall_memory",
     "build_tool",
     "repair_tool",
+    "delegate_task",
 )
 
 # The converted playbook library adds ~43 metadata entries. Playbooks are
@@ -537,6 +538,8 @@ def _tool_group(tool: Any) -> tuple[str, str]:
         return "adapter", "APP ADAPTERS"
     if impl == "installer":
         return "installer", "INSTALLER"
+    if impl == "subagent":
+        return "subagent", "SUBAGENTS"
     if getattr(tool, "is_learned", False):
         return "learned", "LEARNED"
     return "native", "NATIVE"

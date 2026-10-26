@@ -1055,6 +1055,30 @@
         .int-dep code { background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
         .int-oauth { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
+        /* Subagents panel */
+        .sa-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 10px; margin-bottom: 18px;
+        }
+        .sa-card {
+            border: 1px solid var(--line); border-radius: 9px; padding: 11px 12px;
+            background: var(--soft);
+        }
+        .sa-title { font-weight: 700; font-size: 13px; }
+        .sa-meta { font-family: var(--mono); font-size: 10px; color: var(--ink3); margin: 2px 0 6px; }
+        .sa-desc { font-size: 11.5px; color: var(--ink2); line-height: 1.4; }
+        .sa-runs { display: flex; flex-direction: column; gap: 8px; }
+        .sa-run {
+            border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px;
+            background: var(--paper);
+        }
+        .sa-run-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .sa-run-head .sa-title { font-size: 12px; }
+        .sa-task { font-size: 11.5px; color: var(--ink2); margin: 3px 0; }
+        .sa-summary { font-size: 11.5px; color: var(--ink); white-space: pre-wrap; margin-top: 5px; }
+        .sa-steps { font-family: var(--mono); font-size: 10px; color: var(--ink3); margin-top: 5px; }
+        .sa-empty { color: var(--ink3); font-size: 12px; padding: 16px 0; }
+
         @media (max-width: 560px) {
             .hero { padding-top: 28px; }
             .hero h2 { font-size: 26px; }
@@ -1085,6 +1109,8 @@
                 <button class="link-btn" id="toolsBtn">Tools</button>
                 <span class="sep">·</span>
                 <button class="link-btn" id="integrationsBtn">Integrations</button>
+                <span class="sep">·</span>
+                <button class="link-btn" id="subagentsBtn">Subagents</button>
                 <span class="sep">·</span>
                 <button class="link-btn" id="settingsBtn">Settings</button>
             </nav>
@@ -1218,6 +1244,27 @@
         </div>
         <div class="tools-body" id="integrationsBody">
             <div class="empty">Loading integrations…</div>
+        </div>
+    </div>
+</div>
+
+<div class="modal-bg" id="subagentsModal">
+    <div class="tools-panel">
+        <div class="tools-head">
+            <h2>Subagents</h2>
+            <button class="link-btn" onclick="closeSubagents()">Close</button>
+        </div>
+        <div class="tools-toolbar">
+            <div class="sub" style="color:var(--ink2);font-size:12px;">
+                Focused child planners. The main agent delegates automatically when work is independent; you can also say “use subagents to…”.
+            </div>
+            <div class="fields-row" style="display:flex;gap:8px;align-items:center;">
+                <button class="link-btn" onclick="openSubagents()">Refresh</button>
+                <span class="int-note" id="subagentsCount"></span>
+            </div>
+        </div>
+        <div class="tools-body" id="subagentsBody">
+            <div class="empty">Loading subagents…</div>
         </div>
     </div>
 </div>
@@ -2034,6 +2081,74 @@ function copyInstallCommand() {
         () => showToast('Install command copied'),
         () => showToast(command)
     );
+}
+
+/* ── Subagents panel ── */
+async function openSubagents() {
+    document.getElementById('subagentsModal').classList.add('open');
+    document.getElementById('subagentsBody').innerHTML = '<div class="empty">Loading subagents…</div>';
+    try {
+        const resp = await fetch('/api/subagents');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        renderSubagents(await resp.json());
+    } catch (e) {
+        document.getElementById('subagentsBody').innerHTML =
+            '<div class="empty">Could not load subagents: ' + escHtml(String(e)) + '</div>';
+    }
+}
+
+function closeSubagents() {
+    document.getElementById('subagentsModal').classList.remove('open');
+}
+
+function _saStatusClass(status) {
+    if (status === 'done') return 'ok';
+    if (status === 'blocked') return 'warn';
+    if (status === 'failed') return 'err';
+    return 'warn';
+}
+
+function renderSubagents(data) {
+    const profiles = data.profiles || [];
+    const runs = data.runs || [];
+    document.getElementById('subagentsCount').textContent =
+        profiles.length + ' profiles · ' + runs.length + ' recent run' + (runs.length === 1 ? '' : 's');
+
+    let html = '<div class="sa-grid">';
+    for (const profile of profiles) {
+        html += '<div class="sa-card">' +
+            '<div class="sa-title">' + escHtml(profile.label) + '</div>' +
+            '<div class="sa-meta">' + escHtml(profile.id) + ' · max ' + escHtml(String(profile.max_steps)) +
+            ' steps · ' + (profile.parallel_safe ? 'parallel-safe' : 'sequential') + '</div>' +
+            '<div class="sa-desc">' + escHtml(profile.description) + '</div>' +
+            '</div>';
+    }
+    html += '</div>';
+
+    if (!runs.length) {
+        html += '<div class="sa-empty">No subagent runs yet. Try: “Research these three competitors in parallel and compare their pricing.”</div>';
+    } else {
+        html += '<div class="sa-runs">';
+        for (const run of runs) {
+            const steps = (run.steps || []).map(s => s.skill).join(' → ');
+            html += '<div class="sa-run">' +
+                '<div class="sa-run-head"><span class="sa-title">' + escHtml(run.profile) + '</span>' +
+                '<span class="int-status ' + _saStatusClass(run.status) + '">' + escHtml(run.status) + '</span>' +
+                '<span class="sa-meta">' + ((run.elapsed_ms || 0) / 1000).toFixed(1) + 's · ' +
+                (run.step_count || 0) + ' steps</span></div>' +
+                '<div class="sa-task">' + escHtml(run.task || '') + '</div>' +
+                '<div class="sa-summary">' + escHtml(run.summary || '') + '</div>' +
+                (steps ? '<div class="sa-steps">' + escHtml(steps) + '</div>' : '') +
+                '</div>';
+        }
+        html += '</div>';
+    }
+    document.getElementById('subagentsBody').innerHTML = html;
+}
+
+document.getElementById('subagentsBtn').addEventListener('click', openSubagents);
+if (location.hash === '#subagents') {
+    setTimeout(openSubagents, 300);
 }
 
 document.getElementById('integrationsBtn').addEventListener('click', openIntegrations);

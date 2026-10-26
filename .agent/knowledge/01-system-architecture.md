@@ -6,6 +6,7 @@ source_files:
   - run.py
   - start.bat
   - winbrow/agent.py
+  - winbrow/subagents.py
   - winbrow/__main__.py
   - winbrow/cli.py
   - winbrow/registry.py
@@ -144,7 +145,8 @@ server.py
        ├─ SessionMemory + MemoryStore (memory/)
        ├─ SkillMemory (memory/skills.py) ── tools/skills.json
        ├─ ScriptGenerator (generator.py)
-       └─ MCP hub (mcp.py)
+       ├─ MCP hub (mcp.py)
+       └─ SubagentManager (subagents.py) ── scoped child AgentBrain instances
 ```
 
 Import-time risks: `agent.py` imports browser, computer, adapters, installer, shell, document,
@@ -172,6 +174,10 @@ Important environment variables (full list in `.env.example` and the knowledge f
 | `WINBROW_ROUTER_LLM` | unset | Enables the Ollama router tier |
 | `WINBROW_LOCAL_LLM` | unset | Starts local llama.cpp/Qwen |
 | `WINBROW_SKILLS_DIR` | `tools` | Overrides replay-skill storage |
+| `WINBROW_SUBAGENTS` | `1` | Set `0` to disable `delegate_task` |
+| `WINBROW_SUBAGENTS_EXPLICIT` | `0` | Set `1` to require an explicit subagent request |
+| `WINBROW_SUBAGENT_HISTORY` | `data/subagents.json` | Subagent run history |
+| `WINBROW_SUBAGENT_PARALLEL` | `3` | Max concurrent parallel-safe subagents |
 | `WINBROW_PERMISSIONS_DIR` | `tools` | Overrides `permissions.json` |
 | `WINBROW_TTS` | `1` | SAPI speech enabled by default |
 | `WINBROW_CLOUD_VISION` | unset | Enables the VLM grounding rung |
@@ -192,6 +198,7 @@ Default data locations:
 | `data/memory.db` | SQLite episodic memory + FTS5 |
 | `data/chroma/` | Optional vector store |
 | `data/observe/` | VLM budget, dismissed suggestions |
+| `data/subagents.json` | Last 50 subagent runs (gitignored) |
 | `tools/seed.json` | Built-in script tools |
 | `tools/learned.json` | Generated/persisted tools |
 | `tools/skills.json` | Procedural replay records |

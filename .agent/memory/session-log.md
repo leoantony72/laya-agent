@@ -37,3 +37,10 @@ Permanent findings belong in `.agent/knowledge/`; this file is chronological con
 - **Changed files:** winbrow/skills/library/**, winbrow/skill_scripts.py, winbrow/skill_script_utils.py, winbrow/integrations.py, winbrow/brain/skill_registry.py, winbrow/brain/agent_loop.py, winbrow/brain/prompt.py, winbrow/agent.py, winbrow/permissions.py, server.py, templates/index.html, winbrow/tests/*
 - **Verification:** pytest winbrow/tests -q -> 27 passed; pytest test_agent.py test_brain_m0.py test_syntax.py -q -> 48 passed, 1 pre-existing fixture error; smoke PDF/PPTX/XLSX/EPUB/DOCX/CSV/PNG/GIF; 65 skills, 43 playbooks, metadata ~9,060 chars.
 - **Knowledge:** 03 and 06 updated; no stale knowledge.
+
+## 2026-10-26 - scoped subagents
+
+- **Summary:** Added delegate_task, six scoped subagent profiles, automatic delegation by default, filtered skill/tool registries, child-brain execution through the parent permission gate, parallel-safe file analysis, run history, and a Subagents UI panel. Independent research/review candidates are forced into the brain before the browser fast path.
+- **Changed files:** winbrow/subagents.py, winbrow/skills/delegate-task/SKILL.md, winbrow/agent.py, winbrow/brain/agent_loop.py, winbrow/brain/prompt.py, winbrow/brain/skill_registry.py, winbrow/permissions.py, server.py, templates/index.html, winbrow/tests/test_subagents.py, docs.
+- **Verification:** pytest winbrow/tests -> 37 passed; pytest test_brain_m0.py test_syntax.py -> 48 passed; scripted-gateway child brain test; node UI syntax 0 errors.
+- **Limitations:** no live model-provider run; browser subagents are intentionally serialized. Set WINBROW_SUBAGENTS=0 to disable or WINBROW_SUBAGENTS_EXPLICIT=1 to require an explicit request.

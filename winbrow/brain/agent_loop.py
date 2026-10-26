@@ -190,6 +190,79 @@ _OPTION_LINE_RE = re.compile(
 )
 
 
+# Delegation is opt-in. These phrases are deliberately conservative: generic
+# "agents" in a sentence should not turn on subagents, but an explicit request
+# to use/delegate/spawn/run agents should.
+_SUBAGENT_REQUEST_RE = re.compile(
+    r"\bsub[ -]?agents?\b"
+    r"|\bagent team\b"
+    r"|\b(?:parallel|multiple|separate)\s+agents?\b"
+    r"|\bdelegat(?:e|ion|ing)\b[^.?!]{0,60}\b"
+    r"(?:task|work|research|analysis|review|verif\w*|sub[ -]?agent|"
+    r"agent|researcher|analyst|writer|reviewer)\b"
+    r"|\b(?:use|spawn|run|launch|create|ask|have|with)\b[^.?!]{0,40}?"
+    r"\b(?:sub[ -]?agents?|worker agents?|agents?|researcher|analyst|writer|reviewer|verifier)\b",
+    re.I,
+)
+
+
+def is_explicit_subagent_request(text: str) -> bool:
+    """True only when the user explicitly asks for subagents/delegation."""
+    return bool(_SUBAGENT_REQUEST_RE.search(text or ""))
+
+
+def subagents_enabled() -> bool:
+    return os.environ.get("WINBROW_SUBAGENTS", "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def subagents_explicit_only() -> bool:
+    return os.environ.get("WINBROW_SUBAGENTS_EXPLICIT", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def delegation_allowed_for(text: str) -> bool:
+    """Whether this turn may use delegate_task.
+
+    Default: automatic delegation is allowed. Set
+    WINBROW_SUBAGENTS_EXPLICIT=1 to require an explicit user request.
+    """
+    if not subagents_enabled():
+        return False
+    if subagents_explicit_only():
+        return is_explicit_subagent_request(text)
+    return True
+
+
+def is_subagent_candidate(text: str) -> bool:
+    """Conservative auto-delegation hint for independent multi-part work.
+
+    This is not a decision to delegate; it only ensures the brain (which can
+    choose delegate_task) sees research/compare/review tasks instead of letting
+    the browser fast path swallow them.
+    """
+    low = (text or "").lower()
+    patterns = (
+        r"\bresearch\b.*\b(?:competitors?|market|sources?|papers?|literature|"
+        r"vendors?|companies|landscape|due diligence|options?)\b",
+        r"\bcompare\b.*\b(?:files?|documents?|versions?|contracts?|reports?|"
+        r"competitors?|vendors?|options?|pdfs?|spreadsheets?)\b",
+        r"\b(?:review|verify|audit|analy[sz]e)\b.*\b(?:code|diff|patch|pr|"
+        r"pull request|report|claim|artifact|file|document|dataset|tests?)\b",
+        r"\b(?:these|several|multiple|three|four|five|\d+)\b.*\b(?:files?|"
+        r"documents?|pages?|sources?|competitors?|papers?|reports?|pdfs?|"
+        r"spreadsheets?|sites?)\b",
+        r"\b(?:in parallel|parallel)\b.*\b(?:files?|sources?|pages?|tasks?|agents?)\b",
+        r"\b(?:summari[sz]e|read)\b.*\b(?:these|multiple|several|\d+)\b.*\b"
+        r"(?:files?|documents?|pages?|pdfs?|reports?)\b",
+        r"\b(?:ask|have|use|spawn|run|launch|create|delegate)\b.*\b(?:agents?|"
+        r"researcher|analyst|writer|reviewer|verifier)\b",
+    )
+    return any(re.search(pattern, low) for pattern in patterns)
+
+
 def _option_key(value: str) -> str:
     text = str(value or "").strip()
     text = re.sub(r"^\s*(?:[-*•]|\(?[1-9]\d?[.)])\s*", "", text)
@@ -423,6 +496,9 @@ class AgentBrain:
         max_steps: Optional[int] = None,
         tool_builder: Optional[Callable[[str, Any], Awaitable[dict]]] = None,
         ask_user_fn: Optional[Callable[[str], Awaitable[str]]] = None,
+        allowed_skills: Optional[Callable[[str], bool]] = None,
+        system_prompt: Optional[str] = None,
+        enable_skill_writer: bool = True,
     ):
         self.gateway = gateway
         self.registry = registry
@@ -441,12 +517,26 @@ class AgentBrain:
         # Optional interactive pause: receives a clarify question and returns
         # the user's answer. Without it, clarify is surfaced as needs_input.
         self.ask_user_fn = ask_user_fn
+        # Subagent scope: a callable filter on dispatcher keys, a replacement
+        # system prompt, and no background skill capture. The parent brain
+        # leaves all three unset.
+        self.allowed_skills = allowed_skills
+        self.system_prompt = system_prompt
+        self.enable_skill_writer = bool(enable_skill_writer)
+        # Delegation is opt-in per user turn. handle() recomputes this from the
+        # actual utterance; direct _run_step tests default to False.
+        self.subagents_allowed = False
         # Load after .env so WINBROW_SKILLS_DIR is honored even when the
         # server imports this module before loading environment variables.
         self.skills_dir = os.environ.get("WINBROW_SKILLS_DIR") or SKILLS_DIR
         self.skill_registry: dict[str, SkillMeta] = load_skill_registry(
             self.skills_dir
         )
+        if self.allowed_skills is not None:
+            self.skill_registry = {
+                key: meta for key, meta in self.skill_registry.items()
+                if self.allowed_skills(key)
+            }
         self.skills_metadata = build_skills_metadata(self.skill_registry)
         self._tool_index = ""
         self._tool_index_key: tuple = ()
@@ -498,6 +588,8 @@ class AgentBrain:
         which keeps trivial commands from spending a model call.
         """
         if os.environ.get("WINBROW_SKILL_WRITER", "1").strip() == "0":
+            return
+        if not getattr(self, "enable_skill_writer", True):
             return
         successful = [
             step for step in history
@@ -582,6 +674,7 @@ class AgentBrain:
         (the orchestrator then falls back to the generator tier).
         """
         utterance = _merge_clarify_answer(utterance, session)
+        self.subagents_allowed = delegation_allowed_for(utterance)
         memory_block = session.context_block()
         # enrich with episodic hits when the user asks about the past
         if any(w in utterance.lower() for w in ("yesterday", "earlier", "last time", "before", "history", "did i")):
@@ -636,6 +729,7 @@ class AgentBrain:
                 skills_metadata=system_catalog,
                 skill_detail=skill_detail,
                 browser_turn=prompts.is_browser_turn(history),
+                system_prompt=getattr(self, "system_prompt", None),
             )
             try:
                 plan = await self._ask_plan(messages, emit, history=history)
@@ -1073,6 +1167,20 @@ class AgentBrain:
 
         try:
             skill = resolve_skill_key(skill, self.skill_registry)
+            allowed = getattr(self, "allowed_skills", None)
+            if allowed is not None and not allowed(skill):
+                return BrainStepResult(
+                    skill, args, False,
+                    f"Skill '{skill}' is not available to this subagent.",
+                    why, _ms(),
+                )
+            if skill == "delegate_task" and not getattr(self, "subagents_allowed", False):
+                return BrainStepResult(
+                    skill, args, False,
+                    "Subagents are disabled or explicit-only for this turn; do "
+                    "the work in the main loop.",
+                    why, _ms(),
+                )
             meta = self.skill_registry.get(skill)
             if meta is not None and getattr(meta, "kind", "tool") == "playbook":
                 # A playbook is guidance, not an executable tool. Its body is

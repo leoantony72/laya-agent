@@ -128,6 +128,7 @@ The following assumptions appear in some task templates but **do not exist in th
 | What generates new tools? | `winbrow/generator.py` |
 | What writes new skills? | `winbrow/brain/skill_writer.py` |
 | What runs converted skill scripts? | `winbrow/skill_scripts.py` (`run_skill_script`) |
+| Where are subagents? | `winbrow/subagents.py` (`delegate_task`, scoped child brains) |
 | Where are optional integrations? | `winbrow/integrations.py`, `templates/index.html` |
 
 ## Repository map
@@ -151,8 +152,9 @@ winbrow/
   policy.py               Hard-block regexes + script tiering
   registry.py             Tool/ArgSpec model, seed + learned tools
   mcp.py                  MCP client bridge (stdio + HTTP)
+  subagents.py            Scoped child planners + delegate_task + run history
   voice.py/stt.py/tts.py  Push-to-talk/wake loop, Whisper, SAPI
-  skills/                 19 core + 43 converted playbooks + learned/
+  skills/                 19 core + 43 converted playbooks + meta/learned
 tools/                    seed.json, learned.json, skills.json, permissions.json,
                           session_state.json, mcp_servers.json, mcp_cache.json
 data/                     memory.db, chroma/, observe/

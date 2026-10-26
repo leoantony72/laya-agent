@@ -35,3 +35,4 @@
 - No live CDP, UIA, COM, voice, or end-to-end task was executed. Verification is static + hook execution.
 - `stale.md` was not created because no knowledge file is stale as of 2026-10-25.
 - The hook's API refresh path was not exercised (no `AGENT_API_KEY`); the graceful-skip path was.
+| M9 Scoped subagents | DONE | subagents.py, delegate-task SKILL.md, agent.py, agent_loop.py, prompt.py, server.py, templates/index.html, test_subagents.py | pytest winbrow/tests (37 pass); core brain/syntax (48 pass); node UI syntax | 6 profiles, automatic delegation, scoped child brains, delegate_task T1, parallel-safe file analysis, run history + UI |

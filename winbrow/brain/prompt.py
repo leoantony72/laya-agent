@@ -207,7 +207,14 @@ SKILL RULES:
      create_text_file or mcp_filesystem_write_file call. Use
      mcp_filesystem_edit_file only for a small exact replacement; oldText must
      match the file exactly. Never rewrite a whole file through repeated
-     write_file/edit_file steps."""
+     write_file/edit_file steps.
+ 21. Subagents are available for independent work. Use delegate_task when the
+     task has two or more independent research/analysis pieces, a large reading
+     job that would flood the main context, a focused draft from supplied facts,
+     a code review, or an independent verification. Do not delegate simple
+     one-tool actions, dependent next steps, or destructive actions. Give each
+     subagent a self-contained task plus exact paths/URLs in context. Delegation
+     is not permission for a write, push, message, or payment."""
 )
 
 # Backwards-compatible names used by older callers/tests.
@@ -267,16 +274,20 @@ TOOL_FIXER_JSON_SCHEMA = {
 }
 
 
-def build_system_blocks(skills_metadata: str) -> list[dict]:
+def build_system_blocks(skills_metadata: str,
+                        system_prompt: str | None = None) -> list[dict]:
     """Two Anthropic-style cached system blocks.
 
     The static block never changes and is cached after the first call. The
     skills metadata block changes only when a skill folder is added/removed,
     so it is cached on every subsequent turn of the session.
+
+    ``system_prompt`` lets a scoped subagent replace the parent planner prompt
+    while keeping the same cached-block structure.
     """
     blocks = [{
         "type": "text",
-        "text": SYSTEM_PROMPT_STATIC,
+        "text": system_prompt or SYSTEM_PROMPT_STATIC,
         "cache_control": {"type": "ephemeral"},
     }]
     if skills_metadata:
@@ -338,7 +349,8 @@ def build_loop_messages(utterance: str, history_block: str, context_block: str,
                         tried_block: str = "", steps_remaining=None,
                         skills_metadata: str = "",
                         skill_detail: str | None = None,
-                        browser_turn: bool = False) -> list[dict]:
+                        browser_turn: bool = False,
+                        system_prompt: str | None = None) -> list[dict]:
     """Planner messages with cached system blocks and optional SKILL DETAIL.
 
     `skills_block` is the legacy per-turn tool catalog. The brain now passes an
@@ -370,7 +382,9 @@ def build_loop_messages(utterance: str, history_block: str, context_block: str,
     parts.append(question)
 
     return [
-        {"role": "system", "content": build_system_blocks(skills_metadata)},
+        {"role": "system", "content": build_system_blocks(
+            skills_metadata, system_prompt=system_prompt,
+        )},
         {"role": "user", "content": "\n\n".join(parts)},
     ]
 

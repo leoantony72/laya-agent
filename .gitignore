@@ -61,6 +61,7 @@ data/chroma/
 data/observe/
 data/integrations.json
 data/google_token.json
+data/subagents.json
 data/skill_smoke/
 tools/context_memory.json
 tools/permissions.json

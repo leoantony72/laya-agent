@@ -8,6 +8,7 @@ source_files:
   - winbrow/brain/skill_registry.py
   - winbrow/skill_scripts.py
   - winbrow/integrations.py
+  - winbrow/subagents.py
   - winbrow/agent.py
   - server.py
   - templates/index.html
@@ -237,3 +238,27 @@ Verified in this session: 24 focused tests (`test_playbooks`,
 The document/media helpers were smoke-tested for PDF, PPTX, XLSX, EPUB, CSV,
 PNG, and GIF. DOCX and the credential-gated integrations were not exercised
 end-to-end because their optional packages/accounts are not installed here.
+
+## 9. Scoped subagents (2026-10-26)
+
+Added `winbrow/subagents.py` + `winbrow/skills/delegate-task/SKILL.md`:
+
+- `delegate_task` is a real registry tool (`impl="subagent"`, T1). The main
+  planner sees its SKILL.md body; child actions go through the parent
+  `run_skill` gate. Delegation is automatic by default; `WINBROW_SUBAGENTS=0`
+  disables it and `WINBROW_SUBAGENTS_EXPLICIT=1` requires an explicit request.
+  Explicit and independent-research candidates bypass the browser fast path so
+  they reach the brain.
+- Six profiles (`researcher`, `file-analyst`, `writer`, `code-reviewer`,
+  `verifier`, `general`) each get a filtered skill registry + scoped tool
+  registry, a short system prompt, no subagents, no skill writer, and a step cap.
+- `AgentBrain` gained `allowed_skills`, `system_prompt`, and
+  `enable_skill_writer`; `_run_step` rejects disallowed keys before every meta,
+  playbook, and tool branch.
+- `file-analyst` is the only parallel-safe profile. Browser/write profiles are
+  forced sequential; max 4 tasks per call, max 3 concurrent.
+- Runs persist to `data/subagents.json` (last 50) and appear in the Subagents
+  UI panel + `GET /api/subagents`.
+- Tests: `winbrow/tests/test_subagents.py` covers profile filtering, scoped
+  registry, blocked children, parallel fallback, real child-brain execution, and
+  the API/UI surface. No live model call was made.

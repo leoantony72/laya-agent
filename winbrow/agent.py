@@ -26,6 +26,12 @@ from typing import Any, Optional
 from .browser_task import BrowserController, note_browser_from_text
 from .browser_tools import BROWSER_IMPL, execute_browser_tool, get_browser_tools
 from .brain import AgentBrain, GatewayUnavailable, ModelGateway
+from .brain.agent_loop import (
+    is_explicit_subagent_request,
+    is_subagent_candidate,
+    subagents_enabled,
+    subagents_explicit_only,
+)
 from .brain.agent_loop import COMPUTER_SKILL_DISPATCH, _ctx_block
 from .brain.model_gateway import extract_json_object
 from .brain.prompts import build_chat_messages
@@ -51,6 +57,11 @@ from .integrations import (
     INTEGRATION_IMPL,
     execute_integration_tool,
     get_integration_tools,
+)
+from .subagents import (
+    SUBAGENT_IMPL,
+    SubagentManager,
+    get_subagent_tools,
 )
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
@@ -302,7 +313,8 @@ class WinBrowAgent:
         for _t in (get_computer_tools() + get_adapter_tools()
                    + get_installer_tools() + get_shell_tools()
                    + get_browser_tools() + get_document_tools()
-                   + get_skill_script_tools() + get_integration_tools()):
+                   + get_skill_script_tools() + get_integration_tools()
+                   + get_subagent_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -334,6 +346,7 @@ class WinBrowAgent:
             tool_builder=self.build_new_tool,
             ask_user_fn=self.ask_user_fn,
         )
+        self.subagents = SubagentManager(self)
 
     def get_context(self) -> WindowsContext:
         """Capture live Windows environment context."""
@@ -581,6 +594,14 @@ class WinBrowAgent:
             out = await asyncio.to_thread(execute_integration_tool, tool_name, args)
             out.update({
                 "type": "integration",
+                "tool": tool_name,
+            })
+            return out
+        # scoped child planners (delegate_task)
+        if getattr(tool, "impl", None) == SUBAGENT_IMPL:
+            out = await self.subagents.execute(tool_name, args)
+            out.update({
+                "type": "subagent",
                 "tool": tool_name,
             })
             return out
@@ -1124,6 +1145,83 @@ class WinBrowAgent:
         out = await self.browser.ensure_browser_open()
         return {"type": "browser", "tool": "focus_browser", "success": True, "output": out.get("stdout", "Browser focused")}
 
+    async def _execute_subagent_goal(
+        self,
+        utterance: str,
+        ctx: WindowsContext,
+        session: SessionMemory,
+        session_id: str,
+        emit: Optional[Any],
+        started: float,
+    ) -> dict[str, Any]:
+        """Force an explicit or auto-detected subagent goal into the brain.
+
+        The router's browser fast path would otherwise turn "research these
+        three competitors" into one browser task, so the brain never gets to
+        choose delegate_task. This path is deliberately narrow: explicit
+        subagent wording or an independent-research/review candidate only.
+        """
+        if not self.gateway.available:
+            execution = {
+                "type": "error",
+                "success": False,
+                "output": (
+                    "Subagents need a configured model provider. Add an "
+                    "OpenRouter/OpenAI key in Settings, then try again."
+                ),
+            }
+            resolutions = {}
+        else:
+            contextualized, resolutions = session.resolve_references(utterance)
+            self.browser.reset_session()
+            note_browser_from_text(utterance)
+            try:
+                brain_res = await self.brain.handle(
+                    contextualized, ctx, session, emit=emit,
+                )
+                execution = brain_res.to_dict()
+            except GatewayUnavailable:
+                execution = {
+                    "type": "error",
+                    "success": False,
+                    "output": "Subagents need a configured model provider.",
+                }
+            except Exception as exc:
+                log.warning(f"Explicit subagent goal failed: {exc}")
+                execution = {
+                    "type": "error",
+                    "success": False,
+                    "output": f"Subagent request failed before planning: {exc}",
+                }
+
+        total_ms = round((time.perf_counter() - started) * 1000, 1)
+        result: dict[str, Any] = {
+            "utterance": utterance,
+            "route": {
+                "kind": "brain",
+                "tool_name": "brain",
+                "args": {"goal": utterance},
+                "confidence": 1.0,
+                "latency_ms": 0,
+                "probabilities": {},
+                "tier": "explicit_subagent",
+            },
+            "context": ctx.to_dict(),
+            "execution": execution,
+            "total_elapsed_ms": total_ms,
+        }
+        if resolutions:
+            result["session_resolutions"] = resolutions
+        self.history.append(result)
+        if len(self.history) > 100:
+            self.history = self.history[-100:]
+        try:
+            session.record_turn(utterance, result["route"], execution)
+            self.store.record_command(utterance, result["route"], execution, total_ms)
+        except Exception as exc:
+            log.debug(f"Memory recording failed (non-fatal): {exc}")
+        return result
+
     async def execute(
         self,
         utterance: str,
@@ -1149,6 +1247,16 @@ class WinBrowAgent:
         # Ensure gateway is ready if keys became available in env
         if not self.gateway.available and (os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")):
             self.rebuild_gateway()
+
+        # Subagents are automatic by default. Detect explicit requests and
+        # independent-work candidates before replay/browser routing so they are
+        # not hijacked by the browser fast path.
+        explicit_subagents = is_explicit_subagent_request(utterance)
+        auto_subagents = (
+            subagents_enabled()
+            and not subagents_explicit_only()
+            and is_subagent_candidate(utterance)
+        )
 
         # ── Check if user is approving or denying a pending permission action ──
         clean_words = (utterance or "").strip().lower().rstrip(".!?,")
@@ -1189,8 +1297,10 @@ class WinBrowAgent:
         # Live web state changes between runs. A recorded browser workflow can
         # land on the wrong page and then "succeed" against stale assumptions,
         # so browser goals always go through the observe → act → verify loop.
-        if replay_hit is not None and _is_browser_intent(utterance):
-            log.info(f"Skill '{replay_hit[0].id}' skipped for browser task; using the brain loop.")
+        if replay_hit is not None and (
+            _is_browser_intent(utterance) or explicit_subagents or auto_subagents
+        ):
+            log.info(f"Skill '{replay_hit[0].id}' skipped for browser/subagent task; using the brain loop.")
             replay_hit = None
         replay_steps: list[dict[str, Any]] = []
         if replay_hit is not None:
@@ -1264,6 +1374,14 @@ class WinBrowAgent:
         # keep it off the event loop so routing/execution stay responsive.
         loop = asyncio.get_event_loop()
         ctx = await loop.run_in_executor(None, self.get_context)
+
+        # Explicit subagent wording, or an independent-research/review
+        # candidate, must reach the brain. Otherwise the browser fast path can
+        # swallow it before the planner ever sees delegate_task.
+        if explicit_subagents or (auto_subagents and self.gateway.available):
+            return await self._execute_subagent_goal(
+                utterance, ctx, session, session_id, emit, t0,
+            )
 
         # Fast-path browser intent detection (before Laya routing overhead)
         cleaned_utterance = _strip_conversational_prefix(utterance)

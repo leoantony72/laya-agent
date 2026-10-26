@@ -9,6 +9,7 @@ source_files:
   - winbrow/skill_scripts.py
   - winbrow/skill_script_utils.py
   - winbrow/integrations.py
+  - winbrow/subagents.py
   - winbrow/memory/skills.py
   - winbrow/agent.py
   - winbrow/skills
@@ -109,6 +110,10 @@ uses `kind: playbook` and a unique `playbook_*` key. See
 **Learned (3):** `open_notepad`, `create_folder_papers`,
 `create_folder_and_also_make_a_summ` (the last was captured from a garbled multi-intent request and
 is a poor artifact, not a code bug).
+
+**Meta delegation (1):** `delegate_task` (skill folder `delegate-task`) spawns scoped child
+planners from `winbrow/subagents.py`. It is a real registry tool (`impl="subagent"`, T1) plus a
+SKILL.md body, so the planner sees it in AVAILABLE SKILLS.
 
 ## 4. Skill writer lifecycle
 
@@ -258,7 +263,32 @@ The 43 converted skills are normal folder skills plus:
 - Gated skills must call `integration_status` first and emit `clarify` with the
   setup path when unconfigured; never simulate success.
 
-## 8. Adding a new brain skill
+## 8. Subagents
+
+`winbrow/subagents.py` implements scoped child planners:
+
+- `delegate_task` (T1, `impl="subagent"`) accepts one task or a JSON `tasks`
+  array (max 4). Delegation is **automatic by default**:
+  `AgentBrain.handle` sets `subagents_allowed` via
+  `delegation_allowed_for(utterance)` (true unless disabled). Set
+  `WINBROW_SUBAGENTS_EXPLICIT=1` to require an explicit user request.
+  `_run_step` rejects the tool when disabled/explicit-only. Explicit and
+  independent-research candidates are forced into the brain before the browser
+  fast path. Profiles: `researcher`, `file-analyst`, `writer`,
+  `code-reviewer`, `verifier`, `general`.
+- Each child is a real `AgentBrain` with a **filtered skill registry**, a
+  **ScopedToolRegistry** view, its own `SubagentSession`, no `ask_user_fn`, no
+  `tool_builder`, `enable_skill_writer=False`, and `allowed_skills` enforced in
+  `_run_step` before any meta/playbook/tool branch.
+- Child actions still call the parent `agent.run_skill`, so the T0–T3 gate is
+  unchanged. Browser and write profiles are sequential; only `file-analyst` is
+  parallel-safe. Results and step summaries are recorded in
+  `data/subagents.json` (last 50) and exposed at `GET /api/subagents`.
+- The converted `delegate-task/SKILL.md` is the planner-facing contract.
+  Never delegate destructive work as implicit consent; the child still needs
+  its own permission approval.
+
+## 9. Adding a new brain skill
 
 1. Pick a dispatcher key that already exists in the registry (or add the tool first).
 2. Create `winbrow/skills/<kebab-name>/SKILL.md` with the required frontmatter.
@@ -268,7 +298,7 @@ The 43 converted skills are normal folder skills plus:
 6. Restart or let the registry scan; the planner sees it in metadata immediately afterward.
 7. If the tool mutates, confirm its permission tier is correct.
 
-## 9. Adding a procedural replay skill
+## 10. Adding a procedural replay skill
 
 1. Prefer capturing a real successful run; do not hand-write unless necessary.
 2. Keep steps ≤ 12 and use only registered tools.
@@ -277,7 +307,7 @@ The 43 converted skills are normal folder skills plus:
 4. Save as `proposed`, review the steps, then approve.
 5. Never store browser workflows as replay skills; they are skipped by design.
 
-## 10. Risks and sharp edges
+## 11. Risks and sharp edges
 
 - **Writer cost:** each eligible task can trigger a model call. Disable with `WINBROW_SKILL_WRITER=0`.
 - **Specificity guards are heuristic:** a generic-looking but single-site skill can still pass.
@@ -298,6 +328,10 @@ The 43 converted skills are normal folder skills plus:
 - **Integration secrets:** stored under `data/integrations.json`; DPAPI is used
   on Windows, values are masked, and env vars win. Never print a decrypted value
   or put it in SKILL DETAIL.
+- **Subagent cost and races:** every child is a full planner loop; a four-task
+  call can multiply model cost. Browser profiles share one tab and write
+  profiles share files, so they are forced sequential. Only `file-analyst` is
+  parallel-safe.
 - **Replay blindness:** a replay plan does not re-observe the world; a changed desktop can make a
   stale plan "succeed" or fail halfway.
 - **Status gate:** only `approved` records replay. A capture that looks successful but stays
