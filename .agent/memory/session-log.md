@@ -44,3 +44,24 @@ Permanent findings belong in `.agent/knowledge/`; this file is chronological con
 - **Changed files:** winbrow/subagents.py, winbrow/skills/delegate-task/SKILL.md, winbrow/agent.py, winbrow/brain/agent_loop.py, winbrow/brain/prompt.py, winbrow/brain/skill_registry.py, winbrow/permissions.py, server.py, templates/index.html, winbrow/tests/test_subagents.py, docs.
 - **Verification:** pytest winbrow/tests -> 37 passed; pytest test_brain_m0.py test_syntax.py -> 48 passed; scripted-gateway child brain test; node UI syntax 0 errors.
 - **Limitations:** no live model-provider run; browser subagents are intentionally serialized. Set WINBROW_SUBAGENTS=0 to disable or WINBROW_SUBAGENTS_EXPLICIT=1 to require an explicit request.
+
+## 2026-10-26 - web access hierarchy
+
+- **Summary:** Replaced the browser-backed web_search with native HTTP web_search/web_fetch, added the verbatim WEB ACCESS HIERARCHY + WORKED EXAMPLES to the planner prompt, narrowed browser intent, and routed research/search/price/doc reads away from the browser.
+- **Changed files:** winbrow/web_tools.py, winbrow/skills/web-search/SKILL.md, winbrow/skills/web-fetch/SKILL.md, winbrow/skills/browser-navigate/SKILL.md, winbrow/agent.py, winbrow/router.py, winbrow/browser_tools.py, winbrow/brain/prompt.py, winbrow/brain/skill_registry.py, winbrow/permissions.py, tools/seed.json, requirements.txt, .claude/knowledge/session-patterns.md, tests.
+- **Verification:** pytest winbrow/tests -> 49 passed; test_scenarios/test_winbrow_all/test_brain_m0/test_syntax -> 104 passed. No live network search or browser run was performed.
+- **Limitations:** DuckDuckGo HTML can be rate-limited; the tool reports that honestly and never falls back to the browser for research.
+
+## 2026-10-26 - brain-first routing
+
+- **Summary:** Every user request now attempts the brain before replay, MCP shortcuts, the browser fast path, or the router. Legacy paths remain fallbacks only when the provider is unavailable or fails.
+- **Changed files:** winbrow/agent.py, winbrow/tests/test_brain_first.py, AGENT.md, .env.example, docs.
+- **Verification:** pytest winbrow/tests -> 52 passed; test_m6_mcp/test_scenarios/test_winbrow_all/test_brain_m0/test_syntax -> all passed with provider-failure fallback.
+- **Limitation:** with a configured provider that returns 402/429, the request still tries the brain first, then falls back to legacy routing.
+
+## 2026-10-26 - Nebius Token Factory
+
+- **Summary:** Added Nebius Token Factory as an OpenAI-compatible brain provider. NEBIUS_API_KEY puts it first in auto; WINBROW_BRAIN_PROVIDER=nebius forces it. OpenRouter/OpenAI remain fallbacks.
+- **Changed files:** winbrow/brain/model_gateway.py, server.py, templates/index.html, .env.example, .env comments, tests/test_nebius_gateway.py, docs.
+- **Verification:** pytest winbrow/tests -> 56 passed; test_brain_m0/test_syntax -> 48 passed; test_scenarios -> 3 passed. No live Nebius request was made (no key).
+- **Limitations:** default model deepseek-ai/DeepSeek-V4-Flash-0731 can be overridden with WINBROW_NEBIUS_MODEL.

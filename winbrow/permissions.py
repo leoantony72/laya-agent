@@ -51,13 +51,15 @@ TOOL_TIERS: Dict[str, str] = {
     "aftereffects_detect": T0, "take_screenshot": T0, "app_search": T0,
     "read_document": T0,
     "integration_status": T0,
+    "web_search": T0,
+    "web_fetch": T0,
     # T1 — reversible
     "computer_click": T1, "computer_click_text": T1, "computer_type": T1,
     "computer_key": T1, "computer_scroll": T1, "computer_paste": T1,
     "focus_window": T1, "wait_for_window": T1, "window_action": T1,  # 'close' overridden dynamically
     "volume_set_level": T1, "system_volume": T1, "mute": T1, "media_playback": T1,
     "app_focus_or_launch": T1, "open_common_app": T1, "open_file": T1,
-    "open_folder": T1, "close_folder_window": T2, "web_search": T1,
+    "open_folder": T1, "close_folder_window": T2,
     "laya_ultrafast_browser": T1, "take_screenshot_b64": T0,
     "browser_navigate": T1, "browser_interact": T1, "browser_wait": T1,
     "browser_upload_file": T1,

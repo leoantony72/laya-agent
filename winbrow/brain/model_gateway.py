@@ -3,19 +3,23 @@ Model Gateway — Provider-Agnostic LLM Access for the WinBrow Brain
 ===================================================================
 One interface, many backends, tried in priority order:
 
-  1. OpenRouter (default)   — OpenAI-compatible. Default model:
-                              deepseek/deepseek-v4.1-flash  (env: WINBROW_BRAIN_MODEL)
-  2. Other cloud keys       — OpenAI (OPENAI_API_KEY)
-  3. Local OpenAI-compatible — LM Studio (:1234/v1) / Ollama (:11434/v1) if reachable
-  4. No provider            — chat() raises GatewayUnavailable → callers fall back
+  1. Nebius Token Factory  — OpenAI-compatible. Default model:
+                              deepseek-ai/DeepSeek-V4-Flash-0731
+                              (env: NEBIUS_API_KEY, WINBROW_NEBIUS_MODEL)
+  2. OpenRouter            — OpenAI-compatible. Default model:
+                              deepseek/deepseek-v4.1-flash (env: OPENROUTER_API_KEY)
+  3. Other cloud keys      — OpenAI (OPENAI_API_KEY)
+  4. Local OpenAI-compatible — LM Studio (:1234/v1) / Ollama (:11434/v1) if reachable
+  5. No provider           — chat() raises GatewayUnavailable → callers fall back
                               to heuristics/generator tiers.
 
-Env WINBROW_BRAIN_PROVIDER reorders the chain so the local model can be the
-brain instead of the cloud (cloud stays as fallback):
+Env WINBROW_BRAIN_PROVIDER reorders the chain:
 
-  WINBROW_BRAIN_PROVIDER=local | qwen   → local Qwen first, cloud after
-  WINBROW_BRAIN_PROVIDER=openrouter | openai → cloud first (default order)
-  (auto — default)                      → cloud first, local last
+  WINBROW_BRAIN_PROVIDER=nebius     → Nebius Token Factory first
+  WINBROW_BRAIN_PROVIDER=openrouter → OpenRouter first
+  WINBROW_BRAIN_PROVIDER=openai     → OpenAI first
+  WINBROW_BRAIN_PROVIDER=local|qwen → local Qwen first, cloud after
+  (auto — default)                  → Nebius, OpenRouter, OpenAI, local
 
 When the local brain is requested and WINBROW_LOCAL_LLM_ENDPOINT is not set,
 the built-in llama.cpp server at 127.0.0.1:8080 (models/qwen GGUF) is used;
@@ -43,6 +47,17 @@ log = logging.getLogger("winbrow.brain.gateway")
 
 OPENROUTER_BASE = os.environ.get("WINBROW_OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 DEFAULT_BRAIN_MODEL = os.environ.get("WINBROW_BRAIN_MODEL", "deepseek/deepseek-v4.1-flash")
+
+# Nebius Token Factory: OpenAI-compatible inference API.
+# Docs: https://docs.tokenfactory.nebius.com/
+NEBIUS_BASE = os.environ.get(
+    "WINBROW_NEBIUS_BASE", "https://api.tokenfactory.nebius.com/v1"
+).rstrip("/")
+NEBIUS_DEFAULT_MODEL = (
+    os.environ.get("WINBROW_NEBIUS_MODEL")
+    or os.environ.get("NEBIUS_MODEL")
+    or "deepseek-ai/DeepSeek-V4-Flash-0731"
+)
 
 # Upstream OpenRouter provider for DeepSeek V4.1 Flash. Set to an empty string
 # to let OpenRouter choose automatically, and allow fallbacks with 1.
@@ -111,7 +126,7 @@ LOCAL_PROVIDER_ALIASES = ("local", "qwen", "llama.cpp", "llamacpp")
 
 
 def brain_provider_pref() -> str:
-    """Selected brain provider: 'auto' (default) | 'local'/'qwen' | 'openrouter' | 'openai'."""
+    """Selected brain provider: 'auto' | 'nebius' | 'openrouter' | 'openai' | local aliases."""
     return (os.environ.get("WINBROW_BRAIN_PROVIDER") or "auto").strip().lower()
 
 
@@ -494,6 +509,7 @@ class ModelGateway:
         openai_key: Optional[str] = None,
         brain_model: Optional[str] = None,
         local_endpoint: Optional[str] = None,
+        nebius_key: Optional[str] = None,
     ):
         self.providers: List[Provider] = []
         self._build_chain(
@@ -501,10 +517,35 @@ class ModelGateway:
             openai_key=openai_key,
             brain_model=brain_model,
             local_endpoint=local_endpoint,
+            nebius_key=nebius_key,
         )
 
-    def _build_chain(self, openrouter_key, openai_key, brain_model, local_endpoint) -> None:
+    def _build_chain(self, openrouter_key, openai_key, brain_model, local_endpoint,
+                     nebius_key=None) -> None:
         pref = brain_provider_pref()
+
+        # Nebius Token Factory first in auto mode. It is OpenAI-compatible and
+        # can be selected explicitly with WINBROW_BRAIN_PROVIDER=nebius.
+        nb_key = (
+            nebius_key
+            or os.environ.get("NEBIUS_API_KEY", "")
+            or os.environ.get("WINBROW_NEBIUS_API_KEY", "")
+        )
+        if nb_key:
+            self.providers.append(Provider(
+                name="nebius",
+                base_url=os.environ.get(
+                    "WINBROW_NEBIUS_BASE", NEBIUS_BASE
+                ).rstrip("/"),
+                api_key=nb_key,
+                model=(
+                    os.environ.get("WINBROW_NEBIUS_MODEL")
+                    or os.environ.get("NEBIUS_MODEL")
+                    or brain_model
+                    or NEBIUS_DEFAULT_MODEL
+                ),
+            ))
+
         or_key = openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
         if or_key:
             self.providers.append(Provider(
@@ -551,13 +592,20 @@ class ModelGateway:
         # offline local model degrades gracefully instead of failing the task.
         if wants_local_brain():
             self._prioritize("local")
+        elif pref == "nebius":
+            self._prioritize("nebius")
+        elif pref == "openrouter":
+            self._prioritize("openrouter")
         elif pref == "openai":
             self._prioritize("openai")
-        elif pref not in ("auto", "", "openrouter"):
+        elif pref not in ("auto", ""):
             log.warning(f"Unknown WINBROW_BRAIN_PROVIDER '{pref}'; keeping default chain order.")
 
         if not self.providers:
-            log.warning("ModelGateway: no providers configured (set OPENROUTER_API_KEY).")
+            log.warning(
+                "ModelGateway: no providers configured "
+                "(set NEBIUS_API_KEY or OPENROUTER_API_KEY)."
+            )
 
     def _prioritize(self, name: str) -> None:
         """Move the named provider (if present) to the front of the chain."""
@@ -596,7 +644,9 @@ class ModelGateway:
         so hidden reasoning can never eat the whole max_tokens allowance.
         """
         if not self.providers:
-            raise GatewayUnavailable("No LLM provider configured (set OPENROUTER_API_KEY)")
+            raise GatewayUnavailable(
+                "No LLM provider configured (set NEBIUS_API_KEY or OPENROUTER_API_KEY)"
+            )
         last_err: Optional[Exception] = None
         for provider in self.providers:
             t0 = time.perf_counter()
@@ -676,7 +726,7 @@ class ModelGateway:
         return bool(
             not resp.content.strip()
             and not resp.tool_calls
-            and provider.name == "openrouter"
+            and provider.name in ("openrouter", "nebius")
             and (resp.reasoning or resp.finish_reason == "length")
         )
 
@@ -767,6 +817,18 @@ class ModelGateway:
                 # Short replies (chat, STT normalization, parameter fill) do
                 # not need chain-of-thought and cannot afford it.
                 payload["reasoning"] = {"enabled": False}
+        if provider.name == "nebius":
+            # Nebius exposes OpenAI-style reasoning_effort rather than
+            # OpenRouter's reasoning object. Translate the shared policy:
+            # structured planner calls get a medium effort; chat/normalizers
+            # disable it; an explicit retry policy maps to low/none.
+            effort = "medium" if json_schema else "none"
+            if reasoning is not None:
+                if reasoning.get("enabled") is False:
+                    effort = "none"
+                elif reasoning.get("max_tokens"):
+                    effort = "low"
+            payload["reasoning_effort"] = effort
         if (
             provider.name == "openrouter"
             and OPENROUTER_ONLY_PROVIDER

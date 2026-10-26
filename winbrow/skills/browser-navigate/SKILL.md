@@ -12,23 +12,29 @@ args:
     default: false
     description: Force a fresh agent tab instead of reusing the agent's current tab.
 description: >
-  Open a fully-resolved URL in the agent's own dedicated tab, wait for it to
-  render, and return the page title, URL, text and links. Use for every page
-  change and for retrying a failed navigation with a corrected URL. Do not use
-  to read the page you are already on, or when the target URL is still unknown.
+  Open a URL in the real browser. Use ONLY when the task requires actual
+  interaction: playing media, uploading files, filling forms, logging in, using
+  a web tool, or when the user explicitly asked to open a site. For research,
+  comparison, or reading — use web_search or web_fetch instead. Every call
+  opens a real browser tab and costs multiple steps.
 ---
 
 ## When to Use
 
-Use at the start of any browser task, when moving to a known URL, or when
-recovering from a navigation that landed on the wrong page. The first
-navigation of a task creates a new agent tab; the user's existing tabs are
-never touched. Later navigations reuse that agent tab unless `new_tab` is true.
-The returned page state is usable immediately, so a separate read is not
-required unless the content looks stale.
+Use only for browser interaction: opening a site the user explicitly asked for,
+playing media, uploading a file, filling a form, logging in, using a web-only
+tool, downloading something that requires browser interaction, or anything
+behind a login wall. The first navigation of a task creates a new agent tab;
+the user's existing tabs are never touched. Later navigations reuse that agent
+tab unless `new_tab` is true.
 
 ## When NOT to Use
 
+- Do not use for research, search, product comparison, price lookup, news, or
+  documentation reading. Use `web_search` first, then `web_fetch` for a known
+  URL.
+- Do not use when the result is text you will read and report; use
+  `web_search`/`web_fetch`.
 - Do not call it when the browser is already on the target page; use
   browser-read-full or browser-read-page instead.
 - Do not call it to click, type, submit, scroll or upload; use browser-interact

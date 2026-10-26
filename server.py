@@ -668,13 +668,20 @@ async def dismiss_suggestion(req: DismissRequest):
 
 @app.post("/api/settings")
 async def save_settings(req: SettingsRequest):
-    """Update runtime LLM settings. provider='openrouter' + api_key wires the brain."""
+    """Update runtime LLM settings. provider='nebius' or 'openrouter' wires the brain."""
     runtime_settings["provider"] = req.provider
     runtime_settings["api_key"] = req.api_key
     runtime_settings["endpoint"] = req.endpoint
     runtime_settings["project_id"] = req.project_id
-    if req.provider == "openrouter" and req.api_key:
+    if req.provider == "nebius" and req.api_key:
+        os.environ["NEBIUS_API_KEY"] = req.api_key
+        os.environ["WINBROW_BRAIN_PROVIDER"] = "nebius"
+        from winbrow.brain import reset_gateway
+        reset_gateway()
+        agent.rebuild_gateway()
+    elif req.provider == "openrouter" and req.api_key:
         os.environ["OPENROUTER_API_KEY"] = req.api_key
+        os.environ["WINBROW_BRAIN_PROVIDER"] = "openrouter"
         from winbrow.brain import reset_gateway
         reset_gateway()
         agent.rebuild_gateway()
@@ -688,9 +695,16 @@ async def save_settings(req: SettingsRequest):
 
 @app.get("/api/settings")
 async def get_settings():
+    provider = runtime_settings["provider"]
+    if provider == "auto":
+        provider = os.environ.get("WINBROW_BRAIN_PROVIDER", "auto")
     return JSONResponse({
-        "provider": runtime_settings["provider"],
-        "has_api_key": bool(runtime_settings["api_key"]),
+        "provider": provider,
+        "has_api_key": bool(
+            runtime_settings["api_key"]
+            or os.environ.get("NEBIUS_API_KEY")
+            or os.environ.get("OPENROUTER_API_KEY")
+        ),
         "endpoint": runtime_settings["endpoint"],
         "project_id": runtime_settings["project_id"],
     })

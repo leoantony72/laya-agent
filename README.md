@@ -56,6 +56,7 @@ User Voice / Text Utterance + Live Windows Context (Active App, Running Apps)
 3. **Browser Automation (`winbrow/browser_task.py`)**
    - Drives Google Chrome and Microsoft Edge directly.
    - Web searches (Google, YouTube, GitHub, Bing), tab navigation, and shortcuts without heavy screenshot loops.
+   - **Native web access first:** `web_search` and `web_fetch` use HTTP only (curl_cffi with a real browser TLS fingerprint, plus Trafilatura main-content extraction, so pages arrive without nav/ads and DuckDuckGo does not serve its bot challenge) and never open a browser. The browser is reserved for media, uploads, forms, login, and explicit “open/go to” requests.
 
 4. **Safety Policy Engine (`winbrow/policy.py`)**
    - Blocks dangerous operations (disk formatting, system folder deletions, critical process termination).
@@ -66,6 +67,7 @@ User Voice / Text Utterance + Live Windows Context (Active App, Running Apps)
    - Real-time Laya routing inspector showing tool choice, confidence %, and latency in milliseconds.
    - Live Windows Context banner (Frontmost App, Running Apps count).
    - "Learned Tools" browser displaying dynamically generated tools.
+   - Every typed or voice request is **brain-first**: replay, MCP shortcuts, the browser fast path, and the router are fallbacks only when no provider is available or the provider fails.
 
 6. **Converted Skill Library & Integrations**
    - 43 playbook skills for documents, data, writing, creative media, productivity, and collaboration under `winbrow/skills/library/`.
@@ -97,7 +99,23 @@ py -3 -m uvicorn server:app --host 127.0.0.1 --port 8765
 Navigate to:
 👉 **http://127.0.0.1:8765**
 
-### 3. Optional: OCR Setup (`screen_read_text`)
+### 3. Configure the brain (Nebius Token Factory)
+
+Create `.env` from `.env.example` and set:
+
+```env
+NEBIUS_API_KEY=your-nebius-key
+WINBROW_BRAIN_PROVIDER=nebius
+# Optional overrides:
+# WINBROW_NEBIUS_MODEL=deepseek-ai/DeepSeek-V4-Flash-0731
+# WINBROW_NEBIUS_BASE=https://api.tokenfactory.nebius.com/v1
+```
+
+Nebius Token Factory is OpenAI-compatible and is the first provider in `auto`
+whenever `NEBIUS_API_KEY` is set. OpenRouter and OpenAI remain fallbacks if
+configured. You can also choose **Nebius Token Factory** in Settings.
+
+### 4. Optional: OCR Setup (`screen_read_text`)
 
 OCR works out of the box on Windows 10/11 via the built-in Windows OCR API
 (the fallback engine). For better accuracy, install Tesseract:

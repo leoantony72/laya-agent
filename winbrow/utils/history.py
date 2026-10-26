@@ -51,6 +51,18 @@ PAGE_TEXT_LIMIT_CURRENT = 3000
 BROWSER_DETAIL_STEPS = 3
 
 
+# Web research output is the whole point of a search/fetch step: the planner
+# must be able to read enough of it to answer without repeating calls. Without
+# a dedicated budget, web_fetch fell through to RECENT_OUTPUT_LIMIT (400 chars),
+# so every re-fetch showed the same 400-char prefix and the planner looped.
+WEB_SEARCH_SKILLS = frozenset({"web_search"})
+WEB_FETCH_SKILLS = frozenset({"web_fetch"})
+WEB_SEARCH_STEP_LIMIT = 3_000
+WEB_SEARCH_TOTAL_BUDGET = 6_000
+WEB_FETCH_STEP_LIMIT = 20_000
+WEB_FETCH_TOTAL_BUDGET = 30_000
+
+
 def _skill_of(entry: Any) -> str:
     if isinstance(entry, dict):
         step = entry.get("step")
@@ -278,18 +290,32 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
 
 
 def _recent_output_limits(recent: List[Any]) -> List[int]:
-    """Per-step output caps, giving document reads a newest-first budget."""
-    limits = [
-        FILE_LIST_STEP_LIMIT if _skill_of(entry) in FILE_LIST_SKILLS
-        else RECENT_OUTPUT_LIMIT
-        for entry in recent
-    ]
-    remaining = DOCUMENT_TOTAL_BUDGET
-    for idx in range(len(recent) - 1, -1, -1):
-        if _skill_of(recent[idx]) not in DOCUMENT_READ_SKILLS or remaining <= 0:
-            continue
-        limits[idx] = min(DOCUMENT_STEP_LIMIT, remaining)
-        remaining -= limits[idx]
+    """Per-step output caps with newest-first budgets per output family."""
+    def base_limit(skill: str) -> int:
+        if skill in FILE_LIST_SKILLS:
+            return FILE_LIST_STEP_LIMIT
+        if skill in WEB_SEARCH_SKILLS:
+            return WEB_SEARCH_STEP_LIMIT
+        if skill in WEB_FETCH_SKILLS:
+            return WEB_FETCH_STEP_LIMIT
+        return RECENT_OUTPUT_LIMIT
+
+    limits = [base_limit(_skill_of(entry)) for entry in recent]
+
+    def apply_budget(skills: frozenset[str], step_limit: int, total: int) -> None:
+        remaining = total
+        for idx in range(len(recent) - 1, -1, -1):
+            if _skill_of(recent[idx]) not in skills:
+                continue
+            if remaining <= 0:
+                limits[idx] = 0
+                continue
+            limits[idx] = min(step_limit, remaining)
+            remaining -= limits[idx]
+
+    apply_budget(DOCUMENT_READ_SKILLS, DOCUMENT_STEP_LIMIT, DOCUMENT_TOTAL_BUDGET)
+    apply_budget(WEB_FETCH_SKILLS, WEB_FETCH_STEP_LIMIT, WEB_FETCH_TOTAL_BUDGET)
+    apply_budget(WEB_SEARCH_SKILLS, WEB_SEARCH_STEP_LIMIT, WEB_SEARCH_TOTAL_BUDGET)
     return limits
 
 

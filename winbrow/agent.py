@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from .browser_task import BrowserController, note_browser_from_text
 from .browser_tools import BROWSER_IMPL, execute_browser_tool, get_browser_tools
-from .brain import AgentBrain, GatewayUnavailable, ModelGateway
+from .brain import AgentBrain, GatewayError, GatewayUnavailable, ModelGateway
 from .brain.agent_loop import (
     is_explicit_subagent_request,
     is_subagent_candidate,
@@ -53,6 +53,7 @@ from .skill_scripts import (
     execute_skill_script_tool_async,
     get_skill_script_tools,
 )
+from .web_tools import WEB_IMPL, execute_web_tool_async, get_web_tools
 from .integrations import (
     INTEGRATION_IMPL,
     execute_integration_tool,
@@ -73,25 +74,32 @@ from .windows import WindowsContext, get_current_windows_context, run_powershell
 
 log = logging.getLogger("winbrow.agent")
 
-# Phrases that indicate browser intent
+# Phrases that indicate a real browser-interaction intent. Research, search,
+# comparison, and "tell me about" are handled by web_search/web_fetch and must
+# NOT appear here.
 BROWSER_KEYWORDS = [
-    "browser", "chrome", "edge", "firefox", "tab", "open url", "navigate to",
-    "go to website", "go to https", "go to http", "incognito", "private window",
-    "new tab", "close tab", "reload", "scroll down", "scroll up", "bookmark",
-    "devtools", "inspect element", "javascript", "screenshot browser",
-    "read page", "click on", "fill form", "find on page", "browser history",
-    "ultrafast", "laya-ultrafast", "automate browser", "browser task", "multi-step browser",
-    "search", "find results", "in the web", "on the web", "web search", "look up",
-    # Interactive / multi-step tasks
-    "book", "booking", "flight", "flights", "hotel", "buy", "purchase", "order",
-    "sign in", "login", "log in", "sign up", "register", "subscribe",
-    "check out", "checkout", "add to cart", "shop", "shopping",
-    "fill", "submit", "download from", "open website", "go to",
-    "show me", "find me", "get me", "look for", "browse to",
-    "amazon", "youtube", "twitter", "instagram", "linkedin", "github",
-    "google flights", "booking.com", "airbnb", "expedia", "instagram", "google drive", "facebook",
-    "flipkart", "discord", "twitter",
+    "open browser", "browser tab", "tab", "open url", "navigate to",
+    "go to website", "go to https", "go to http", "visit website", "visit http",
+    "incognito", "private window", "new tab", "close tab", "reload",
+    "scroll down", "scroll up", "bookmark", "devtools", "inspect element",
+    "javascript", "screenshot browser", "read page", "click on", "fill form",
+    "find on page", "browser history", "ultrafast", "laya-ultrafast",
+    "automate browser", "browser task", "multi-step browser",
+    # Explicit interaction phrases. Bare words like "hotel", "flight", "buy",
+    # "order" are research-compatible and belong to the router/brain, not the
+    # browser fast path.
+    "add to cart", "check out", "checkout", "sign in", "log in", "login",
+    "sign up", "register", "subscribe", "fill out", "submit form",
+    "download from", "open website", "go to", "watch on", "play on",
 ]
+
+# Site names only imply the browser when paired with an explicit open/go/visit
+# verb. A bare "github" or "youtube" in a research query must not open a tab.
+_BROWSER_SITES = (
+    "youtube", "twitter", "x.com", "instagram", "linkedin", "github",
+    "amazon", "flipkart", "facebook", "discord", "google drive",
+    "booking.com", "airbnb", "expedia",
+)
 
 
 # Task patterns that indicate multi-step interactive work (not just a URL open)
@@ -101,11 +109,16 @@ _INTERACTIVE_PATTERNS = [
     "check out", "checkout", "subscribe",
     "flight", "hotel", "airbnb", "expedia",
     "fill form", "fill out", "submit form",
-    "find details", "show details", "get details",
-    "search on", "search for", "look for", "find on",
     "open and", "go to and", "navigate to and",
     "download from", "watch on", "play on",
 ]
+
+
+def _brain_first_enabled() -> bool:
+    """Every user request starts at the brain unless explicitly disabled."""
+    return os.environ.get("WINBROW_BRAIN_FIRST", "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
 
 
 def _is_browser_intent(utterance: str) -> bool:
@@ -120,6 +133,12 @@ def _is_browser_intent(utterance: str) -> bool:
         return False
     if _APP_LAUNCH_RE.search(lower):
         return False
+    # Site names are only browser intent when paired with an explicit open/go
+    # verb. "compare github copilot and cursor" must not open a tab.
+    if any(site in lower for site in _BROWSER_SITES) and re.search(
+        r"\b(open|go to|visit|navigate to|browse to)\b", lower,
+    ):
+        return True
     for kw in BROWSER_KEYWORDS:
         if " " in kw or "://" in kw or "-" in kw or "." in kw:
             # Multi-word phrases / URLs: substring match is safe.
@@ -314,7 +333,7 @@ class WinBrowAgent:
                    + get_installer_tools() + get_shell_tools()
                    + get_browser_tools() + get_document_tools()
                    + get_skill_script_tools() + get_integration_tools()
-                   + get_subagent_tools()):
+                   + get_subagent_tools() + get_web_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -462,7 +481,7 @@ class WinBrowAgent:
                 "output": out_msg,
                 "elapsed_ms": 1.0,
             }
-        if tool_name in ("laya_ultrafast_browser", "web_search"):
+        if tool_name == "laya_ultrafast_browser":
             goal = str(args.get("goal") or args.get("query") or "")
             out = await self.browser.run_ultrafast_task(goal)
             return {
@@ -578,6 +597,14 @@ class WinBrowAgent:
             out = await asyncio.to_thread(execute_document_tool, tool_name, args)
             out.update({
                 "type": "document",
+                "tool": tool_name,
+            })
+            return out
+        # native web search/fetch (HTTP only, never opens the browser)
+        if getattr(tool, "impl", None) == WEB_IMPL:
+            out = await execute_web_tool_async(tool_name, args)
+            out.update({
+                "type": "web",
                 "tool": tool_name,
             })
             return out
@@ -900,18 +927,6 @@ class WinBrowAgent:
             return await self._run_browser_goal(
                 goal, ctx=ctx, session=session, emit=emit,
             )
-        if route.tool.name == "web_search":
-            goal = route.args.get("goal") or route.args.get("query") or utterance
-            out = await self.browser.run_ultrafast_task(goal)
-            return {
-                "type": "browser",
-                "tool": "laya_ultrafast_browser",
-                "success": out.get("success", True),
-                "output": out.get("final_answer") or str(out.get("steps", [])),
-                "steps": out.get("steps", []),
-                "total_elapsed_ms": out.get("total_elapsed_ms", 0.0),
-                "method": out.get("method", "laya_ultrafast"),
-            }
         # v3/M3: everything else (templates, atoms, adapters,
         # installers, learned tools) goes through the single
         # permission-gated executor — no direct paths.
@@ -1145,7 +1160,7 @@ class WinBrowAgent:
         out = await self.browser.ensure_browser_open()
         return {"type": "browser", "tool": "focus_browser", "success": True, "output": out.get("stdout", "Browser focused")}
 
-    async def _execute_subagent_goal(
+    async def _execute_brain_goal(
         self,
         utterance: str,
         ctx: WindowsContext,
@@ -1153,46 +1168,49 @@ class WinBrowAgent:
         session_id: str,
         emit: Optional[Any],
         started: float,
-    ) -> dict[str, Any]:
-        """Force an explicit or auto-detected subagent goal into the brain.
+    ) -> Optional[dict[str, Any]]:
+        """Run one user goal through the brain before any fast path.
 
-        The router's browser fast path would otherwise turn "research these
-        three competitors" into one browser task, so the brain never gets to
-        choose delegate_task. This path is deliberately narrow: explicit
-        subagent wording or an independent-research/review candidate only.
+        Returns None only when no model provider is available, so the caller can
+        fall back to the legacy router/generator. A brain failure is returned as
+        an honest error result; it never falls through to an MCP shortcut or the
+        browser fast path.
         """
         if not self.gateway.available:
-            execution = {
-                "type": "error",
-                "success": False,
-                "output": (
-                    "Subagents need a configured model provider. Add an "
-                    "OpenRouter/OpenAI key in Settings, then try again."
-                ),
-            }
-            resolutions = {}
-        else:
-            contextualized, resolutions = session.resolve_references(utterance)
-            self.browser.reset_session()
-            note_browser_from_text(utterance)
-            try:
+            return None
+
+        resolutions: dict = {}
+        tier = "brain_first"
+        try:
+            if _is_browser_intent(utterance):
+                brain_res, resolutions = await self.handle_browser_task(
+                    utterance, ctx, session, emit=emit,
+                )
+            else:
+                contextualized, resolutions = session.resolve_references(utterance)
+                self.browser.reset_session()
+                note_browser_from_text(utterance)
                 brain_res = await self.brain.handle(
                     contextualized, ctx, session, emit=emit,
                 )
-                execution = brain_res.to_dict()
-            except GatewayUnavailable:
-                execution = {
-                    "type": "error",
-                    "success": False,
-                    "output": "Subagents need a configured model provider.",
-                }
-            except Exception as exc:
-                log.warning(f"Explicit subagent goal failed: {exc}")
-                execution = {
-                    "type": "error",
-                    "success": False,
-                    "output": f"Subagent request failed before planning: {exc}",
-                }
+            execution = brain_res.to_dict()
+        except GatewayUnavailable:
+            log.warning("Brain unavailable; falling back to legacy routing.")
+            return None
+        except GatewayError as exc:
+            # The provider is configured but failed (quota, 429, timeout after
+            # retries). The brain was still tried first; let the legacy path
+            # handle the command rather than dropping it entirely.
+            log.warning(f"Brain provider failed ({exc}); falling back to legacy routing.")
+            return None
+        except Exception as exc:
+            log.warning(f"Brain-first execution failed: {exc}")
+            tier = "brain_first_error"
+            execution = {
+                "type": "error",
+                "success": False,
+                "output": f"Brain failed before planning: {exc}",
+            }
 
         total_ms = round((time.perf_counter() - started) * 1000, 1)
         result: dict[str, Any] = {
@@ -1204,7 +1222,7 @@ class WinBrowAgent:
                 "confidence": 1.0,
                 "latency_ms": 0,
                 "probabilities": {},
-                "tier": "explicit_subagent",
+                "tier": tier,
             },
             "context": ctx.to_dict(),
             "execution": execution,
@@ -1235,11 +1253,10 @@ class WinBrowAgent:
     ) -> dict[str, Any]:
         """
         Process user command end-to-end:
-        1. Capture live Windows context
-        2. Check for browser intent fast-path
-        3. Route with Laya decision engine (~200ms)
-        4. Execute or trigger brain / generator tier
-        5. Record turn in session + episodic memory; return structured trace
+        1. Brain first for every request when a provider is available
+        2. Legacy replay/MCP/browser/router fast paths only when the brain is
+           unavailable (or WINBROW_BRAIN_FIRST=0)
+        3. Record turn in session + episodic memory; return structured trace
         """
         t0 = time.perf_counter()
         session = self.session if session_id == "default" else get_session(session_id)
@@ -1247,6 +1264,11 @@ class WinBrowAgent:
         # Ensure gateway is ready if keys became available in env
         if not self.gateway.available and (os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")):
             self.rebuild_gateway()
+
+        # Every request starts at the brain when a model is available. This
+        # deliberately bypasses replay, MCP shortcuts, the browser fast path,
+        # and the router; those remain fallbacks only when no provider exists.
+        brain_first = _brain_first_enabled() and self.gateway.available
 
         # Subagents are automatic by default. Detect explicit requests and
         # independent-work candidates before replay/browser routing so they are
@@ -1298,9 +1320,10 @@ class WinBrowAgent:
         # land on the wrong page and then "succeed" against stale assumptions,
         # so browser goals always go through the observe → act → verify loop.
         if replay_hit is not None and (
-            _is_browser_intent(utterance) or explicit_subagents or auto_subagents
+            brain_first or _is_browser_intent(utterance)
+            or explicit_subagents or auto_subagents
         ):
-            log.info(f"Skill '{replay_hit[0].id}' skipped for browser/subagent task; using the brain loop.")
+            log.info(f"Skill '{replay_hit[0].id}' skipped for brain-first/browser task; using the brain loop.")
             replay_hit = None
         replay_steps: list[dict[str, Any]] = []
         if replay_hit is not None:
@@ -1375,36 +1398,31 @@ class WinBrowAgent:
         loop = asyncio.get_event_loop()
         ctx = await loop.run_in_executor(None, self.get_context)
 
-        # Explicit subagent wording, or an independent-research/review
-        # candidate, must reach the brain. Otherwise the browser fast path can
-        # swallow it before the planner ever sees delegate_task.
-        if explicit_subagents or (auto_subagents and self.gateway.available):
-            return await self._execute_subagent_goal(
+        # Brain-first: this is the single entry point for every user request
+        # whenever a model provider is available. Replay, MCP shortcuts, the
+        # browser fast path, and the router are fallbacks only.
+        if brain_first:
+            brain_result = await self._execute_brain_goal(
                 utterance, ctx, session, session_id, emit, t0,
             )
+            if brain_result is not None:
+                return brain_result
+            log.warning("Brain-first path unavailable; using legacy routing.")
 
-        # Fast-path browser intent detection (before Laya routing overhead)
+        # Fast-path browser intent detection (before Laya routing overhead).
+        # Research/search/comparison never reaches this path; those go to the
+        # router/web_search or the brain.
         cleaned_utterance = _strip_conversational_prefix(utterance)
         utterance_lower = cleaned_utterance.lower()
         browser_fast = _is_browser_intent(utterance)
         is_interactive = _is_interactive_task(utterance)
-
-        # -- Handle direct search queries that go through web_search tool --
-        # Keep these in the tool routing path rather than browser fast-path
-        # UNLESS the search is interactive (e.g. "search for X on amazon" needs
-        # navigate+type+click, not just a Google URL open).
-        is_search = any(utterance_lower.startswith(p) for p in [
-            "search ", "google ", "look up ", "find ", "search for ", "find results "
-        ]) and not any(kw in utterance_lower for kw in [
-            "tab", "reload", "scroll", "screenshot", "find on page", "incognito"
-        ]) and not is_interactive  # interactive tasks should NOT be treated as simple search
 
         # Multi-step command check: if the user wants multiple steps (e.g. search + save to desktop),
         # do NOT hijack with browser fast-path; let it route to the multi-step brain planner.
         is_multi_step = is_multi_step_intent(utterance)
 
         # MCP direct shortcuts for high-confidence lookups and local reads —
-        # these MUST run before the browser/is_search fast-path so "search
+        # these MUST run before browser routing so "search
         # wikipedia for X" reaches the wiki server instead of Google, and
         # before router/brain so git/time/pdf/local files work brainless.
         mcp_shortcut_tool = None
@@ -1546,7 +1564,7 @@ class WinBrowAgent:
         # No task-type tiers. The brain decides how many steps this specific
         # goal needs: a simple task finishes in one or two, a complex one uses
         # more, and a bad earlier step is visible before the next decision.
-        if not is_multi_step and (browser_fast or is_search) and self.gateway.available:
+        if not is_multi_step and browser_fast and self.gateway.available:
             try:
                 brain_res, resolutions = await self.handle_browser_task(
                     utterance, ctx, session, emit=emit,
@@ -1582,7 +1600,7 @@ class WinBrowAgent:
                 log.warning(f"Browser brain failed ({e}); using one-shot fallback.")
 
         # One-shot fallback only when no model provider is usable.
-        if not is_multi_step and (browser_fast or is_search):
+        if not is_multi_step and browser_fast:
             out = await self.browser.run_ultrafast_task(utterance)
             total_ms = round((time.perf_counter() - t0) * 1000, 1)
             result = {

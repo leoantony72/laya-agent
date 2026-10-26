@@ -102,12 +102,16 @@ The following assumptions appear in some task templates but **do not exist in th
 6. **Page state is cached by URL only, with no TTL.** Pass `force_refresh=True` after any mutation.
 7. **Policy regexes are a safety net, not a sandbox.** Generated scripts run with
    `-ExecutionPolicy Bypass`. Treat `policy.py` gaps as real risk (see `05-known-issues.md`).
-8. **Do not add a new tool without**: a `Tool`/`ArgSpec` definition, a tier in
+8. **Brain-first by default.** `WinBrowAgent.execute()` sends every request to
+   `_execute_brain_goal()` before replay, MCP shortcuts, the browser fast path, or the
+   router. Those paths are fallbacks for an unavailable/failed provider. Set
+   `WINBROW_BRAIN_FIRST=0` only to debug legacy routing.
+9. **Do not add a new tool without**: a `Tool`/`ArgSpec` definition, a tier in
    `permissions.TOOL_TIERS` (or a clear default), a dispatcher branch in `run_skill`, and a
    matching `SKILL.md` if the brain should see it.
-9. **PowerShell quoting is the most common bug source.** Always single-quote and escape embedded
-   apostrophes; never interpolate user text into a double-quoted PowerShell string.
-10. **Tests:** `pytest` files exist under `winbrow/tests/` and repo root. They do not cover live
+10. **PowerShell quoting is the most common bug source.** Always single-quote and escape embedded
+    apostrophes; never interpolate user text into a double-quoted PowerShell string.
+11. **Tests:** `pytest` files exist under `winbrow/tests/` and repo root. They do not cover live
     CDP/UIA. Record exactly what you ran.
 
 ## Fast orientation
@@ -128,6 +132,7 @@ The following assumptions appear in some task templates but **do not exist in th
 | What generates new tools? | `winbrow/generator.py` |
 | What writes new skills? | `winbrow/brain/skill_writer.py` |
 | What runs converted skill scripts? | `winbrow/skill_scripts.py` (`run_skill_script`) |
+| How does web research avoid the browser? | `winbrow/web_tools.py` (`web_search`, `web_fetch`) |
 | Where are subagents? | `winbrow/subagents.py` (`delegate_task`, scoped child brains) |
 | Where are optional integrations? | `winbrow/integrations.py`, `templates/index.html` |
 
@@ -152,6 +157,7 @@ winbrow/
   policy.py               Hard-block regexes + script tiering
   registry.py             Tool/ArgSpec model, seed + learned tools
   mcp.py                  MCP client bridge (stdio + HTTP)
+  web_tools.py            Native web_search/web_fetch (HTTP, no browser)
   subagents.py            Scoped child planners + delegate_task + run history
   voice.py/stt.py/tts.py  Push-to-talk/wake loop, Whisper, SAPI
   skills/                 19 core + 43 converted playbooks + meta/learned
@@ -169,9 +175,11 @@ data/                     memory.db, chroma/, observe/
   dependencies break the whole server.
 - `server.py` does not pass `ask_user_fn` to the agent, so clarify returns `needs_input=True`
   rather than blocking for an interactive answer.
-- The brain is cloud-first (`OPENROUTER_API_KEY`). Local llama.cpp/Qwen starts only when
+- The brain is cloud-first: Nebius Token Factory (`NEBIUS_API_KEY`) first, then
+  OpenRouter (`OPENROUTER_API_KEY`), then OpenAI. Local llama.cpp/Qwen starts only when
   `WINBROW_LOCAL_LLM=1` or `WINBROW_BRAIN_PROVIDER=local|qwen`.
-- Default brain model: `deepseek/deepseek-v4.1-flash`; planner `max_tokens=16000`,
+- Default Nebius model: `deepseek-ai/DeepSeek-V4-Flash-0731` (`WINBROW_NEBIUS_MODEL`);
+  OpenRouter default remains `deepseek/deepseek-v4.1-flash`. Planner `max_tokens=16000`,
   `temperature=1`; browser-heavy turns use 8000 total / 600 reasoning.
 - `agent_loop.MAX_STEPS_DEFAULT=20`, `STEP_TIMEOUT_S=120`, `STEP_WARN_REMAINING=5`.
 - `history.FULL_WINDOW=5`, `RECENT_OUTPUT_LIMIT=400`, `BROWSER_DETAIL_STEPS=3`.

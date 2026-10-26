@@ -7,6 +7,7 @@ source_files:
   - start.bat
   - winbrow/agent.py
   - winbrow/subagents.py
+  - winbrow/web_tools.py
   - winbrow/__main__.py
   - winbrow/cli.py
   - winbrow/registry.py
@@ -120,9 +121,12 @@ They share the word "skill" but no storage, no matching, and no lifecycle. Do no
 
 ### 4.6 Cloud-first brain, optional local fallback
 
-`brain/model_gateway.py` defaults to OpenRouter `deepseek/deepseek-v4.1-flash`, provider `relace`,
-planner `max_tokens=16000`, `temperature=1`, reasoning cap 2000. Browser-heavy turns drop to
-8000 total / 600 reasoning. Local llama.cpp/Qwen is opt-in.
+`brain/model_gateway.py` prefers **Nebius Token Factory** when `NEBIUS_API_KEY` is
+set (`https://api.tokenfactory.nebius.com/v1`, default model
+`deepseek-ai/DeepSeek-V4-Flash-0731`), then OpenRouter
+`deepseek/deepseek-v4.1-flash`, then OpenAI. Provider `relace`, planner
+`max_tokens=16000`, `temperature=1`, reasoning cap 2000. Browser-heavy turns drop
+to 8000 total / 600 reasoning. Local llama.cpp/Qwen is opt-in.
 
 ### 4.7 Windows-native execution
 
@@ -146,6 +150,7 @@ server.py
        ├─ SkillMemory (memory/skills.py) ── tools/skills.json
        ├─ ScriptGenerator (generator.py)
        ├─ MCP hub (mcp.py)
+       ├─ Native web tools (web_tools.py) ── web_search, web_fetch (no browser)
        └─ SubagentManager (subagents.py) ── scoped child AgentBrain instances
 ```
 
@@ -159,10 +164,14 @@ Important environment variables (full list in `.env.example` and the knowledge f
 
 | Variable | Default | Effect |
 |---|---|---|
-| `OPENROUTER_API_KEY` | empty | Enables the cloud brain |
-| `WINBROW_BRAIN_MODEL` | `deepseek/deepseek-v4.1-flash` | Planner model |
-| `WINBROW_BRAIN_PROVIDER` | `auto` | `auto` / `local` / `qwen` / `openrouter` / `openai` |
+| `NEBIUS_API_KEY` | empty | Nebius Token Factory key; first cloud provider in auto |
+| `WINBROW_NEBIUS_BASE` | `https://api.tokenfactory.nebius.com/v1` | Nebius OpenAI-compatible base |
+| `WINBROW_NEBIUS_MODEL` | `deepseek-ai/DeepSeek-V4-Flash-0731` | Nebius model ID |
+| `OPENROUTER_API_KEY` | empty | OpenRouter fallback key |
+| `WINBROW_BRAIN_MODEL` | `deepseek/deepseek-v4.1-flash` | OpenRouter model |
+| `WINBROW_BRAIN_PROVIDER` | `auto` | `auto` / `nebius` / `local` / `qwen` / `openrouter` / `openai` |
 | `WINBROW_MAX_STEPS` | `20` | Brain action budget |
+| `WINBROW_BRAIN_FIRST` | `1` | Every request attempts the brain before replay/MCP/browser/router |
 | `WINBROW_STEP_TIMEOUT` | `120` | Per-action timeout (seconds) |
 | `WINBROW_STEP_WARN` | `5` | Steps-remaining warning threshold |
 | `WINBROW_REASONING_MAX_TOKENS` | `2000` | Reasoning cap for structured calls |

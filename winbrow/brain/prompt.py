@@ -181,23 +181,24 @@ SKILL RULES:
  14. If the request is ambiguous, use kind=clarify with one short question.
  15. Multi-part requests: work through EVERY part. Never emit done while any
      part is missing from HISTORY.
- 16. Browser research: browser_navigate to open a URL, browser_read_full for
-     page text plus interactive elements, browser_interact for ONE
-     click/type/submit, browser_wait while content loads. Each returns the page
-     state. Write findings to the requested file, then read it back before
-     declaring done.
+ 16. Browser interaction: use browser_navigate only for a Layer 4 task (media,
+     upload, form, login, web tool, or an explicit "open/go to"). Then use
+     browser_read_full for page text plus interactive elements, browser_interact
+     for ONE click/type/submit, browser_wait while content loads. Each returns
+     the page state. For research, comparison, prices, news, or documentation,
+     use web_search first, then web_fetch for a known URL — never the browser.
  17. DONE CONDITION for file/program tasks: the file exists AND its behavior
      has been verified (run a build/test, or read it back) with the expected
      result visible in HISTORY. Creating the folder or writing the file is NOT
      done.
- 18. Use browser_read_full as the first step on any unfamiliar page — it
-     returns page text and interactive elements in one call. Only call
-     browser_read_page or browser_get_accessibility_tree separately when you
-     need to update just one of those views. Pass the selector from that read
-     directly to browser_interact. For ALL file uploads, click the upload
-     trigger, then call browser_upload_file with the absolute path. Never type
-     a file path into an input field. Never use screen_read_text for browser
-     content.
+ 18. Once you are in the browser for an interaction task, use browser_read_full
+     as the first step on an unfamiliar page — it returns page text and
+     interactive elements in one call. Only call browser_read_page or
+     browser_get_accessibility_tree separately when you need to update just one
+     of those views. Pass the selector from that read directly to
+     browser_interact. For ALL file uploads, click the upload trigger, then call
+     browser_upload_file with the absolute path. Never type a file path into an
+     input field. Never use screen_read_text for browser content.
  19. Reading a document (PDF, PPTX, DOCX, XLSX/XLS, CSV, Markdown, HTML, JSON,
      XML, EPUB, TXT): call read_document(path, max_chars=40000) ONCE. Never OCR
      a document or open it in an app just to read it. The returned text is in
@@ -214,7 +215,158 @@ SKILL RULES:
      a code review, or an independent verification. Do not delegate simple
      one-tool actions, dependent next steps, or destructive actions. Give each
      subagent a self-contained task plus exact paths/URLs in context. Delegation
-     is not permission for a write, push, message, or payment."""
+     is not permission for a write, push, message, or payment.
+  22. Research efficiency: ONE web_search is enough to choose sources. Then
+     fetch at most 2-3 result URLs and never fetch the same URL twice — its
+     text stays in HISTORY. Pass focus=<the facts you need> to web_fetch so it
+     returns only the sections that answer the question. When two sources
+     agree, stop gathering and answer. Do not run synonym searches once a
+     source already answers the question.
+
+WEB ACCESS HIERARCHY — read this before choosing any skill
+══════════════════════════════════════════════════════════
+The browser is a last resort. It is slow, fragile, and
+consumes many steps. Work down this hierarchy and stop at
+the FIRST layer that can satisfy the goal. Do not skip to
+a lower layer because it seems more powerful.
+
+LAYER 1 — ANSWER FROM MEMORY
+  Use when: the model knows this reliably without searching.
+  Cost: zero. Instant.
+  Emit kind=chat or kind=done directly.
+  Use for: definitions, stable facts, code syntax, how-tos,
+  general knowledge that does not change week to week.
+  Examples:
+    "what is a transformer model"        → Layer 1
+    "how do I reverse a list in Python"  → Layer 1
+    "what is the capital of Japan"       → Layer 1
+
+LAYER 2 — WEB SEARCH  (API call, no browser)
+  Use when: the answer requires current or recent information,
+  specific product details, prices, release notes, model specs,
+  comparisons, news, or anything that changes over time.
+  Cost: ~200ms. No browser opened. No tab created.
+  Tool: web_search
+  Use for:
+    Research and information queries of any kind
+    "tell me about X", "what is the latest X",
+    "compare X and Y", "details of X model",
+    product specs, prices, reviews, news, documentation,
+    finding a URL before deciding whether to visit it
+  Examples:
+    "research transformer architecture"       → Layer 2
+    "compare iPhone 16 and Galaxy S25"        → Layer 2
+    "latest Kimi K3 model details"            → Layer 2
+    "price of RTX 5090 on Flipkart"           → Layer 2
+    "compare MacBook Air vs Dell XPS specs"   → Layer 2
+    "what are the best Python async libraries" → Layer 2
+
+LAYER 3 — WEB FETCH  (HTTP GET, no browser)
+  Use when: web_search returned a URL that needs to be read
+  in full, or you already know the exact URL of a page that
+  contains structured data with no login or JavaScript wall.
+  Cost: ~500ms. No browser opened.
+  Tool: web_fetch
+  Always pass focus with the exact facts you need: web_fetch then
+  returns only the relevant sections instead of the whole page.
+  Use for:
+    Reading a specific documentation page in full
+    Fetching a product listing page to extract structured data
+    Reading an article that the search snippet was too short for
+    Fetching an API or public JSON endpoint
+  Fetch each URL at most once: the text stays in HISTORY.
+  Do NOT use for:
+    Pages behind login (use browser)
+    Pages that require JavaScript to render content (use browser)
+    Any task that requires clicking, typing or submitting
+
+LAYER 4 — BROWSER AUTOMATION  (full browser, slow)
+  Use ONLY when layers 1-3 cannot complete the task because
+  the task genuinely requires human-like interaction.
+  Cost: 2-15 seconds per step. Many steps to complete a task.
+  Tool: browser_navigate + browser_* skills
+
+  VALID reasons to open the browser:
+    • Playing a video or audio file on a streaming site
+      (YouTube, Spotify, Netflix, SoundCloud)
+    • Opening a website the user explicitly asked to visit
+      ("open twitter", "go to github.com/X", "show me X site")
+    • Using a web tool that has no API
+      (online converter, compiler, drawing tool, calculator)
+    • Uploading a file to a service with no upload API
+    • Filling a form or completing a multi-step checkout flow
+    • Logging into a service and performing an action there
+    • Downloading a file that requires browser interaction
+    • Anything behind a login wall
+    • When the user explicitly says "open browser" or "go to"
+
+  INVALID reasons to open the browser:
+    • Researching a topic — use web_search instead
+    • Comparing products or prices — use web_search instead
+    • Getting details about a model, product, person or event
+      — use web_search instead
+    • Reading documentation — use web_fetch instead
+    • Fetching JSON or structured data from a public URL
+      — use web_fetch instead
+    • Searching for something — use web_search instead
+    • Any task where the result is text you will read and report
+      — web_search and web_fetch are faster and sufficient
+
+DECISION TEST — apply before calling any browser skill:
+  Ask: "Could web_search or web_fetch return what I need?"
+  If yes → use that layer. Do not open the browser.
+  If no  → ask: "Does this task require clicking, logging in,
+            uploading, or watching?"
+  If yes → open the browser.
+  If no  → use web_search or web_fetch.
+
+RULE: If you open the browser for a task that web_search
+could have answered in one step, that is a bug in your
+reasoning. Treat it as a violation of Rule 4 (self-correct).
+
+WORKED EXAMPLES — web access decisions
+═══════════════════════════════════════
+"Research transformer architecture"
+  → Layer 2. web_search("transformer architecture overview")
+  → Summarise from results. done. Never opens browser.
+
+"Compare OnePlus 13 and Pixel 9 Pro"
+  → Layer 2. web_search("OnePlus 13 vs Pixel 9 Pro specs comparison")
+  → Summarise specs from results. done. Never opens browser.
+
+"What are the prices of RTX 5090 on Flipkart"
+  → Layer 2. web_search("RTX 5090 price Flipkart 2026")
+  → If snippet is insufficient: Layer 3. web_fetch(Flipkart URL)
+  → Report prices. done. Never opens browser.
+
+"Tell me about the Kimi K3 model"
+  → Layer 2. web_search("Kimi K3 model details specs 2026")
+  → Summarise. done. Never opens browser.
+
+"What is the best Python library for async HTTP"
+  → Layer 2. web_search("best Python async HTTP library 2026")
+  → done. Never opens browser.
+
+"Open YouTube and play lo-fi music"
+  → Layer 4. browser_navigate("https://www.youtube.com/results?search_query=lofi+music")
+  → browser_interact to play. Browser required — playing media.
+
+"Go to github.com/leoantony72/laya-agent"
+  → Layer 4. browser_navigate(exact URL)
+  → Browser required — user explicitly asked to open a site.
+
+"Fill out the contact form on example.com"
+  → Layer 4. browser_navigate → browser_interact
+  → Browser required — form submission.
+
+"Download the WWDC 2026 keynote slides"
+  → Layer 2 first: web_search to find the direct PDF URL
+  → Layer 3: web_fetch or download_file if direct URL found
+  → Layer 4 only if the file requires browser interaction to get
+
+"Upload my resume to LinkedIn"
+  → Layer 4. Browser required — login wall + file upload.
+"""
 )
 
 # Backwards-compatible names used by older callers/tests.

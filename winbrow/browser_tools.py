@@ -124,12 +124,12 @@ def get_browser_tools():
         Tool(
             name="browser_navigate",
             description=(
-                "Open a URL in the agent's own dedicated browser tab, wait for "
-                "it to render, and return the page title, URL, visible text and "
-                "links. The first navigation of a task creates the agent tab; "
-                "later calls reuse it. It returns the new page state, so a "
-                "separate browser_read_page call is not needed immediately "
-                "after it."
+                "Open a URL in the real browser. Use ONLY when the task requires "
+                "actual interaction: playing media, uploading files, filling "
+                "forms, logging in, using a web tool, or when the user explicitly "
+                "asked to open a site. For research, comparison, or reading — use "
+                "web_search or web_fetch instead. Every call opens a real browser "
+                "tab and costs multiple steps."
             ),
             script="",
             impl=BROWSER_IMPL,

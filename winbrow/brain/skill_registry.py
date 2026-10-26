@@ -60,6 +60,8 @@ PREFERRED_ORDER = (
     "create_text_file",
     "run_command",
     "screen_read_text",
+    "web_search",
+    "web_fetch",
     "remember_fact",
     "recall_memory",
     "build_tool",

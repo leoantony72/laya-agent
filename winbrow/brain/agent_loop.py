@@ -904,7 +904,12 @@ class AgentBrain:
                 # budget and hides the rest of the task; nudge it forward.
                 # Reads/waits are exempt: re-reading is how the planner sees a
                 # page that finished loading after the first read.
-                if sig in done_sigs and skill not in REPEATABLE_SKILLS:
+                escalate_fetch = (
+                    sig in done_sigs
+                    and skill == "web_fetch"
+                    and _is_fetch_escalation(history, args)
+                )
+                if sig in done_sigs and skill not in REPEATABLE_SKILLS and not escalate_fetch:
                     repeats[sig] = repeats.get(sig, 0) + 1
                     if repeats[sig] >= 3:
                         result.kind = "action"
@@ -914,17 +919,25 @@ class AgentBrain:
                             f"succeeded. {self._history_summary(history)}"
                         ).strip()
                         return result
-                    coaching = (
-                        f"'{skill}' with those exact arguments ALREADY SUCCEEDED — "
-                        "it is in HISTORY. Do NOT repeat it. Emit the NEXT action needed, "
-                        "or done only if every part of GOAL is complete."
-                    )
+                    if skill == "web_fetch":
+                        coaching = (
+                            f"You already fetched {_fetch_url_of(args)} successfully; "
+                            "its text is in HISTORY. Do NOT fetch that URL again. "
+                            "Use the text you already have, fetch a DIFFERENT source, "
+                            "or answer if the evidence is sufficient."
+                        )
+                    else:
+                        coaching = (
+                            f"'{skill}' with those exact arguments ALREADY SUCCEEDED — "
+                            "it is in HISTORY. Do NOT repeat it. Emit the NEXT action needed, "
+                            "or done only if every part of GOAL is complete."
+                        )
                     prior = next(
                         (s for s in reversed(history)
                          if s.success and _step_signature(s.skill, s.args) == sig),
                         None,
                     )
-                    if prior and prior.output:
+                    if prior and prior.output and skill != "web_fetch":
                         coaching = (
                             f"'{skill}' with those exact arguments ALREADY SUCCEEDED. "
                             f"Its result was: {prior.output[:300]} "
@@ -932,6 +945,8 @@ class AgentBrain:
                         )
                     log.info(f"Planner repeated completed step '{skill}'; re-planning with feedback.")
                     break
+                if escalate_fetch:
+                    log.info(f"Allowing one larger re-fetch of {_fetch_url_of(args)} (truncated).")
 
                 step_res = await self._run_step(skill, args, why, ctx=ctx)
                 result.steps.append(step_res)
@@ -1565,8 +1580,44 @@ def inject_skill_detail(
     return None
 
 
+def _fetch_url_of(args: dict) -> str:
+    return str((args or {}).get("url") or "").strip()
+
+
+def _is_fetch_escalation(history: List[BrainStepResult], args: dict) -> bool:
+    """Allow ONE re-fetch of a truncated URL with a larger max_chars.
+
+    Any other repeat of the same URL is redundant: the earlier text is already
+    in HISTORY, so refetching only burns steps and context.
+    """
+    url = _fetch_url_of(args)
+    if not url:
+        return False
+    priors = [
+        step for step in history
+        if step.success and step.skill == "web_fetch"
+        and _fetch_url_of(step.args) == url
+    ]
+    if not priors or len(priors) >= 2:
+        return False
+    prior = priors[-1]
+    if "TRUNCATED" not in (prior.output or ""):
+        return False
+    try:
+        prior_limit = int(str(prior.args.get("max_chars") or 12000))
+        new_limit = int(str(args.get("max_chars") or 12000))
+    except (TypeError, ValueError):
+        return False
+    return new_limit > prior_limit
+
+
 def _step_signature(skill: str, args: dict) -> tuple:
     """Stable identity for a step, used to detect repeats of completed work."""
+    args = dict(args or {})
+    if skill == "web_fetch":
+        # The same URL is the same work regardless of max_chars; escalating a
+        # truncated fetch is allowed separately by _is_fetch_escalation.
+        args = {"url": _fetch_url_of(args)}
     try:
         args_key = json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
     except Exception:

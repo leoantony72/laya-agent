@@ -1184,7 +1184,9 @@
         <div class="field">
             <label>Provider</label>
             <select id="providerSelect" class="input">
-                <option value="auto">Auto (offline synthesizer, or OpenAI/Gemini if a key is set)</option>
+                <option value="auto">Auto (Nebius → OpenRouter → OpenAI → local)</option>
+                <option value="nebius">Nebius Token Factory</option>
+                <option value="openrouter">OpenRouter</option>
                 <option value="ollama">Ollama (localhost:11434)</option>
                 <option value="lmstudio">LM Studio (localhost:1234/v1)</option>
                 <option value="openai">OpenAI (gpt-4o-mini)</option>
@@ -1193,7 +1195,7 @@
         </div>
         <div class="field">
             <label>API key</label>
-            <input type="password" id="apiKeyInput" class="input" placeholder="sk-... (OpenAI) or AIza... (Gemini)" />
+            <input type="password" id="apiKeyInput" class="input" placeholder="Nebius / OpenRouter / OpenAI / Gemini API key" />
         </div>
         <div class="field">
             <label>Gemini Project ID (optional, for Vertex AI)</label>

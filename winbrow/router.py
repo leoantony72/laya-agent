@@ -1551,24 +1551,24 @@ class WinBrowRouter:
                              confidence=0.9, latency_ms=elapsed_ms,
                              tier="heuristic")
 
-        # --- ULTRAFAST BROWSER TASKS (flights, booking, shopping, form fill, deep search & extract) ---
-        _ULTRAFAST_KEYWORDS = [
-            "flight", "flights", "book flight", "book a flight", "booking",
-            "hotel", "book hotel", "airbnb", "expedia", "kayak",
+        # --- BROWSER INTERACTION TASKS (booking, checkout, forms, login) ---
+        _BROWSER_ACTION_KEYWORDS = [
             "buy", "purchase", "order", "add to cart", "checkout", "check out",
-            "fill form", "fill out", "login to", "sign in to",
+            "fill form", "fill out", "login to", "sign in to", "sign up",
+            "register", "subscribe", "download from",
             "ultrafast", "laya-ultrafast", "automate browser",
-            "find details", "show details", "recipe", "extract details",
-            "search on", "find on", "search for",
         ]
-        is_flight_task = any(k in lower for k in ["flight", "flights", "fly to", "fly from", "airline", "book a flight", "book flight"])
-        is_booking_task = any(k in lower for k in ["book ", "booking", "hotel", "airbnb", "expedia"])
-        is_interactive_search = (
-            any(k in lower for k in ["search on", "find on", "recipe", "show details", "find details", "buy ", "order "])
-            or lower.startswith("search for ")
-            or (any(lower.startswith(p) for p in ("search ", "find ", "look up ")) and any(k in lower for k in ["detail", "price", "how to", "recipe", "flight", "ticket", "book", "japan", "curry"]))
-        )
-        if is_flight_task or is_booking_task or is_interactive_search or any(k in lower for k in _ULTRAFAST_KEYWORDS):
+        is_flight_task = any(k in lower for k in [
+            "book a flight", "book flight", "flight booking", "booking a flight",
+            "reserve a flight", "reserve flight",
+        ]) or ("flight" in lower and any(k in lower for k in ("book", "booking", "reserve")))
+        is_booking_task = any(k in lower for k in [
+            "book ", "booking", "reserve",
+        ]) and any(k in lower for k in (
+            "hotel", "airbnb", "expedia", "flight", "room", "stay",
+        ))
+        is_browser_action = any(k in lower for k in _BROWSER_ACTION_KEYWORDS)
+        if is_flight_task or is_booking_task or is_browser_action:
             t = self.registry.get("laya_ultrafast_browser")
             if t:
                 return Route(kind="tool", tool=t, args={"goal": cleaned}, confidence=0.96, latency_ms=elapsed_ms, tier="heuristic")
@@ -1588,16 +1588,15 @@ class WinBrowRouter:
         
         is_web_search = (has_search_verb and has_web_location) or starts_with_search
         
-        # Exclude local file searches
+        # Exclude local file searches. Research/search always uses the API tool,
+        # never the browser.
         if is_web_search and not any(t in _LOCAL_FIND for t in tokens):
-            t = self.registry.get("laya_ultrafast_browser")
+            t = self.registry.get("web_search")
             if t:
-                return Route(kind="tool", tool=t, args={"goal": cleaned}, confidence=0.96, latency_ms=elapsed_ms, tier="heuristic")
-            query = web_search_query(cleaned)
-            if query:
-                t = self.registry.get("web_search")
-                if t:
-                    return Route(kind="tool", tool=t, args={"query": query}, confidence=0.92, latency_ms=elapsed_ms, tier="heuristic")
+                query = web_search_query(cleaned)
+                if query:
+                    return Route(kind="tool", tool=t, args={"query": query}, confidence=0.96, latency_ms=elapsed_ms, tier="heuristic")
+            return Route(kind=NEW_ACTION, confidence=0.6, latency_ms=elapsed_ms, tier="web_search_unavailable")
 
         # --- APP LAUNCH / FOCUS (fuzzy matching against known apps) ---
         # Check for open/launch/switch/focus/start + app name
@@ -1740,12 +1739,21 @@ class WinBrowRouter:
             if t:
                 return Route(kind="tool", tool=t, args={"search_term": term}, confidence=0.85, latency_ms=elapsed_ms, tier="heuristic")
 
-        # --- OPEN URL directly (https://...) ---
+        # --- OPEN / FETCH A URL ---
         url_match = re.search(r"(https?://\S+|[\w\-]+\.(com|org|net|io|dev|ai|gov|edu|co|me|app)[\S]*)", cleaned, re.IGNORECASE)
         if url_match:
-            t = self.registry.get("web_search")
+            url = url_match.group(0)
+            read_verbs = ("fetch", "read ", "summarize", "analyse", "analyze", "extract")
+            if any(verb in lower for verb in read_verbs):
+                t = self.registry.get("web_fetch")
+                if t:
+                    return Route(kind="tool", tool=t, args={"url": url}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+            t = self.registry.get("browser_navigate")
             if t:
-                return Route(kind="tool", tool=t, args={"query": url_match.group(0)}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+                return Route(kind="tool", tool=t, args={"url": url, "new_tab": "true"}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
+            t = self.registry.get("web_fetch")
+            if t:
+                return Route(kind="tool", tool=t, args={"url": url}, confidence=0.8, latency_ms=elapsed_ms, tier="heuristic")
 
         # No heuristic match
         return Route(kind=NEW_ACTION, confidence=0.5, latency_ms=elapsed_ms, tier="heuristic")
@@ -1887,8 +1895,8 @@ class WinBrowRouter:
                 if t:
                     return Route(kind="tool", tool=t, args={"folder": hit}, confidence=0.9, latency_ms=elapsed_ms, tier="heuristic")
 
-        # Web Search / Browser query (exact intent fallback when Laya times out).
-        if any(w in lower for w in ["search", "google", "look up", "find results", "on the web", "in the web", "ultrafast", "browse"]):
+        # Web Search query (exact intent fallback when Laya times out).
+        if any(w in lower for w in ["search", "google", "look up", "find results", "on the web", "in the web"]):
             q = _strip_conversational_prefix(cleaned)
             for p in ["search for ", "search ", "find results for ", "find ", "look up ", "google ", "open "]:
                 if q.lower().startswith(p):

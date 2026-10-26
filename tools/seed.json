@@ -138,27 +138,6 @@
     "speak": "done"
   },
   {
-    "name": "web_search",
-    "description": "Search the web using Google or navigate directly to a website.",
-    "examples": [
-      "search google for weather in Tokyo",
-      "open youtube.com",
-      "search for latest news"
-    ],
-    "scope": null,
-    "args": [
-      {
-        "name": "query",
-        "kind": "text",
-        "instructions": "What to search for or URL to navigate to?",
-        "criteria": {},
-        "default": "google.com"
-      }
-    ],
-    "script": "\n            python -c \"import asyncio; from winbrow.agent import WinBrowAgent; agent = WinBrowAgent(); print(asyncio.run(agent.browser.run_ultrafast_task(r'{{query}}')))\"\n            ",
-    "speak": "done"
-  },
-  {
     "name": "windows_settings",
     "description": "Open specific Windows 10/11 Settings panes like sound, network, bluetooth, or display.",
     "examples": [

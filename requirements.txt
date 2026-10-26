@@ -16,5 +16,12 @@ rapidfuzz>=3.9
 sounddevice
 onnxruntime
 pyyaml
+# Native web access (web_search / web_fetch); no browser required
+requests>=2.31
+beautifulsoup4>=4.12
+# Browser TLS/HTTP2 fingerprint for web_search (DuckDuckGo blocks plain requests)
+curl_cffi>=0.7,<1
+# Main-content extraction for web_fetch (removes nav/ads before the planner)
+trafilatura>=2.0,<3
 # Document reading: PDF, PPTX, DOCX, XLSX/XLS, CSV, Markdown, HTML, JSON, EPUB
 markitdown[pdf,docx,pptx,xlsx,xls]>=0.1.5

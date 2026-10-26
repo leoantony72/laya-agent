@@ -3,6 +3,7 @@ knowledge: 04-request-data-flow
 last_verified: 2026-10-25
 source_files:
   - winbrow/agent.py
+  - winbrow/web_tools.py
   - winbrow/router.py
   - winbrow/brain/agent_loop.py
   - winbrow/brain/model_gateway.py
@@ -27,47 +28,65 @@ HTTP /api/execute or voice
         │
         ▼
 WinBrowAgent.execute()
-  1. pending permission yes/no?          agent.py:1059-1085
-  2. approved replay skill?              agent.py:1087-1167
-  3. capture Windows context (thread)    agent.py:1169-1172
-  4. MCP direct shortcuts                agent.py:1194-1331
-  5. browser fast path → brain loop      agent.py:1337-1370
-     or ultrafast one-shot               agent.py:1373-1404
-  6. router.route()                      agent.py:1406
-  7. dispatch / NEW_ACTION / CHAT / STOP agent.py:1431-1544
-  8. record history, session, store       agent.py:1549-1566
-  9. learn corrections, trace             agent.py:1568-1606
+  1. pending permission yes/no?          (control path)
+  2. capture Windows context (thread)
+  3. BRAIN FIRST (provider available)    agent.py:_execute_brain_goal
+     browser intent → handle_browser_task
+     everything else → brain.handle
+  4. legacy fallback only if the brain is unavailable or provider fails:
+     approved replay skill?
+     MCP direct shortcuts
+     browser fast path / ultrafast one-shot
+     router.route()
+  5. record history, session, store
+  6. learn corrections, trace
 ```
+
+`WINBROW_BRAIN_FIRST=0` disables the brain-first path (legacy behavior).
+`WINBROW_BRAIN_FIRST` defaults to `1`.
 
 ## 2. Step detail
 
-### 2.1 Pending permission replies (`:1059-1085`)
+### 2.1 Pending permission replies
 
 If the whole utterance is yes/approve/confirm/allow/proceed/go ahead/do it/sure/yep/ok do it/accept,
 the most recent pending action is approved, consumed, and its original utterance is re-executed.
 `remember=True` only for T2. No/cancel/deny/reject/don't do it/dont denies and returns a `stop`
-result. This runs before all routing.
+result. This runs before the brain.
 
-### 2.2 Procedural replay (`:1087-1167`)
+### 2.2 Brain first
 
+When a model provider is available, every request goes to `_execute_brain_goal()` before replay,
+MCP shortcuts, the browser fast path, or the router:
+
+- browser-intent utterances use `handle_browser_task()` (fresh agent tab + browser step budget);
+- everything else uses `AgentBrain.handle()`;
+- the route tier is `brain_first`; a planner exception is `brain_first_error`;
+- a provider failure falls back to legacy routing; a normal brain result (including
+  `needs_input`/failure) is returned without an MCP shortcut.
+
+### 2.3 Procedural replay (legacy fallback)
+
+- Runs only when brain-first is disabled or the provider is unavailable.
 - `self.skills.find_match(utterance)` (only approved, Jaccard ≥ 0.66).
-- Browser intents are skipped (`:1098-1100`) and sent to the brain loop instead.
-- `_fill_skill_parameters()` maps the new utterance onto the stored `{{parameter}}` templates; missing parameters
-  abort replay.
+- Browser intents are skipped and sent to the brain loop instead.
+- `_fill_skill_parameters()` maps the new utterance onto the stored `{{parameter}}` templates;
+  missing parameters abort replay.
 - Steps run through `run_skill()` in order, max 12; first failure stops replay.
 - All success → `mark_used`, confidence 1.0, tier `replay`, return immediately.
 - Any failure → fall through to normal routing.
 
-### 2.3 Context capture (`:1169-1172`)
+### 2.4 Context capture
 
 `get_context()` runs in an executor because process enumeration + COM volume reads take 15–600 ms.
 `WindowsContext` fields: `active_app`, `active_title`, `running_apps`, `volume_level`, `is_muted`,
 `dark_mode`, `battery_percent`, `battery_plugged`. `to_dict()` caps running apps at 15 and formats
 battery as a string.
 
-### 2.4 MCP direct shortcuts (`:1194-1331`)
+### 2.5 MCP direct shortcuts (legacy fallback)
 
-Runs only when the command is not multi-step and not interactive. Covers:
+Runs only when brain-first is unavailable and the command is not multi-step and not interactive.
+Covers:
 
 - dictionary definitions (`define X`, `meaning of X`);
 - Wikipedia summary/search;
@@ -79,10 +98,12 @@ Runs only when the command is not multi-step and not interactive. Covers:
 These bypass the router and brain, return `tier="mcp_shortcut"`, confidence 0.95 (or 0.9 for some
 paths). They exist so high-confidence lookups do not spend a planner call.
 
-### 2.5 Browser fast path (`:1174-1404`)
+### 2.5 Browser fast path (`:1383-1430`)
 
-`_is_browser_intent()` (`:90`) and `_is_interactive_task()` (`:133`) classify the utterance. A
-simple search is excluded if it mentions tab/reload/scroll/screenshot/find on page/incognito.
+`_is_browser_intent()` (`:117`) and `_is_interactive_task()` classify the
+utterance. Research, search, comparison, price lookup, and documentation
+reading are **excluded** by design; those go to `web_search`/`web_fetch` or the
+brain. Site names only count when paired with an explicit open/go/visit verb.
 Multi-step intents bypass this path entirely.
 
 - If the gateway is available and the command is not multi-step: `handle_browser_task()` (`:535`)
@@ -91,6 +112,8 @@ Multi-step intents bypass this path entirely.
 - If the brain fails/unavailable: `browser.run_ultrafast_task(utterance)`; tier
   `laya_ultrafast`, confidence 0.98.
 - All browser tasks use the same observe→act→verify loop; there are no task-type tiers.
+- The WEB ACCESS HIERARCHY in `SYSTEM_PROMPT_STATIC` decides whether the brain
+  should use web_search, web_fetch, or browser_navigate.
 
 ### 2.6 Router (`:1406`)
 
@@ -121,8 +144,9 @@ Order inside `route()`:
 
 Heuristic branch order: STOP → multi-step → Wikipedia → URL fetch → editor type/save → create file →
 URL download → winget → volume → lock → app launch → open folder/file → close folder → play/watch →
-ultrafast keywords → web search → launch prefix → window action → settings → screenshot → clipboard →
-time → network → battery → dark mode → media keys → find files → bare URL → NEW_ACTION.
+browser interaction (booking/checkout/form/login) → web search (web_search) → launch prefix → window action → settings → screenshot → clipboard →
+time → network → battery → dark mode → media keys → find files → bare URL (browser_navigate or
+web_fetch if read/fetch verb) → NEW_ACTION.
 
 ### 2.7 Dispatch (`:1431-1544`)
 
@@ -181,16 +205,20 @@ Classification:
 2. Render script templates **before** the gate so content-based tiering sees real args.
 3. Permission gate.
 4. Special cases: `create_text_file` (`files.write_named_text_file`), `volume_set_level`,
-   `laya_ultrafast_browser`/`web_search`, `app_focus_or_launch`, `type_text`.
+   `laya_ultrafast_browser`, `app_focus_or_launch`, `type_text`.
 5. `impl` dispatch:
    - `COMPUTER_IMPL` → async override map or `execute_computer_tool`; OCR goes through
      `asyncio.to_thread`.
    - `ADAPTER_IMPL` → `execute_adapter_tool`.
    - `SHELL_IMPL` → `execute_shell_tool`.
    - `DOCUMENT_IMPL` → `asyncio.to_thread(execute_document_tool)`.
+   - `WEB_IMPL` → `execute_web_tool_async` (`web_search`/`web_fetch`; never opens the browser).
    - `BROWSER_IMPL` → `execute_browser_tool` (20 s cap).
    - `INSTALLER_IMPL` → `INSTALL_OPS[name]`, then consume the one-shot approval.
    - `MCP_IMPL` → `execute_mcp_tool`.
+   - `SKILL_SCRIPTS_IMPL` → allowlisted bundled helper.
+   - `INTEGRATION_IMPL` → `integration_status`.
+   - `SUBAGENT_IMPL` → `SubagentManager.execute`.
 6. Otherwise: render and `run_powershell(rendered)`.
 
 All impls return a dict with at least `success` and `output`; the dispatcher adds `type`/`tool`.
@@ -239,9 +267,13 @@ warning text so the loop can force a clarify instead of spinning.
 
 ## 7. Model gateway (`brain/model_gateway.py`)
 
-- Provider chain is built in `_build_chain()` (`:506`): OpenRouter → OpenAI → local, depending on
-  keys and `WINBROW_BRAIN_PROVIDER`.
-- `chat()` (`:581`) sends OpenAI-compatible requests, retries transient errors, and handles empty
+- Provider chain is built in `_build_chain()`: Nebius Token Factory → OpenRouter → OpenAI → local,
+  depending on keys and `WINBROW_BRAIN_PROVIDER`. `NEBIUS_API_KEY` alone puts Nebius first in
+  `auto`; set `WINBROW_BRAIN_PROVIDER=nebius` to force it.
+- Nebius uses the OpenAI-compatible base `https://api.tokenfactory.nebius.com/v1` and translates
+  the shared reasoning policy to `reasoning_effort` (medium for structured calls, none for chat,
+  low for capped retries).
+- `chat()` sends OpenAI-compatible requests, retries transient errors, and handles empty
   content caused by reasoning-token exhaustion.
 - Reasoning config (`get_reasoning_config`, `:85`): default total 16000 / reasoning 2000; browser
   turns 8000 / 600.

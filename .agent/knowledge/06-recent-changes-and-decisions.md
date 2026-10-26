@@ -6,6 +6,7 @@ source_files:
   - winbrow/brain/skill_writer.py
   - winbrow/brain/agent_loop.py
   - winbrow/brain/skill_registry.py
+  - winbrow/brain/model_gateway.py
   - winbrow/skill_scripts.py
   - winbrow/integrations.py
   - winbrow/subagents.py
@@ -143,9 +144,11 @@ D9. **Two independent skill memories.** Brain markdown skills (writer) and proce
 D10. **Post-session skill writer is asynchronous and conservative.** Minimum 3 successful steps,
 specificity guards, no overwrite, hot reload, all exceptions swallowed.
 
-D11. **Cloud-first brain with optional local fallback.** OpenRouter/DeepSeek default; llama.cpp/Qwen
-only when explicitly enabled. Reasoning budgets are capped because hidden reasoning consumes
-`max_tokens`.
+D11. **Cloud-first brain with optional local fallback.** Nebius Token Factory
+(`NEBIUS_API_KEY`, OpenAI-compatible `https://api.tokenfactory.nebius.com/v1`)
+is first in auto; OpenRouter/DeepSeek remains a fallback. llama.cpp/Qwen only
+when explicitly enabled. Reasoning budgets are capped because hidden reasoning
+consumes `max_tokens`; Nebius maps the shared policy to `reasoning_effort`.
 
 D12. **Windows-native execution.** PowerShell + COM + UIA + ctypes, with app adapters rather than a
 generic GUI framework. `policy.py` is a safety net, not a sandbox.
@@ -234,7 +237,7 @@ Added 43 playbooks from the six requested awesome-claude-skills sections:
 
 Verified in this session: 24 focused tests (`test_playbooks`,
 `test_converted_skills`, `test_integrations`, `test_integrations_api`,
-`test_skill_writer`) passed; 65 skill definitions load; metadata is ~9,060 chars.
+`test_skill_writer`) passed; 69 skill definitions load; metadata is ~9,626 chars.
 The document/media helpers were smoke-tested for PDF, PPTX, XLSX, EPUB, CSV,
 PNG, and GIF. DOCX and the credential-gated integrations were not exercised
 end-to-end because their optional packages/accounts are not installed here.
@@ -262,3 +265,139 @@ Added `winbrow/subagents.py` + `winbrow/skills/delegate-task/SKILL.md`:
 - Tests: `winbrow/tests/test_subagents.py` covers profile filtering, scoped
   registry, blocked children, parallel fallback, real child-brain execution, and
   the API/UI surface. No live model call was made.
+
+## 10. Web access hierarchy (2026-10-26)
+
+The browser was opening for research because the old `web_search` seed tool ran
+`laya_ultrafast_browser`, the router preferred `laya_ultrafast_browser` for
+searches, and the agent browser fast path treated `search` as a browser
+keyword.
+
+Fixed:
+
+- `winbrow/web_tools.py` adds native `web_search` (DuckDuckGo HTML API) and
+  `web_fetch` (HTTP GET + BeautifulSoup/PyMuPDF), both T0 and browser-free. The
+  old seed `web_search` was removed.
+- `SYSTEM_PROMPT_STATIC` ends with the verbatim WEB ACCESS HIERARCHY + WORKED
+  EXAMPLES, so it sits immediately before the AVAILABLE SKILLS system block.
+- The router sends search/price/comparison/documentation to
+  `web_search`/`web_fetch`; only booking/checkout/form/login/media/explicit-open
+  routes to the browser.
+- `_is_browser_intent` no longer matches bare research/search/site words; site
+  names require an explicit open/go/visit verb.
+- `web_search` and `web_fetch` have SKILL.md descriptions ending in
+  "No browser opened"; `browser_navigate` is interaction-only.
+- `.claude/knowledge/session-patterns.md` records the web-access pattern table.
+
+Verification: `test_web_tools.py` (9 tests) covers DDG parsing, browser-free
+descriptions, prompt ordering, browser-intent negatives, router
+search-vs-booking, and session-patterns. No live network test was run.
+
+## 11. Brain-first routing (2026-10-26)
+
+`WinBrowAgent.execute()` now attempts the brain before replay, MCP shortcuts,
+the browser fast path, or the router whenever a provider is available.
+
+- `_execute_brain_goal()` uses `handle_browser_task()` for browser-intent
+  utterances and `AgentBrain.handle()` for everything else.
+- Route tier is `brain_first`; a planner exception is `brain_first_error`. A
+  normal brain result (including `needs_input`) is returned immediately.
+- Replay is skipped when brain-first is active. MCP shortcuts, browser fast
+  path, and router remain fallbacks only when the provider is unavailable or
+  fails (`GatewayUnavailable`/`GatewayError`).
+- `WINBROW_BRAIN_FIRST` defaults to `1`; set `0` only to debug legacy routing.
+- Tests: `test_brain_first.py` proves an MCP shortcut is not used when the brain
+  is available and that a planner exception does not fall through to MCP.
+
+## 12. Web search transport: curl_cffi TLS impersonation (2026-10-26)
+
+DuckDuckGo started serving plain `requests` clients an HTTP 202 "Select all
+squares containing a duck" challenge, so `web_search` returned zero results on
+both `html.duckduckgo.com` and `lite.duckduckgo.com`. The CSS selectors and the
+existing parsers were still correct.
+
+Fixed:
+
+- `winbrow/web_tools.py` keeps the DDG HTML/Lite parsers and replaces the
+  `requests` transport with `curl_cffi` (browser TLS/HTTP2 impersonation).
+  Measured before/after: `requests` → 202 challenge; `curl_cffi` chrome124 →
+  200 with 10 parsed results in ~0.8s.
+- Challenges are detected by status (202/403/429) and body markers, then
+  retried up to 3 times alternating `chrome124` → `safari17_0` with 0.6s/1.2s
+  backoff. A challenged identity happens intermittently under rapid queries.
+- One budget (`WINBROW_SEARCH_TIMEOUT`, default 20s) is shared by both DDG
+  endpoints; each gets half. Fingerprint order is `WINBROW_TLS_IMPERSONATE`.
+- `web_fetch` uses the same transport (falls back to `requests` only when
+  `curl_cffi` is missing) because impersonation also clears site 403s.
+- `web_search` now also returns `provider` and `transport`
+  (e.g. `curl_cffi:chrome124`). The failure text, including "Do not open the
+  browser for research", is unchanged.
+- `curl_cffi` is in `requirements.txt` and in `integrations.DEPENDENCIES` so the
+  Integrations UI install command includes it.
+
+Non-goals: no SearXNG/Docker (not installed on the target machine), no Brave or
+other keyed API, no Google scraping (Google serves a JS-only interstitial even
+to curl_cffi), no extra providers or ports.
+
+Verification: `test_web_tools.py` adds challenge detection, retry, lite-endpoint
+fallback, missing-dependency, and failure-message tests; the live DuckDuckGo
+test is opt-in via `WINBROW_LIVE_TESTS=1`. A live query returned 10 results.
+
+## 13. Research loop fix: web history budget + URL repeat guard (2026-10-26)
+
+A 12-step Kimi K3.1 Pro research run re-ran `web_search` four times and fetched
+the same two URLs repeatedly. The cause was history compression, not the
+planner: `format_history` capped every non-document step at
+`RECENT_OUTPUT_LIMIT` (400 chars). `web_search` therefore showed ~2 of 5
+results, and `web_fetch` showed only the first 400 chars of a 12k-char page.
+Refetching with a larger `max_chars` produced the same 400-char prefix, so the
+model could never see more and kept trying.
+
+Fixed:
+
+- `winbrow/utils/history.py` gives web output its own newest-first budgets:
+  `web_search` 3k per step / 6k total; `web_fetch` 20k per step / 30k total.
+  Documents keep 30k/60k; every other tool stays terse at 400 chars.
+- `_step_signature` identifies `web_fetch` by URL only, so a different
+  `max_chars` no longer bypasses the completed-step guard.
+  `_is_fetch_escalation` still allows ONE larger re-fetch of a truncated page
+  (hard cap: two successful fetches per URL), then guards again.
+- Prompt rule 22 and the web-search/web-fetch SKILL.md step patterns state the
+  budget: one search, 2-3 fetches, never the same URL twice, answer once two
+  sources agree.
+- Tests: `winbrow/tests/test_research_loop.py` covers web text surviving
+  compression, newest-first budgets, terse non-web output, URL-only signatures,
+  and the one-time escalation rule.
+
+## 14. Web fetch: main-content extraction + focus selection (2026-10-26)
+
+`web_fetch` returned raw BeautifulSoup text (nav, cookie banners, footers) up to
+12k chars. The planner only needs the part that answers the question.
+
+Added:
+
+- `trafilatura` (Apache-2.0, ~1 MB, no model) extracts main content as Markdown
+  with headings, tables, and code preserved. Fallback: the old
+  `_html_to_text()` when extraction is empty/short, `trafilatura` is missing, or
+  the page is not HTML. Measured: MDN 153k HTML → 2.6k text; Wikipedia 383k →
+  16.7k; kimi.ai blog 20.9k → 5.5k after focus selection.
+- `web_fetch(url, max_chars, focus="")`: with `focus`, a dependency-free BM25
+  ranks Markdown sections and keeps the intro plus the best sections up to
+  `WINBROW_FETCH_FOCUS_CHARS` (default 6000). A 15% quota preserves numeric /
+  price / date lines from otherwise-dropped sections under
+  "Additional relevant facts".
+- Login/JavaScript walls (`You signed in with another tab…`, Cloudflare
+  interstitials) now return `success=False` with a `browser_navigate` hint
+  instead of page chrome.
+- Output header adds `EXTRACTOR`, `RAW-CHARS`, and (when focused) `FOCUS` and
+  `SELECTED: k/n sections`; the result dict adds matching fields.
+- Prompt rule 22, the Layer 3 block, and the web-fetch/web-search SKILL.md files
+  instruct the planner to pass `focus` with the facts it needs.
+
+Deliberately not added: local LLM summarization (measured 7.4 prompt tok/s for
+the bundled Qwen 0.5B on this CPU — a 12k page takes minutes), LLMLingua-2
+(100M-600M model, deletes exact numbers), Dripper/ReaderLM (model inference),
+and Docker/SearXNG.
+
+Tests: `winbrow/tests/test_web_extract.py` covers extraction, fallback, BM25,
+section selection, fact retention, focus plumbing, and wall detection.

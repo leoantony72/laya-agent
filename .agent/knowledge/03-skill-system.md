@@ -90,8 +90,10 @@ everything as `kind="text"`, so frontmatter types are documentation, not enforce
    task completion.
 5. `load_skill_body()` reads the markdown below the frontmatter (`skill_registry.py:402-414`).
 
-Ordering: `PREFERRED_ORDER` (`:47-67`) puts 15 core skills first, then meta skills, then learned
-skills alphabetically. `CORE_SKILL_KEYS` = first 15; `META_SKILL_KEYS` = last 4.
+Ordering: `PREFERRED_ORDER` puts 15 core skills first, then meta skills
+(`web_search`, `web_fetch`, memory, build/repair, delegation), then learned
+skills alphabetically. `CORE_SKILL_KEYS` = first 15; `META_SKILL_KEYS` = the
+rest of `PREFERRED_ORDER`.
 
 Current inventory:
 
@@ -100,6 +102,14 @@ Current inventory:
 `create_text_file`, `find_files`, `mcp_filesystem_move_file`, `open_file`, `open_folder`,
 `read_document`, `recall_memory`, `remember_fact`, `repair_tool`, `run_command`,
 `screen_read_text`.
+
+**Native web access (2):** `web_search` and `web_fetch` (`winbrow/web_tools.py`,
+`impl="web"`, T0). No browser is opened. They use DuckDuckGo HTML/Lite search
+through a `curl_cffi` TLS/HTTP2-impersonated transport (plain `requests` gets an
+HTTP 202 bot challenge) and HTTP GET + Trafilatura main-content extraction
+(BeautifulSoup/PyMuPDF fallback). A `focus` question makes `web_fetch` return
+only the most relevant Markdown sections (~6k chars). A search provider failure
+is reported honestly; it never falls back to the browser for research.
 
 **Converted playbooks (43):** the six requested sections live under
 `winbrow/skills/library/<section>/<name>/SKILL.md`. Six document, five data,
@@ -315,7 +325,7 @@ The 43 converted skills are normal folder skills plus:
   will not replace it.
 - **Folder-name truncation:** `_slugify` caps at 60 chars; `create-folder-and-also-make-a-summ` is
   evidence that a garbled goal can become a permanent skill name.
-- **Metadata budget:** the block is now ~9,060 chars for 65 skills against a
+- **Metadata budget:** the block is now ~9,626 chars for 69 skills against a
   12,000-char limit. Adding many verbose playbooks will trigger the warning and
   a shorter ladder; measure after every batch.
 - **Playbook turn cost:** a playbook costs one extra planner turn because it is
