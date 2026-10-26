@@ -66,20 +66,44 @@ PREFERRED_ORDER = (
     "repair_tool",
 )
 
-META_DESC_LIMIT = 4000
+# The converted playbook library adds ~43 metadata entries. Playbooks are
+# guidance-only skills, so their trigger lines are deliberately shorter than
+# the core tool descriptions. 12,000 chars is roughly 3,000 tokens and leaves
+# room for the core 15 plus the six converted sections.
+META_DESC_LIMIT = 12000
+PLAYBOOK_DESC_LIMIT = 95
 CORE_SKILL_KEYS = frozenset(PREFERRED_ORDER[:15])
 META_SKILL_KEYS = frozenset(PREFERRED_ORDER[15:])
-# (core, meta, learned) description budgets. The first ladder rung that fits
-# under META_DESC_LIMIT wins, so the core 15 keep the richest triggers.
+# (core, meta, playbook, learned) description budgets. The first ladder rung
+# that fits under META_DESC_LIMIT wins, so the core 15 keep the richest
+# triggers and playbooks stay compact.
 _DESC_LADDER = (
-    (200, 130, 100),
-    (180, 120, 100),
-    (170, 110, 90),
-    (150, 95, 75),
-    (120, 80, 60),
+    (200, 130, 95, 100),
+    (180, 120, 90, 100),
+    (170, 110, 85, 90),
+    (150, 95, 80, 75),
+    (120, 80, 70, 60),
 )
 _VALID_ARG_TYPES = {"string", "bool", "int", "float", "number", "enum", "text"}
 _TYPE_ALIASES = {"text": "string", "enum": "string", "number": "float"}
+_VALID_SKILL_KINDS = {"tool", "playbook"}
+CATEGORY_ORDER = (
+    "document-processing",
+    "data-analysis",
+    "communication-writing",
+    "creative-media",
+    "productivity-organization",
+    "collaboration-project-management",
+)
+CATEGORY_LABELS = {
+    "document-processing": "DOCUMENT PROCESSING",
+    "data-analysis": "DATA & ANALYSIS",
+    "communication-writing": "COMMUNICATION & WRITING",
+    "creative-media": "CREATIVE & MEDIA",
+    "productivity-organization": "PRODUCTIVITY & ORGANIZATION",
+    "collaboration-project-management": "COLLABORATION & PROJECT MANAGEMENT",
+    "other": "OTHER PLAYBOOKS",
+}
 
 
 class SkillRegistryError(ValueError):
@@ -105,6 +129,10 @@ class SkillMeta:
     folder: str = ""
     source: str = "folder"    # "folder" | "learned"
     body: Optional[str] = None  # generated body for non-file skills
+    kind: str = "tool"        # "tool" | "playbook"
+    category: str = ""        # converted-library section slug
+    origin: str = ""          # upstream URL, provenance only
+    license: str = ""         # upstream license, provenance only
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +206,25 @@ def _load_skill_file(path: Path, folder_name: str, source: str = "folder") -> Sk
     name = str(data.get("name") or "").strip()
     skill = str(data.get("skill") or "").strip()
     description = str(data.get("description") or "").strip()
+    kind = str(data.get("kind") or "tool").strip().lower()
+    category = str(data.get("category") or "").strip().lower()
+    origin = str(data.get("source") or data.get("origin") or "").strip()
+    license_name = str(data.get("license") or "").strip()
     if not name:
         raise SkillRegistryError(f"{path}: frontmatter is missing 'name'")
     if not skill:
         raise SkillRegistryError(f"{path}: frontmatter is missing 'skill'")
     if not description:
         raise SkillRegistryError(f"{path}: frontmatter is missing 'description'")
+    if kind not in _VALID_SKILL_KINDS:
+        raise SkillRegistryError(
+            f"{path}: unsupported kind '{kind}' (expected one of "
+            f"{sorted(_VALID_SKILL_KINDS)})"
+        )
+    if kind == "playbook" and not skill.startswith("playbook_"):
+        raise SkillRegistryError(
+            f"{path}: playbook skills must use a 'playbook_' dispatcher key"
+        )
     if name != folder_name:
         raise SkillRegistryError(
             f"{path}: frontmatter name '{name}' does not match folder '{folder_name}'"
@@ -197,6 +238,10 @@ def _load_skill_file(path: Path, folder_name: str, source: str = "folder") -> Sk
         folder=str(path.parent.resolve()),
         source=source,
         body=body or None,
+        kind=kind,
+        category=category,
+        origin=origin,
+        license=license_name,
     )
 
 
@@ -341,29 +386,85 @@ def _ordered(registry: dict[str, SkillMeta]) -> list[SkillMeta]:
     )
 
 
-def _desc_limit(meta: SkillMeta, core: int, meta_limit: int, learned: int) -> int:
+def _is_playbook(meta: SkillMeta) -> bool:
+    return getattr(meta, "kind", "tool") == "playbook"
+
+
+def _category_key(meta: SkillMeta) -> str:
+    category = (getattr(meta, "category", "") or "other").strip().lower()
+    return category if category in CATEGORY_LABELS else "other"
+
+
+def _ordered_playbooks(registry: dict[str, SkillMeta]) -> list[SkillMeta]:
+    order = {name: index for index, name in enumerate(CATEGORY_ORDER)}
+    return sorted(
+        (meta for meta in registry.values() if _is_playbook(meta)),
+        key=lambda meta: (
+            order.get(_category_key(meta), len(order)),
+            meta.name.lower(),
+        ),
+    )
+
+
+def _desc_limit(
+    meta: SkillMeta, core: int, meta_limit: int, playbook: int, learned: int,
+) -> int:
     if meta.source == "learned":
         return learned
+    if _is_playbook(meta):
+        return playbook
     if meta.skill in CORE_SKILL_KEYS:
         return core
     return meta_limit
 
 
+def _render_skill_line(lines: list[str], meta: SkillMeta, limit: int) -> None:
+    lines.append(f"{meta.skill}  {_skill_args_label(meta.args)}")
+    lines.append(textwrap.fill(
+        _complete_clip(meta.description, limit),
+        width=76,
+        initial_indent="  ",
+        subsequent_indent="  ",
+    ))
+    lines.append("")
+
+
 def _render_skills_metadata(
-    registry: dict[str, SkillMeta], core: int, meta_limit: int, learned: int,
+    registry: dict[str, SkillMeta],
+    core: int,
+    meta_limit: int,
+    playbook: int,
+    learned: int,
 ) -> str:
     lines = ["AVAILABLE SKILLS", "════════════════"]
+    # Core tools and learned tools keep the original flat layout.
     for meta in _ordered(registry):
-        limit = _desc_limit(meta, core, meta_limit, learned)
-        lines.append(f"{meta.skill}  {_skill_args_label(meta.args)}")
-        wrapped = textwrap.fill(
-            _complete_clip(meta.description, limit),
-            width=76,
-            initial_indent="  ",
-            subsequent_indent="  ",
+        if _is_playbook(meta):
+            continue
+        _render_skill_line(
+            lines, meta,
+            _desc_limit(meta, core, meta_limit, playbook, learned),
         )
-        lines.append(wrapped)
-        lines.append("")
+
+    # Converted guidance-only skills are grouped by their section so the
+    # planner can scan 43 entries without losing the core tools above.
+    current_category = None
+    for meta in _ordered_playbooks(registry):
+        category = _category_key(meta)
+        if category != current_category:
+            current_category = category
+            lines.append(CATEGORY_LABELS.get(category, CATEGORY_LABELS["other"]))
+            lines.append("─" * len(CATEGORY_LABELS.get(category, "OTHER PLAYBOOKS")))
+        _render_skill_line(
+            lines, meta,
+            _desc_limit(meta, core, meta_limit, playbook, learned),
+        )
+
+    lines.append(
+        "PLAYBOOK SKILLS: a playbook_* call loads guidance only. Its full "
+        "instructions arrive as SKILL DETAIL on the next turn; then execute "
+        "the concrete tools it names. Never treat a playbook call as done."
+    )
     lines.append(
         "Full instructions for the chosen skill are injected as SKILL DETAIL "
         "on the next turn."
@@ -376,16 +477,17 @@ def build_skills_metadata(
 ) -> str:
     """Compact metadata-only list injected into the cached system prompt.
 
-    Core skills get the richest trigger text; meta and learned skills get a
-    shorter line. Descriptions are truncated only at sentence boundaries and
-    always end with terminal punctuation — never with "...". Budget: under
-    4,000 characters (~1,000 tokens) whenever the registry is the standard set.
+    Core skills get the richest trigger text; playbooks and learned skills get
+    a shorter line. Descriptions are truncated only at sentence boundaries and
+    always end with terminal punctuation — never with "...".
     """
     if not registry:
         return ""
     text = ""
-    for core, meta_limit, learned in _DESC_LADDER:
-        text = _render_skills_metadata(registry, core, meta_limit, learned)
+    for core, meta_limit, playbook, learned in _DESC_LADDER:
+        text = _render_skills_metadata(
+            registry, core, meta_limit, playbook, learned,
+        )
         if len(text) <= max_chars:
             return text
     log.warning(

@@ -719,5 +719,90 @@
     "uses": 0,
     "last_used": 1792818065.1313612,
     "source": "brain"
+  },
+  {
+    "id": "run-playbook-docx-then-run-command-then-read-document",
+    "name": "Run playbook docx, then run command, then read document",
+    "utterance": "Create a Word document on my Desktop called Q3-Report.docx titled \"Q3 Report\" with a short summary, three bullet points, and a table of Region and Revenue.",
+    "steps": [
+      {
+        "skill": "playbook_docx",
+        "args": {}
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$env:USERPROFILE"
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "$code = @'\nfrom docx import Document\nfrom docx.shared import Pt\n\ndoc = Document()\ndoc.add_heading('Q3 Report', level=1)\ndoc.add_paragraph('Q3 delivered steady growth across all regions, with total revenue up 12% quarter over quarter. The team expanded into two new markets and improved retention.')\ndoc.add_paragraph('Highlights:', style='Intense Quote')\nfor b in ['Revenue grew 12% QoQ to $4.8M', 'Two new regional markets launched', 'Customer retention improved to 94%']:\n    doc.add_paragraph(b, style='List Bullet')\n\ntable = doc.add_table(rows=1, cols=2)\ntable.style = 'Light Grid Accent 1'\nhdr = table.rows[0].cells\nhdr[0].text = 'Region'\nhdr[1].text = 'Revenue'\nfor region, rev in [('North America', '$2.1M'), ('Europe', '$1.5M'), ('Asia Pacific', '$0.9M'), ('Latin America', '$0.3M')]:\n    row = table.add_row().cells\n    row[0].text = region\n    row[1].text = rev\n\ndoc.save(r'C:\\\\Users\\\\USER\\\\Desktop\\\\Q3-Report.docx')\nprint('OK')\n'@\n$code | Out-File -Encoding utf8 $env:TEMP\\mk_q3.py\npython $env:TEMP\\mk_q3.py",
+          "why": "Create the Q3 Report Word document on the Desktop using python-docx."
+        }
+      },
+      {
+        "skill": "run_command",
+        "args": {
+          "command": "Test-Path 'C:\\Users\\USER\\Desktop\\Q3-Report.docx'; (Get-Item 'C:\\Users\\USER\\Desktop\\Q3-Report.docx').Length"
+        }
+      },
+      {
+        "skill": "read_document",
+        "args": {
+          "path": "{{file_path}}"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: playbook_docx -> run_command -> run_command -> run_command -> read_document. Use when the request resembles: Create a Word document on my Desktop called Q3-Report.docx titled \"Q3 Report\" with a short summary, three bullet points, and a table of Region and Revenue.",
+    "triggers": [],
+    "parameters": [
+      {
+        "name": "file_path",
+        "description": "File path for 'path' from the new request.",
+        "required": true,
+        "default": ""
+      }
+    ],
+    "status": "proposed",
+    "created": 1792951322.376547,
+    "uses": 0,
+    "last_used": 1792951322.376547,
+    "source": "brain"
+  },
+  {
+    "id": "run-browser-navigate",
+    "name": "Run browser navigate",
+    "utterance": "can give me a summary of the latest kimi model",
+    "steps": [
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://www.google.com/search?q=latest+Kimi+model+Moonshot+AI+K2"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://www.kimi.com/blog/kimi-k2-6"
+        }
+      },
+      {
+        "skill": "browser_navigate",
+        "args": {
+          "url": "https://www.google.com/search?q=Kimi+K3.1+Pro+Moonshot+AI+latest+model+release",
+          "new_tab": "False"
+        }
+      }
+    ],
+    "description": "Replays a verified workflow: browser_navigate -> browser_navigate -> browser_navigate. Use when the request resembles: can give me a summary of the latest kimi model",
+    "triggers": [],
+    "parameters": [],
+    "status": "proposed",
+    "created": 1792951567.9479542,
+    "uses": 0,
+    "last_used": 1792951567.9479542,
+    "source": "brain"
   }
 ]

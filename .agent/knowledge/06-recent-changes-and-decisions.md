@@ -6,7 +6,11 @@ source_files:
   - winbrow/brain/skill_writer.py
   - winbrow/brain/agent_loop.py
   - winbrow/brain/skill_registry.py
+  - winbrow/skill_scripts.py
+  - winbrow/integrations.py
   - winbrow/agent.py
+  - server.py
+  - templates/index.html
   - winbrow/tests/test_skill_writer.py
   - tools/skills.json
   - winbrow/browser_task.py
@@ -211,3 +215,25 @@ The knowledge base was built by reading source, not by running the product. No l
 UIA tree, COM automation, voice loop, or end-to-end task was executed for these documents. Treat
 runtime claims as "what the code says", not "what was observed". When you run something, record the
 exact command and result in the session log.
+
+## 8. Converted skill library (2026-10-25)
+
+Added 43 playbooks from the six requested awesome-claude-skills sections:
+
+- `winbrow/skills/library/<section>/<name>/SKILL.md` plus 21 helpers,
+  references, and templates.
+- `kind: playbook` in the frontmatter; unique `playbook_*` keys; grouped
+  metadata; budget raised from 4,000 to 12,000 chars.
+- `agent_loop._run_step` acknowledges a playbook without a tool lookup and
+  injects the body as SKILL DETAIL on the next turn.
+- `winbrow/skill_scripts.py` adds `run_skill_script` (T2, allowlisted).
+- `winbrow/integrations.py` adds provider storage, probes, and the T0
+  `integration_status` tool.
+- `server.py` + `templates/index.html` add the Integrations panel and endpoints.
+
+Verified in this session: 24 focused tests (`test_playbooks`,
+`test_converted_skills`, `test_integrations`, `test_integrations_api`,
+`test_skill_writer`) passed; 65 skill definitions load; metadata is ~9,060 chars.
+The document/media helpers were smoke-tested for PDF, PPTX, XLSX, EPUB, CSV,
+PNG, and GIF. DOCX and the credential-gated integrations were not exercised
+end-to-end because their optional packages/accounts are not installed here.

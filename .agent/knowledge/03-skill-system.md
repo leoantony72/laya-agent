@@ -6,6 +6,9 @@ source_files:
   - winbrow/brain/skill_writer.py
   - winbrow/brain/agent_loop.py
   - winbrow/brain/prompt.py
+  - winbrow/skill_scripts.py
+  - winbrow/skill_script_utils.py
+  - winbrow/integrations.py
   - winbrow/memory/skills.py
   - winbrow/agent.py
   - winbrow/skills
@@ -37,6 +40,7 @@ Each curated skill is `winbrow/skills/<folder>/SKILL.md` with YAML frontmatter:
 ---
 name: browser-upload-file
 skill: browser_upload_file
+kind: tool
 description: >
   Upload a local file to a website...
 args:
@@ -51,10 +55,17 @@ args:
 
 Required frontmatter fields (`skill_registry._load_skill_file`, `:160-202`):
 
-- `skill` — exact dispatcher key; must match a registry tool name.
+- `skill` — exact dispatcher key; must match a registry tool name, or start
+  with `playbook_` when `kind: playbook`.
+- `kind` — `tool` (default) or `playbook`. Playbook keys are guidance-only and
+  are acknowledged by `agent_loop._run_step` without a tool lookup.
+- `category` — converted-library section slug; used for metadata grouping.
+- `source`/`license` — provenance only; parsed into `origin`/`license`.
 - `description` — trigger text shown in metadata.
-- `args` — list of `{name, type, required, default, description}`.
-- `name` is optional but used as the human-facing/folder name.
+- `args` — list of `{name, type, required, default, description}`. Playbooks use
+  `args: []`.
+- `name` is optional but used as the human-facing/folder name; it must match the
+  folder.
 
 Malformed files are logged and skipped per file (`:217-290`); one bad skill does not stop startup.
 `yaml` is optional at import (`:35-41`) but is required in practice for frontmatter parsing.
@@ -66,23 +77,34 @@ everything as `kind="text"`, so frontmatter types are documentation, not enforce
 ## 3. Progressive disclosure
 
 1. `build_skills_metadata()` (`skill_registry.py:374-395`) renders **metadata only**:
-   dispatcher key, args label, and a clipped description. Budget target: under 4,000 chars
-   (`META_DESC_LIMIT`), using a ladder of description lengths (`_DESC_LADDER`, `:74-80`).
+   dispatcher key, args label, and a clipped description. The budget is now
+   **12,000 chars** because the converted library adds 43 playbooks; core skills
+   keep the longest descriptions, playbooks use a 95-char budget, and the six
+   categories get a header.
 2. The metadata is injected into the cached system prompt (`brain/prompt.py`).
 3. When the planner chooses a skill, `inject_skill_detail()` loads the full body and adds it as
    `SKILL DETAIL` on the **next** turn (`agent_loop.py:766-770`).
-4. `load_skill_body()` reads the markdown below the frontmatter (`skill_registry.py:402-414`).
+4. A `playbook_*` choice is a no-op acknowledgement; the next turn receives the
+   body and executes the concrete tools it names. Never treat a playbook call as
+   task completion.
+5. `load_skill_body()` reads the markdown below the frontmatter (`skill_registry.py:402-414`).
 
 Ordering: `PREFERRED_ORDER` (`:47-67`) puts 15 core skills first, then meta skills, then learned
 skills alphabetically. `CORE_SKILL_KEYS` = first 15; `META_SKILL_KEYS` = last 4.
 
 Current inventory:
 
-**Curated (19):** `browser_accessibility`, `browser_interact`, `browser_navigate`,
+**Core (19):** `browser_accessibility`, `browser_interact`, `browser_navigate`,
 `browser_read_full`, `browser_read_page`, `browser_upload_file`, `browser_wait`, `build_tool`,
 `create_text_file`, `find_files`, `mcp_filesystem_move_file`, `open_file`, `open_folder`,
 `read_document`, `recall_memory`, `remember_fact`, `repair_tool`, `run_command`,
 `screen_read_text`.
+
+**Converted playbooks (43):** the six requested sections live under
+`winbrow/skills/library/<section>/<name>/SKILL.md`. Six document, five data,
+seven writing, ten creative, nine productivity, six collaboration. Every one
+uses `kind: playbook` and a unique `playbook_*` key. See
+`winbrow/skills/library/README.md` and `PROVENANCE.md`.
 
 **Learned (3):** `open_notepad`, `create_folder_papers`,
 `create_folder_and_also_make_a_summ` (the last was captured from a garbled multi-intent request and
@@ -216,7 +238,27 @@ Current `tools/skills.json`: 14 records, 2 approved, 12 proposed, all `uses=0` a
 - Learned tools have `impl=None` (script-backed) and are gated at least T2 by
   `permissions.py:221-224` when invoked through `run_skill`.
 
-## 7. Adding a new brain skill
+## 7. Converted skill library and integrations
+
+The 43 converted skills are normal folder skills plus:
+
+- **`run_skill_script`** (`winbrow/skill_scripts.py`, impl `skill_script`, T2):
+  runs an allowlisted `.py` helper under `winbrow/skills/library/**/scripts/`.
+  The spec travels as `--spec-json`, never through PowerShell. Path traversal,
+  symlinks, non-library paths, oversized specs, and timeouts are rejected.
+- **`integration_status`** (`winbrow/integrations.py`, impl `integration`, T0):
+  checks whether an optional provider is configured.
+- **Integrations panel** (`templates/index.html` + `server.py`):
+  `GET /api/integrations`, `POST /api/integrations/{id}`,
+  `POST /api/integrations/{id}/test`, `DELETE /api/integrations/{id}`,
+  `POST /api/integrations/google/oauth`.
+- Secrets live in `data/integrations.json` (gitignored), encrypted with Windows
+  DPAPI where available, masked on every read, with environment variables taking
+  precedence. They are never written into a SKILL.md or planner history.
+- Gated skills must call `integration_status` first and emit `clarify` with the
+  setup path when unconfigured; never simulate success.
+
+## 8. Adding a new brain skill
 
 1. Pick a dispatcher key that already exists in the registry (or add the tool first).
 2. Create `winbrow/skills/<kebab-name>/SKILL.md` with the required frontmatter.
@@ -226,7 +268,7 @@ Current `tools/skills.json`: 14 records, 2 approved, 12 proposed, all `uses=0` a
 6. Restart or let the registry scan; the planner sees it in metadata immediately afterward.
 7. If the tool mutates, confirm its permission tier is correct.
 
-## 8. Adding a procedural replay skill
+## 9. Adding a procedural replay skill
 
 1. Prefer capturing a real successful run; do not hand-write unless necessary.
 2. Keep steps ≤ 12 and use only registered tools.
@@ -235,7 +277,7 @@ Current `tools/skills.json`: 14 records, 2 approved, 12 proposed, all `uses=0` a
 4. Save as `proposed`, review the steps, then approve.
 5. Never store browser workflows as replay skills; they are skipped by design.
 
-## 9. Risks and sharp edges
+## 10. Risks and sharp edges
 
 - **Writer cost:** each eligible task can trigger a model call. Disable with `WINBROW_SKILL_WRITER=0`.
 - **Specificity guards are heuristic:** a generic-looking but single-site skill can still pass.
@@ -243,8 +285,19 @@ Current `tools/skills.json`: 14 records, 2 approved, 12 proposed, all `uses=0` a
   will not replace it.
 - **Folder-name truncation:** `_slugify` caps at 60 chars; `create-folder-and-also-make-a-summ` is
   evidence that a garbled goal can become a permanent skill name.
-- **Metadata budget:** too many verbose descriptions push the block over 4,000 chars and trigger a
-  warning; the ladder clips at sentence boundaries.
+- **Metadata budget:** the block is now ~9,060 chars for 65 skills against a
+  12,000-char limit. Adding many verbose playbooks will trigger the warning and
+  a shorter ladder; measure after every batch.
+- **Playbook turn cost:** a playbook costs one extra planner turn because it is
+  guidance, not an action. The prompt forbids two playbooks in a row and treats
+  a playbook call as non-completion.
+- **Script runner surface:** `run_skill_script` executes Python helpers under the
+  skill library at T2. It rejects non-library paths, traversal, symlinks, and
+  oversized specs, but a malicious helper committed to the library would still
+  run. Review helper diffs like code.
+- **Integration secrets:** stored under `data/integrations.json`; DPAPI is used
+  on Windows, values are masked, and env vars win. Never print a decrypted value
+  or put it in SKILL DETAIL.
 - **Replay blindness:** a replay plan does not re-observe the world; a changed desktop can make a
   stale plan "succeed" or fail halfway.
 - **Status gate:** only `approved` records replay. A capture that looks successful but stays

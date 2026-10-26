@@ -505,6 +505,10 @@ class AgentBrain:
         ]
         if len(successful) < 3:
             return
+        # A converted playbook already documents this workflow. Capturing the
+        # same run again would create a duplicate, task-specific skill.
+        if any(str(step.skill).startswith("playbook_") for step in successful):
+            return
         try:
             task = asyncio.create_task(
                 self._maybe_save_skill(goal, list(history))
@@ -1069,6 +1073,19 @@ class AgentBrain:
 
         try:
             skill = resolve_skill_key(skill, self.skill_registry)
+            meta = self.skill_registry.get(skill)
+            if meta is not None and getattr(meta, "kind", "tool") == "playbook":
+                # A playbook is guidance, not an executable tool. Its body is
+                # injected as SKILL DETAIL on the next planning turn; this
+                # acknowledgement closes the current step without pretending
+                # the user's task is complete.
+                return BrainStepResult(
+                    skill, args, True,
+                    "Playbook loaded. Follow its SKILL DETAIL on the next turn "
+                    "and execute the concrete tools it names. This call is not "
+                    "task completion.",
+                    why, _ms(),
+                )
             if skill == "remember_fact":
                 fact = str(args.get("fact", "")).strip()
                 if fact:

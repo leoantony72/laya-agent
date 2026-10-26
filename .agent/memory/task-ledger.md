@@ -10,6 +10,7 @@
 | M5 Session log + hook + settings | DONE | session-log.md, hooks/post-session.py, settings.json | py_compile, dry run, live append, JSON parse | All passed |
 | M6 Final verification | DONE | 9 acceptance checks | inspect + run | All passed |
 | M7 Fix x.com browser trace | DONE | browser_task.py, browser_tools.py, agent_loop.py, agent.py, tools/seed.json, test_browser_fixes.py | py_compile; pytest test_browser_fixes (13 pass); test_m2 (1 pre-existing fail); HEAD worktree comparison | Blank-cache/repeat-guard/Notepad/browser-preference fixed; 13 regression tests |
+| M8 Converted skill library + integrations | DONE | winbrow/skills/library/**, winbrow/skill_scripts.py, winbrow/skill_script_utils.py, winbrow/integrations.py, brain/skill_registry.py, brain/agent_loop.py, brain/prompt.py, agent.py, permissions.py, server.py, templates/index.html, tests/* | pytest winbrow/tests (27 pass); py_compile; node script syntax; smoke PDF/PPTX/XLSX/EPUB/DOCX/CSV/PNG/GIF | 43 playbooks, 21 helpers, 8 integration cards, 2 native helper tools |
 
 ## Verification log
 

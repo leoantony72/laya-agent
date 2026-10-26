@@ -1,0 +1,19 @@
+# Optional dependencies for the converted skill library.
+#
+# The core agent runs without these. Install only what you want to use:
+#   pip install -r winbrow/skills/library/requirements-skills.txt
+#
+# Already present in the standard WinBrow environment:
+#   openpyxl, python-pptx, PyMuPDF, pandas, matplotlib, Pillow, httpx, requests
+
+python-docx>=1.1.0          # docx create/edit
+yt-dlp>=2025.1.0            # video-downloader, youtube-transcript
+psycopg2-binary>=2.9.9      # postgres read-only queries
+google-api-python-client>=2.100.0   # google-workspace
+google-auth>=2.23.0          # google-workspace token refresh
+google-auth-oauthlib>=1.1.0  # google-workspace OAuth connect
+google-auth-httplib2>=0.1.1  # google-api-python-client transport
+
+# Optional upgrades
+# pypdf>=4.0                 # advanced PDF forms/encryption edges
+# trafilatura>=1.8           # better article extraction fallback

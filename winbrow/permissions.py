@@ -50,6 +50,7 @@ TOOL_TIERS: Dict[str, str] = {
     "battery_health": T0, "clipboard_inspect": T0, "vscode_list_extensions": T0,
     "aftereffects_detect": T0, "take_screenshot": T0, "app_search": T0,
     "read_document": T0,
+    "integration_status": T0,
     # T1 — reversible
     "computer_click": T1, "computer_click_text": T1, "computer_type": T1,
     "computer_key": T1, "computer_scroll": T1, "computer_paste": T1,
@@ -70,6 +71,9 @@ TOOL_TIERS: Dict[str, str] = {
     "photoshop_save_as": T2, "photoshop_desaturate": T2, "photoshop_open_image": T1,
     "office_save_as_pdf": T2, "file_dialog_save": T2,
     "create_text_file": T2, "download_file": T2,
+    # Bundled skill helpers may write user files; scripts are allowlisted but
+    # the tool still runs user-visible work, so keep it at the write tier.
+    "run_skill_script": T2,
     # Shell execution — base T2; gate() raises to T3 for system-class commands.
     "run_command": T2,
     # T3 — system

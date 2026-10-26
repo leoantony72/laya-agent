@@ -67,6 +67,12 @@ User Voice / Text Utterance + Live Windows Context (Active App, Running Apps)
    - Live Windows Context banner (Frontmost App, Running Apps count).
    - "Learned Tools" browser displaying dynamically generated tools.
 
+6. **Converted Skill Library & Integrations**
+   - 43 playbook skills for documents, data, writing, creative media, productivity, and collaboration under `winbrow/skills/library/`.
+   - Optional helpers for DOCX/PDF/PPTX/XLSX/EPUB, CSV charts, images, GIFs, video, transcripts, duplicates, invoices, raffles, Google Workspace, Outline, and PostgreSQL.
+   - **Integrations** panel for Gemini, PostgreSQL, NotebookLM, Google Workspace, Outline, n8n, Mercury, and Pixelbin. Secrets stay local and are masked after saving.
+
+
 ---
 
 ## 🚀 Quick Start

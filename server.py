@@ -34,6 +34,13 @@ from winbrow.brain import uses_builtin_local_server
 from winbrow.windows import run_powershell
 from winbrow.model_manager import get_model_path, ensure_llama_cpp, ensure_all_models
 from winbrow.llm import QwenLLM
+from winbrow.integrations import (
+    clear_integration,
+    google_oauth,
+    list_integrations,
+    save_integration,
+    test_integration,
+)
 
 
 def _load_env_file() -> None:
@@ -283,6 +290,10 @@ class SettingsRequest(BaseModel):
     api_key: str = ""
     endpoint: str = ""
     project_id: str = ""
+
+
+class IntegrationSaveRequest(BaseModel):
+    values: dict[str, str] = {}
 
 
 class BrowserRequest(BaseModel):
@@ -682,6 +693,50 @@ async def get_settings():
         "endpoint": runtime_settings["endpoint"],
         "project_id": runtime_settings["project_id"],
     })
+
+
+# ---------------------------------------------------------------------------
+# Integrations (optional skills: Gemini, Google, Postgres, Outline, n8n, ...)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/integrations")
+async def get_integrations():
+    """Return masked provider status plus optional Python dependency status."""
+    return JSONResponse(list_integrations())
+
+
+@app.post("/api/integrations/{provider}")
+async def update_integration(provider: str, req: IntegrationSaveRequest):
+    try:
+        status = save_integration(provider, req.values)
+    except KeyError:
+        return JSONResponse({"error": f"Unknown integration '{provider}'"}, status_code=404)
+    return JSONResponse({"status": "saved", "provider": status})
+
+
+@app.post("/api/integrations/{provider}/test")
+async def test_integration_endpoint(provider: str):
+    try:
+        result = await asyncio.to_thread(test_integration, provider)
+    except KeyError:
+        return JSONResponse({"error": f"Unknown integration '{provider}'"}, status_code=404)
+    return JSONResponse(result)
+
+
+@app.delete("/api/integrations/{provider}")
+async def delete_integration(provider: str):
+    try:
+        removed = clear_integration(provider)
+    except KeyError:
+        return JSONResponse({"error": f"Unknown integration '{provider}'"}, status_code=404)
+    return JSONResponse({"deleted": removed})
+
+
+@app.post("/api/integrations/google/oauth")
+async def google_oauth_endpoint():
+    """Run the installed-app OAuth flow. Local desktop only; blocks until done."""
+    result = await asyncio.to_thread(google_oauth)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 400)
 
 
 # ---------------------------------------------------------------------------

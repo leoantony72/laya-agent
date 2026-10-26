@@ -1011,6 +1011,50 @@
         .imp.mcp { background: var(--accent-soft); color: var(--accent-dark); border-color: #4a3128; }
         .tools-foot { color: var(--ink3); border-top-color: var(--line); }
 
+        /* Integrations panel */
+        .int-grid {
+            display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+            gap: 14px; padding: 4px 2px 18px;
+        }
+        .int-card {
+            border: 1px solid var(--line); background: var(--paper);
+            border-radius: 10px; padding: 14px 14px 12px; display: flex;
+            flex-direction: column; gap: 10px;
+        }
+        .int-card-head { display: flex; align-items: flex-start; gap: 8px; }
+        .int-title { font-family: var(--sans); font-weight: 700; font-size: 14px; }
+        .int-cat { font-family: var(--mono); font-size: 10px; color: var(--ink3); }
+        .int-desc { font-size: 12px; color: var(--ink2); line-height: 1.45; }
+        .int-status {
+            margin-left: auto; font-family: var(--mono); font-size: 10px;
+            border: 1px solid var(--line); border-radius: 999px;
+            padding: 2px 8px; white-space: nowrap;
+        }
+        .int-status.ok { color: var(--ok); border-color: #bfe3cb; background: var(--ok-bg); }
+        .int-status.warn { color: var(--warn); border-color: #f0d3b4; background: var(--warn-bg); }
+        .int-status.err { color: var(--err); border-color: #f1c4c4; background: var(--err-bg); }
+        .int-status.manual { color: var(--ashoka); border-color: #c7d2fe; background: var(--ashoka-bg); }
+        .int-fields { display: flex; flex-direction: column; gap: 8px; }
+        .int-field label { display: block; font-family: var(--mono); font-size: 10px; color: var(--ink3); margin-bottom: 3px; }
+        .int-field input, .int-field textarea {
+            width: 100%; font-family: var(--mono); font-size: 11.5px;
+            border: 1px solid var(--line); border-radius: 6px; padding: 7px 8px;
+            background: var(--soft); color: var(--ink);
+        }
+        .int-field textarea { min-height: 64px; resize: vertical; }
+        .int-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+        .int-actions .link-btn { font-size: 11.5px; }
+        .int-used { font-family: var(--mono); font-size: 10px; color: var(--ink3); }
+        .int-note { font-size: 11px; color: var(--ink3); }
+        .int-note.err { color: var(--err); }
+        .int-deps { border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin: 0 2px 18px; }
+        .int-deps h3 { font-family: var(--serif); font-size: 16px; margin-bottom: 6px; }
+        .int-dep { display: flex; gap: 8px; align-items: center; font-family: var(--mono); font-size: 11px; padding: 4px 0; }
+        .int-dep .ok { color: var(--ok); }
+        .int-dep .miss { color: var(--err); }
+        .int-dep code { background: var(--soft); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+        .int-oauth { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
         @media (max-width: 560px) {
             .hero { padding-top: 28px; }
             .hero h2 { font-size: 26px; }
@@ -1039,6 +1083,8 @@
                 <span class="status"><span class="dot" id="statusDot"></span><span id="statusText">Ready</span></span>
                 <span class="sep">·</span>
                 <button class="link-btn" id="toolsBtn">Tools</button>
+                <span class="sep">·</span>
+                <button class="link-btn" id="integrationsBtn">Integrations</button>
                 <span class="sep">·</span>
                 <button class="link-btn" id="settingsBtn">Settings</button>
             </nav>
@@ -1158,6 +1204,21 @@
             <div class="empty">Loading tools…</div>
         </div>
         <div class="tools-foot" id="toolsFoot"></div>
+    </div>
+</div>
+
+<div class="modal-bg" id="integrationsModal">
+    <div class="tools-panel">
+        <div class="tools-head">
+            <h2>Integrations</h2>
+            <button class="link-btn" onclick="closeIntegrations()">Close</button>
+        </div>
+        <div class="sub" style="padding:0 2px 10px;color:var(--ink2);font-size:12px;">
+            Optional services used by the converted skills. Secrets are stored locally and never shown again.
+        </div>
+        <div class="tools-body" id="integrationsBody">
+            <div class="empty">Loading integrations…</div>
+        </div>
     </div>
 </div>
 
@@ -1828,6 +1889,156 @@ async function saveSettings() {
     });
     closeSettings();
     showToast('Settings saved');
+}
+
+/* ── Integrations panel ── */
+let integrationsCache = null;
+
+async function openIntegrations() {
+    document.getElementById('integrationsModal').classList.add('open');
+    document.getElementById('integrationsBody').innerHTML = '<div class="empty">Loading integrations…</div>';
+    try {
+        const resp = await fetch('/api/integrations');
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        integrationsCache = await resp.json();
+        renderIntegrations(integrationsCache);
+    } catch (e) {
+        document.getElementById('integrationsBody').innerHTML =
+            '<div class="empty">Could not load integrations: ' + escHtml(String(e)) + '</div>';
+    }
+}
+
+function closeIntegrations() {
+    document.getElementById('integrationsModal').classList.remove('open');
+}
+
+function _intStatus(provider) {
+    if (provider.manual) return ['manual', 'Manual sign-in'];
+    const test = provider.last_test || {};
+    if (test.message) return [test.ok ? 'ok' : 'err', test.ok ? 'Connected' : 'Test failed'];
+    if (provider.configured) return ['ok', 'Configured'];
+    return ['warn', 'Not configured'];
+}
+
+function _intField(field, providerId) {
+    const value = field.secret ? '' : (field.value || '');
+    const placeholder = field.secret && field.has_value ? '•••• saved' : (field.placeholder || '');
+    const source = field.source ? ' · ' + field.source : '';
+    const help = field.help
+        ? '<a class="link-btn" style="font-size:10px" href="' + escHtml(field.help) + '" target="_blank" rel="noopener">Get this</a>'
+        : '';
+    const label = escHtml(field.label + (field.required ? ' *' : '') + source);
+    const common = 'data-int-provider="' + escHtml(providerId) + '" data-int-key="' + escHtml(field.key) + '"';
+    const control = field.multiline
+        ? '<textarea ' + common + ' placeholder="' + escHtml(placeholder) + '">' + escHtml(value) + '</textarea>'
+        : '<input type="' + (field.secret ? 'password' : 'text') + '" ' + common +
+          ' value="' + escHtml(value) + '" placeholder="' + escHtml(placeholder) + '" autocomplete="off" />';
+    return '<div class="int-field"><label>' + label + ' ' + help + '</label>' + control + '</div>';
+}
+
+function renderIntegrations(data) {
+    const providers = (data.providers || []);
+    let html = '<div class="int-grid">';
+    for (const provider of providers) {
+        const [statusClass, statusLabel] = _intStatus(provider);
+        const fields = (provider.fields || []).map(f => _intField(f, provider.id)).join('');
+        const used = (provider.used_by || []).length
+            ? '<div class="int-used">Used by: ' + provider.used_by.map(escHtml).join(', ') + '</div>'
+            : '';
+        const test = provider.last_test || {};
+        const testNote = test.message
+            ? '<div class="int-note ' + (test.ok ? '' : 'err') + '">' + escHtml(test.message) + '</div>'
+            : '';
+        const oauth = provider.oauth
+            ? '<div class="int-oauth"><button class="link-btn" onclick="connectGoogle()">Connect Google</button><span class="int-note">Opens a browser sign-in.</span></div>'
+            : '';
+        const clear = provider.configured || Object.keys(provider.fields || {}).length
+            ? '<button class="link-btn" onclick="clearIntegration(\'' + escHtml(provider.id) + '\')">Clear</button>'
+            : '';
+        html += '<div class="int-card">' +
+            '<div class="int-card-head"><div><div class="int-title">' + escHtml(provider.label) + '</div>' +
+            '<div class="int-cat">' + escHtml(provider.category || '') + '</div></div>' +
+            '<span class="int-status ' + statusClass + '">' + statusLabel + '</span></div>' +
+            '<div class="int-desc">' + escHtml(provider.description || '') + '</div>' +
+            '<div class="int-fields">' + fields + '</div>' + oauth +
+            '<div class="int-actions"><button class="btn-save" style="padding:5px 10px;font-size:11px" onclick="saveIntegration(\'' + escHtml(provider.id) + '\')">Save</button>' +
+            '<button class="link-btn" onclick="testIntegration(\'' + escHtml(provider.id) + '\')">Test</button>' +
+            clear + '</div>' + used + testNote + '</div>';
+    }
+    html += '</div>';
+
+    const deps = data.dependencies || [];
+    const missing = deps.filter(d => !d.installed);
+    if (deps.length) {
+        html += '<div class="int-deps"><h3>Optional Python packages</h3>';
+        for (const dep of deps) {
+            html += '<div class="int-dep"><span class="' + (dep.installed ? 'ok' : 'miss') + '">' +
+                (dep.installed ? 'installed' : 'missing') + '</span><code>' + escHtml(dep.package) +
+                '</code><span style="color:var(--ink3)">for ' + dep.used_by.map(escHtml).join(', ') + '</span></div>';
+        }
+        if (missing.length) {
+            const command = 'pip install ' + missing.map(d => d.package).join(' ');
+            html += '<div class="int-actions" style="margin-top:8px"><code style="font-size:11px">' + escHtml(command) +
+                '</code><button class="link-btn" onclick="copyInstallCommand()">Copy command</button></div>';
+        }
+        html += '</div>';
+    }
+    document.getElementById('integrationsBody').innerHTML = html;
+}
+
+function _intValues(providerId) {
+    const values = {};
+    document.querySelectorAll('[data-int-provider="' + providerId + '"]').forEach(el => {
+        values[el.dataset.intKey] = el.value;
+    });
+    return values;
+}
+
+async function saveIntegration(providerId) {
+    const resp = await fetch('/api/integrations/' + encodeURIComponent(providerId), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values: _intValues(providerId) }),
+    });
+    if (!resp.ok) { showToast('Could not save ' + providerId); return; }
+    showToast(providerId + ' saved');
+    await openIntegrations();
+}
+
+async function testIntegration(providerId) {
+    const resp = await fetch('/api/integrations/' + encodeURIComponent(providerId) + '/test', { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    showToast(data.message || ('Test finished for ' + providerId));
+    await openIntegrations();
+}
+
+async function clearIntegration(providerId) {
+    if (!confirm('Clear saved settings for ' + providerId + '?')) return;
+    await fetch('/api/integrations/' + encodeURIComponent(providerId), { method: 'DELETE' });
+    showToast(providerId + ' cleared');
+    await openIntegrations();
+}
+
+async function connectGoogle() {
+    showToast('Opening Google sign-in in your browser…');
+    const resp = await fetch('/api/integrations/google/oauth', { method: 'POST' });
+    const data = await resp.json().catch(() => ({}));
+    showToast(data.message || 'Google sign-in finished');
+    await openIntegrations();
+}
+
+function copyInstallCommand() {
+    const deps = (integrationsCache && integrationsCache.dependencies) || [];
+    const command = 'pip install ' + deps.filter(d => !d.installed).map(d => d.package).join(' ');
+    navigator.clipboard.writeText(command).then(
+        () => showToast('Install command copied'),
+        () => showToast(command)
+    );
+}
+
+document.getElementById('integrationsBtn').addEventListener('click', openIntegrations);
+if (location.hash === '#integrations') {
+    setTimeout(openIntegrations, 300);
 }
 
 function setStatus(text, busy) {

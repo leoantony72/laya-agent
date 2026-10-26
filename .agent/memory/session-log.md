@@ -30,3 +30,10 @@ Permanent findings belong in `.agent/knowledge/`; this file is chronological con
 - **Changed files:** `M tools/skills.json`, `M winbrow/agent.py`, `M winbrow/brain/agent_loop.py`, `M winbrow/brain/skill_registry.py`, `?? .agent/`, `?? AGENT.md`, `?? winbrow/brain/skill_writer.py`, `?? winbrow/tests/`
 - **Knowledge:** 6 file(s) present; 0 stale
 - **Auto-refresh:** not needed: no stale knowledge
+
+## 2026-10-25 - converted skill library
+
+- **Summary:** Added 43 playbook skills from the six requested sections, 21 bundled helpers, playbook dispatch, the script runner, and the Integrations panel/backend.
+- **Changed files:** winbrow/skills/library/**, winbrow/skill_scripts.py, winbrow/skill_script_utils.py, winbrow/integrations.py, winbrow/brain/skill_registry.py, winbrow/brain/agent_loop.py, winbrow/brain/prompt.py, winbrow/agent.py, winbrow/permissions.py, server.py, templates/index.html, winbrow/tests/*
+- **Verification:** pytest winbrow/tests -q -> 27 passed; pytest test_agent.py test_brain_m0.py test_syntax.py -q -> 48 passed, 1 pre-existing fixture error; smoke PDF/PPTX/XLSX/EPUB/DOCX/CSV/PNG/GIF; 65 skills, 43 playbooks, metadata ~9,060 chars.
+- **Knowledge:** 03 and 06 updated; no stale knowledge.

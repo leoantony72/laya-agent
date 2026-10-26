@@ -278,4 +278,4 @@ def test_metadata_has_complete_sentences():
 
     assert registry
     assert "..." not in metadata
-    assert len(metadata) < 4000
+    assert len(metadata) < 12000

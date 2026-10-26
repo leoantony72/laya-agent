@@ -42,6 +42,16 @@ from .installer import INSTALLER_IMPL, INSTALL_OPS, get_installer_tools
 from .mcp import MCP_IMPL, get_mcp_tools, execute_mcp_tool, get_mcp_hub
 from .shell import SHELL_IMPL, execute_shell_tool, get_shell_tools
 from .document_tools import DOCUMENT_IMPL, execute_document_tool, get_document_tools
+from .skill_scripts import (
+    SKILL_SCRIPTS_IMPL,
+    execute_skill_script_tool_async,
+    get_skill_script_tools,
+)
+from .integrations import (
+    INTEGRATION_IMPL,
+    execute_integration_tool,
+    get_integration_tools,
+)
 from .generator import ScriptGenerator
 from .last_opened import ContextMemory
 from .memory import MemoryStore, SessionMemory, get_session, get_store
@@ -291,7 +301,8 @@ class WinBrowAgent:
         # register Python-backed computer atoms + app adapter ops once
         for _t in (get_computer_tools() + get_adapter_tools()
                    + get_installer_tools() + get_shell_tools()
-                   + get_browser_tools() + get_document_tools()):
+                   + get_browser_tools() + get_document_tools()
+                   + get_skill_script_tools() + get_integration_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -554,6 +565,22 @@ class WinBrowAgent:
             out = await asyncio.to_thread(execute_document_tool, tool_name, args)
             out.update({
                 "type": "document",
+                "tool": tool_name,
+            })
+            return out
+        # converted-skill bundled Python helpers (allowlisted, JSON spec)
+        if getattr(tool, "impl", None) == SKILL_SCRIPTS_IMPL:
+            out = await execute_skill_script_tool_async(tool_name, args)
+            out.update({
+                "type": "skill_script",
+                "tool": tool_name,
+            })
+            return out
+        # optional integration status (T0, read-only)
+        if getattr(tool, "impl", None) == INTEGRATION_IMPL:
+            out = await asyncio.to_thread(execute_integration_tool, tool_name, args)
+            out.update({
+                "type": "integration",
                 "tool": tool_name,
             })
             return out

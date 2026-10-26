@@ -133,6 +133,12 @@ DONE IS A STATE, NOT AN ACTION:
   it contains the exact sequence, edge cases and recovery rules for that skill.
   Never invent an argument or a step that contradicts SKILL DETAIL.
 
+  PLAYBOOK SKILLS: names starting with playbook_ are guidance loaders, not
+  actions. Calling one returns an acknowledgement; its full instructions arrive
+  as SKILL DETAIL on your next turn. Then execute the concrete tools the
+  playbook names. Never call two playbooks in a row, and never emit done just
+  because a playbook loaded.
+
 OUTPUT — ONLY one raw JSON object, no markdown fences, no commentary:
   {"kind":"action","step":{"skill":"<name>","args":{…},"why":"<one sentence>"}}
   {"kind":"done","summary":"<what was accomplished>","evidence":{…}}
