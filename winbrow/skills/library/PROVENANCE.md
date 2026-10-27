@@ -8,7 +8,7 @@ license before redistribution.
 | Skill | Source | License | Conversion |
 |---|---|---|---|
 | docx | anthropics/skills/tree/main/skills/docx | Proprietary | Rewritten; new python-docx helper |
-| pdf | anthropics/skills/tree/main/skills/pdf | Proprietary | Rewritten; PyMuPDF helper |
+| pdf | anthropics/skills/tree/main/skills/pdf | Proprietary | Rewritten; pure-Python pypdf/fpdf2 helper |
 | pptx | anthropics/skills/tree/main/skills/pptx | Proprietary | Rewritten; python-pptx helper |
 | xlsx | anthropics/skills/tree/main/skills/xlsx | Proprietary | Rewritten; openpyxl/pandas helper |
 | markdown-to-epub | smerchek/claude-epub-skill | See upstream | Rewritten; stdlib EPUB 3 builder |
@@ -36,7 +36,7 @@ license before redistribution.
 | swiftui-design | wholiver/swiftui-design-skill | See upstream | Rewritten; translated from Chinese; code-only on Windows |
 | pixelbin-media | anandpareek-hub/pixelbin-claude-skill | See upstream | Rewritten; thin authenticated client |
 | file-organizer | ComposioHQ/awesome-claude-skills | Apache-2.0 | Rewritten; stdlib duplicate/plan helper |
-| invoice-organizer | ComposioHQ/awesome-claude-skills | Apache-2.0 | Rewritten; PyMuPDF extraction helper |
+| invoice-organizer | ComposioHQ/awesome-claude-skills | Apache-2.0 | Rewritten; pure-Python PDF extraction helper |
 | kaizen | NeoLabHQ/context-engineering-kit/plugins/kaizen/skills/kaizen | See upstream | Rewritten |
 | n8n-workflows | haunchen/n8n-skills | See upstream | Reconstructed from repo docs/release pack; no 545-node dataset copied |
 | raffle-winner | ComposioHQ/awesome-claude-skills | Apache-2.0 | Rewritten; stdlib secrets helper |

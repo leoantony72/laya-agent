@@ -4,7 +4,10 @@
 #   pip install -r winbrow/skills/library/requirements-skills.txt
 #
 # Already present in the standard WinBrow environment:
-#   openpyxl, python-pptx, PyMuPDF, pandas, matplotlib, Pillow, httpx, requests
+#   openpyxl, python-pptx, pandas, matplotlib, Pillow, httpx, requests
+# PDF support (pypdf, fpdf2, pdfminer.six) is installed by requirements.txt.
+# PyMuPDF is intentionally not required: its unsigned native DLL can be blocked
+# by Windows Smart App Control.
 
 python-docx>=1.1.0          # docx create/edit
 yt-dlp>=2025.1.0            # video-downloader, youtube-transcript
@@ -15,5 +18,4 @@ google-auth-oauthlib>=1.1.0  # google-workspace OAuth connect
 google-auth-httplib2>=0.1.1  # google-api-python-client transport
 
 # Optional upgrades
-# pypdf>=4.0                 # advanced PDF forms/encryption edges
 # trafilatura>=1.8           # better article extraction fallback

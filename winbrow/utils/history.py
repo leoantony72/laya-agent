@@ -224,6 +224,38 @@ def detect_stuck(history: List[Any], window: int = 2) -> bool:
     )
 
 
+def _args_key(args: Dict[str, Any]) -> str:
+    try:
+        return json.dumps(args or {}, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        return str(args)
+
+
+def detect_repeated_failure(history: List[Any], window: int = 20) -> str:
+    """Return the repeated error when the same step failed twice identically.
+
+    A dependency install can succeed between two failed script calls, so the
+    plain consecutive-failure counter resets and the planner loops. This guard
+    looks across the recent window and returns the error text for the second
+    identical failure. An empty string means no repeat was found.
+    """
+    seen: set[tuple[str, str, str]] = set()
+    for entry in history[-max(2, window):]:
+        if _success_of(entry):
+            continue
+        output = _output_of(entry).strip()
+        if not output:
+            continue
+        # The first line identifies the failure; traceback tails often vary
+        # with paths while the underlying error is unchanged.
+        first_line = output.splitlines()[0][:300]
+        key = (_skill_of(entry), _args_key(_args_of(entry)), first_line)
+        if key in seen:
+            return output
+        seen.add(key)
+    return ""
+
+
 def count_recent_stuck(history: List[Any], window: int = 6) -> int:
     """Count recent steps whose warning says the planner is stuck/repeating."""
     count = 0

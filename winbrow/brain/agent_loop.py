@@ -16,7 +16,8 @@ step (a file path, a search result) are therefore available verbatim to later
 steps instead of both steps being planned blind up front.
 
 Termination: done, clarify/chat, hard permission/policy stops, the same skill
-failing twice in a row, provider loss mid-task, or the max_steps action budget.
+failing twice in a row, the same step failing twice with an identical error,
+provider loss mid-task, or the max_steps action budget.
 Clarify pauses interactively when an ask_user_fn callback is wired; otherwise
 the question is returned with needs_input=True for the UI to ask.
 
@@ -67,6 +68,7 @@ from ..policy import PolicyError, validate_script_safety
 from ..registry import ArgSpec, Tool
 from ..utils.history import (
     count_recent_stuck,
+    detect_repeated_failure,
     detect_stuck,
     extract_tried_services,
     format_history,
@@ -695,6 +697,7 @@ class AgentBrain:
         last_plan_response = ""
         coaching = ""
         repeats: Dict[tuple, int] = {}
+        loaded_playbooks: set[str] = set()
         done_challenged = False
         clarify_rounds = 0
         step_budget = max_steps if max_steps is not None else self.max_steps
@@ -710,6 +713,11 @@ class AgentBrain:
                 if tool_catalog else self.skills_metadata
             )
             turn_memory = memory_block
+            if loaded_playbooks:
+                turn_memory += (
+                    "\nPLAYBOOKS ALREADY LOADED (do NOT call these again): "
+                    + ", ".join(sorted(loaded_playbooks))
+                )
             if coaching:
                 turn_memory += f"\nPLANNER FEEDBACK: {coaching}"
                 coaching = ""
@@ -919,7 +927,13 @@ class AgentBrain:
                             f"succeeded. {self._history_summary(history)}"
                         ).strip()
                         return result
-                    if skill == "web_fetch":
+                    if skill.startswith("playbook_"):
+                        coaching = (
+                            f"The {skill} playbook is already loaded; its "
+                            "instructions are in SKILL DETAIL. Do NOT call it "
+                            "again. Execute the concrete tool it names."
+                        )
+                    elif skill == "web_fetch":
                         coaching = (
                             f"You already fetched {_fetch_url_of(args)} successfully; "
                             "its text is in HISTORY. Do NOT fetch that URL again. "
@@ -937,7 +951,11 @@ class AgentBrain:
                          if s.success and _step_signature(s.skill, s.args) == sig),
                         None,
                     )
-                    if prior and prior.output and skill != "web_fetch":
+                    if (
+                        prior and prior.output
+                        and skill != "web_fetch"
+                        and not skill.startswith("playbook_")
+                    ):
                         coaching = (
                             f"'{skill}' with those exact arguments ALREADY SUCCEEDED. "
                             f"Its result was: {prior.output[:300]} "
@@ -990,6 +1008,24 @@ class AgentBrain:
                         result.pending = step_res.pending
                     return result
 
+                # A successful pip install between two failed script calls
+                # resets the consecutive-failure counter. Stop when the exact
+                # same step produces the exact same error twice instead of
+                # letting the planner reinstall and retry forever.
+                repeated_error = detect_repeated_failure(history)
+                if not step_res.success and repeated_error:
+                    log.warning(
+                        f"Brain repeated failure for '{skill}'; stopping instead "
+                        "of re-planning the same error."
+                    )
+                    result.kind = "action"
+                    result.success = False
+                    result.response = (
+                        f"Stopped: '{skill}' failed twice with the same error. "
+                        f"{repeated_error[:400]}"
+                    )
+                    return result
+
                 # A warning alone does not stop a stubborn planner. After two
                 # stuck warnings in the recent window, stop spinning and ask
                 # the user instead of burning the remaining action budget.
@@ -1014,6 +1050,8 @@ class AgentBrain:
                     return result
 
                 if step_res.success:
+                    if skill.startswith("playbook_"):
+                        loaded_playbooks.add(skill)
                     done_sigs.add(sig)
                     consecutive_failures = 0
                     last_failed_skill = ""

@@ -25,3 +25,9 @@ curl_cffi>=0.7,<1
 trafilatura>=2.0,<3
 # Document reading: PDF, PPTX, DOCX, XLSX/XLS, CSV, Markdown, HTML, JSON, EPUB
 markitdown[pdf,docx,pptx,xlsx,xls]>=0.1.5
+# PDF creation/editing: pure-Python stack. PyMuPDF is intentionally not
+# required because its unsigned native DLL can be blocked by Windows Smart App
+# Control, which is easy to misdiagnose as a missing package.
+pypdf[crypto]>=5,<7
+fpdf2>=2.8,<3
+pdfminer.six>=20231228

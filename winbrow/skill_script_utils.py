@@ -75,15 +75,51 @@ def read_text_arg(spec: dict[str, Any], key: str = "content") -> str:
     return ""
 
 
+def _import_chain(exc: BaseException) -> str:
+    """Render an exception and its causes on one line.
+
+    A blocked native DLL often appears as ``ModuleNotFoundError: No module named
+    'mupdf'`` with the real ``ImportError: DLL load failed`` only in the cause
+    chain. The planner needs both parts to stop treating it as a missing
+    package.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        part = f"{type(current).__name__}: {current}"
+        if part not in parts:
+            parts.append(part)
+        current = current.__cause__ or current.__context__
+    return " <- ".join(parts)
+
+
+def _import_failure_message(module: str, package: str, exc: BaseException) -> str:
+    return (
+        f"Could not import '{package}' (module '{module}') with "
+        f"{sys.executable}: {_import_chain(exc)}; the package may be installed "
+        "but blocked by Windows Application Control, missing a dependency, or "
+        "built for a different Python."
+    )
+
+
 def require_module(module: str, package: str) -> Any:
+    import importlib
+
     try:
-        import importlib
         return importlib.import_module(module)
-    except Exception:
-        fail(
-            f"Missing Python package '{package}'. Install it with: "
-            f"pip install {package}"
-        )
+    except ModuleNotFoundError as exc:
+        missing = str(exc.name or "")
+        if missing == module or module.startswith(missing + "."):
+            fail(
+                f"Missing Python package '{package}'. Install it for the "
+                f"agent's interpreter with: \"{sys.executable}\" -m pip install "
+                f"{package}"
+            )
+        fail(_import_failure_message(module, package, exc))
+    except Exception as exc:
+        fail(_import_failure_message(module, package, exc))
 
 
 def ensure_parent(path: Path) -> None:

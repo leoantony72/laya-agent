@@ -65,7 +65,8 @@ Safety properties:
 ## Optional dependencies
 
 See `requirements-skills.txt`. Missing packages are reported by each script with
-an exact `pip install` command, and the Integrations panel shows their status.
+an install command for the exact interpreter running the agent, and the
+Integrations panel shows their status.
 
 ## Credentials and services
 

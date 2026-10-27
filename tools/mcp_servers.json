@@ -164,7 +164,7 @@
       "command": ["python", "tools/mcp_servers/winbrow_keyless.py", "--api", "pdf"],
       "tier": "t1",
       "enabled": true,
-      "description": "WinBrow bundled: LOCAL PDF reading via pymupdf — extract_text (page ranges), info (pages/TOC/metadata), search (page+snippet) (verified live, 3 tools)"
+      "description": "WinBrow bundled: LOCAL PDF reading via pypdf — extract_text (page ranges), info (pages/TOC/metadata), search (page+snippet) (verified live, 3 tools)"
     }
   ]
 }

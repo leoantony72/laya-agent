@@ -28,11 +28,11 @@ watermarking pages, creating a PDF from text, or adding password protection.
 
 ## Prerequisites
 
-- Text reading: `read_document` (T0, uses PyMuPDF/MarkItDown).
+- Text reading: `read_document` (T0, uses MarkItDown/pdfminer).
 - PDF operations: `run_skill_script` with `skill="pdf"` and
   `script="pdf_tool.py"`.
-- The helper uses PyMuPDF, which is already installed. If it is ever missing,
-  report `pip install PyMuPDF` and stop.
+- The helper uses the pure-Python `pypdf` + `fpdf2` stack installed by
+  `requirements.txt`. It does not need PyMuPDF.
 
 ## Step Pattern
 
@@ -65,6 +65,8 @@ The script returns `success`, `output`, `path`, and sometimes `paths` or
 
 ## Recovery
 
+- Import error: report the exact error and stop. Do not retry `pip install`
+  in a loop; PyMuPDF is not required by this skill.
 - Encrypted input: ask for the password; do not attempt to crack it.
 - Corrupt PDF: report the exact error and ask for another copy.
 - Output path is open in a viewer: ask the user to close it and retry once.

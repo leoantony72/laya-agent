@@ -276,7 +276,7 @@ keyword.
 Fixed:
 
 - `winbrow/web_tools.py` adds native `web_search` (DuckDuckGo HTML API) and
-  `web_fetch` (HTTP GET + BeautifulSoup/PyMuPDF), both T0 and browser-free. The
+  `web_fetch` (HTTP GET + BeautifulSoup/pdfminer), both T0 and browser-free. The
   old seed `web_search` was removed.
 - `SYSTEM_PROMPT_STATIC` ends with the verbatim WEB ACCESS HIERARCHY + WORKED
   EXAMPLES, so it sits immediately before the AVAILABLE SKILLS system block.

@@ -39,66 +39,86 @@ def _clip(o, n: int = MAX_TEXT) -> str:
 
 
 # ------------------------------------------------------------------ pdf (local, read-only)
-def _pdf():
-    try:
-        import pymupdf as _f
-    except ImportError:
-        import fitz as _f
-    return _f
+def _pdf_reader(path):
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(path))
+    if reader.is_encrypted:
+        try:
+            if not reader.decrypt(""):
+                raise ValueError
+        except Exception as exc:
+            raise ValueError("PDF is password-protected; cannot read it") from exc
+    return reader
 
 
 def _pdf_info(args):
-    f = _pdf()
-    d = f.open(str(args.get("path", "")))
+    reader = _pdf_reader(args.get("path", ""))
+    meta = reader.metadata or {}
+
+    def field(key):
+        try:
+            return meta.get(key)
+        except Exception:
+            return None
+
+    toc = []
+
+    def walk(items, level=1):
+        for item in items or []:
+            if isinstance(item, list):
+                walk(item, level + 1)
+                continue
+            try:
+                page = reader.get_destination_page_number(item) + 1
+            except Exception:
+                page = 0
+            toc.append({"level": level,
+                        "title": getattr(item, "title", str(item)),
+                        "page": page})
+
     try:
-        meta = d.metadata or {}
-        return {"pages": d.page_count, "encrypted": bool(d.is_encrypted),
-                "metadata": {k: meta.get(k) for k in
-                             ("title", "author", "subject", "producer",
-                              "creationDate")},
-                "toc": [{"level": t[0], "title": t[1], "page": int(t[2])}
-                        for t in (d.get_toc() or [])[:20]]}
-    finally:
-        d.close()
+        walk(reader.outline)
+    except Exception:
+        toc = []
+
+    return {"pages": len(reader.pages), "encrypted": bool(reader.is_encrypted),
+            "metadata": {key: field(key) for key in
+                         ("/Title", "/Author", "/Subject", "/Producer",
+                          "/CreationDate")},
+            "toc": toc[:20]}
 
 
 def _pdf_extract_text(args):
-    f = _pdf()
-    d = f.open(str(args.get("path", "")))
-    try:
-        if d.is_encrypted and not d.authenticate(""):
-            return "PDF is password-protected; cannot extract text"
-        first = max(1, int(args.get("first_page", 1) or 1))
-        last = int(args.get("last_page", 0) or 0) or d.page_count
-        last = min(last, d.page_count)
-        parts = []
-        for i in range(first - 1, last):
-            parts.append(f"--- page {i + 1} ---\n{d[i].get_text()}")
-        return "".join(parts)
-    finally:
-        d.close()
+    reader = _pdf_reader(args.get("path", ""))
+    total = len(reader.pages)
+    first = max(1, int(args.get("first_page", 1) or 1))
+    last = int(args.get("last_page", 0) or 0) or total
+    last = min(last, total)
+    parts = []
+    for i in range(first - 1, last):
+        parts.append(f"--- page {i + 1} ---\n{reader.pages[i].extract_text() or ''}")
+    return "".join(parts)
 
 
 def _pdf_search(args):
-    f = _pdf()
+    reader = _pdf_reader(args.get("path", ""))
     q = str(args.get("query", "")).lower()
     cap = min(int(args.get("max_hits", 20) or 20), 20)
-    d = f.open(str(args.get("path", "")))
-    try:
-        hits = []
-        for i in range(d.page_count):
-            txt = d[i].get_text()
-            low = txt.lower()
-            at = low.find(q)
-            if q and at >= 0:
-                hits.append({"page": i + 1,
-                             "snippet": txt[max(0, at - 60):at + 120]
-                             .replace("\n", " ")})
-                if len(hits) >= cap:
-                    break
+    hits = []
+    if not q:
         return hits
-    finally:
-        d.close()
+    for i, page in enumerate(reader.pages):
+        txt = page.extract_text() or ""
+        low = txt.lower()
+        at = low.find(q)
+        if at >= 0:
+            hits.append({"page": i + 1,
+                         "snippet": txt[max(0, at - 60):at + 120]
+                         .replace("\n", " ")})
+            if len(hits) >= cap:
+                break
+    return hits
 
 
 # ------------------------------------------------------------------ handlers

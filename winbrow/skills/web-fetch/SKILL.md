@@ -65,7 +65,7 @@ article, API, or JSON endpoint. This is Layer 3 of the web hierarchy.
   only the sections that match the question (about 6000 chars), plus an
   "Additional relevant facts" block for prices, dates, and numbers.
 - HTML is reduced to main content with Trafilatura (Markdown, tables and code
-  kept); nav, ads, and footers are removed. PDFs use PyMuPDF; JSON is
+  kept); nav, ads, and footers are removed. PDFs use pdfminer/pypdf; JSON is
   pretty-printed.
 
 ## Output Shape

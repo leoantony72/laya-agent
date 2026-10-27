@@ -107,7 +107,7 @@ Current inventory:
 `impl="web"`, T0). No browser is opened. They use DuckDuckGo HTML/Lite search
 through a `curl_cffi` TLS/HTTP2-impersonated transport (plain `requests` gets an
 HTTP 202 bot challenge) and HTTP GET + Trafilatura main-content extraction
-(BeautifulSoup/PyMuPDF fallback). A `focus` question makes `web_fetch` return
+(BeautifulSoup/pdfminer fallback). A `focus` question makes `web_fetch` return
 only the most relevant Markdown sections (~6k chars). A search provider failure
 is reported honestly; it never falls back to the browser for research.
 

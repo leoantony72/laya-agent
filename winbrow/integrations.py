@@ -155,6 +155,9 @@ ENV_KEYS = {
 DEPENDENCIES = [
     {"module": "curl_cffi", "package": "curl_cffi", "used_by": ["web-search"]},
     {"module": "trafilatura", "package": "trafilatura", "used_by": ["web-fetch"]},
+    {"module": "pypdf", "package": "pypdf", "used_by": ["pdf", "web-fetch"]},
+    {"module": "fpdf", "package": "fpdf2", "used_by": ["pdf"]},
+    {"module": "pdfminer", "package": "pdfminer.six", "used_by": ["pdf", "invoice-organizer", "web-fetch"]},
     {"module": "docx", "package": "python-docx", "used_by": ["docx"]},
     {"module": "yt_dlp", "package": "yt-dlp", "used_by": ["video-downloader", "youtube-transcript"]},
     {"module": "psycopg2", "package": "psycopg2-binary", "used_by": ["postgres"]},

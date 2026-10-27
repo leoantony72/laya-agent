@@ -7,9 +7,8 @@ import re
 import shutil
 from pathlib import Path
 
-from winbrow.skill_script_utils import emit, fail, load_spec, require_module, resolve_path
-
-fitz = require_module("fitz", "PyMuPDF")
+from winbrow.pdf_utils import PdfError, extract_text as extract_pdf_text
+from winbrow.skill_script_utils import emit, fail, load_spec, resolve_path
 
 _DATE_PATTERNS = [
     re.compile(r"\b(20\d{2})[-/](0?[1-9]|1[0-2])[-/](0?[1-9]|[12]\d|3[01])\b"),
@@ -28,9 +27,8 @@ _VENDOR_HINT = re.compile(r"^(?:from|vendor|seller|supplier)\s*[:\-]\s*(.+)$", r
 
 def _pdf_text(path: Path) -> str:
     try:
-        with fitz.open(str(path)) as document:
-            return "\n".join(page.get_text() for page in document)
-    except Exception:
+        return extract_pdf_text(path)
+    except PdfError:
         return ""
 
 

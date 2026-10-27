@@ -66,7 +66,7 @@ DONE — all six phases implemented; focused tests passing.
   the router preferred the browser for searches; `_is_browser_intent` treated
   `search` as a browser keyword.
 - Added `winbrow/web_tools.py`: native `web_search` (DuckDuckGo HTML API) and
-  `web_fetch` (HTTP GET, BeautifulSoup/PyMuPDF), both T0/no-browser.
+  `web_fetch` (HTTP GET, BeautifulSoup/pdfminer), both T0/no-browser.
 - Removed the seed `web_search`; registered web tools in `WinBrowAgent`.
 - Added `web-search`/`web-fetch` SKILL.md files; rewrote `browser-navigate` to
   interaction-only.

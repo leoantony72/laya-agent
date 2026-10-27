@@ -483,14 +483,14 @@ def _looks_like_wall(text: str) -> bool:
 
 def _pdf_to_text(raw: bytes) -> str:
     try:
-        import fitz
+        from .pdf_utils import extract_text
+
+        text = extract_text(raw)
     except Exception as exc:
         return f"[PDF text extraction unavailable: {exc}]"
-    try:
-        with fitz.open(stream=raw, filetype="pdf") as document:
-            return "\n".join(page.get_text() for page in document)
-    except Exception as exc:
-        return f"[Could not read PDF: {exc}]"
+    if not text.strip():
+        return "[PDF contained no extractable text]"
+    return text
 
 
 def web_fetch(url: str, max_chars: Any = DEFAULT_FETCH_CHARS,

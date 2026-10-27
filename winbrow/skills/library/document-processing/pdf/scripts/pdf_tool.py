@@ -1,14 +1,30 @@
-"""PDF operations with PyMuPDF (fitz): create, merge, split, rotate, watermark."""
+"""PDF operations with pure-Python libraries: create, merge, split, rotate,
+watermark, encrypt, and extract text.
+
+PyMuPDF is intentionally not used. Its native DLL can be blocked by Windows
+Smart App Control, which makes the package look missing even when it is
+installed. ``pypdf`` and ``fpdf2`` are pure Python.
+"""
 
 from __future__ import annotations
 
+import io
+import os
 from pathlib import Path
 
+from winbrow.pdf_utils import PdfError, open_reader
 from winbrow.skill_script_utils import (
-    clip, emit, ensure_parent, fail, load_spec, read_text_arg, require_module, resolve_path,
+    clip, emit, ensure_parent, fail, load_spec, read_text_arg, require_module,
+    resolve_path,
 )
 
-fitz = require_module("fitz", "PyMuPDF")
+pypdf = require_module("pypdf", "pypdf")
+PdfReader = pypdf.PdfReader
+PdfWriter = pypdf.PdfWriter
+fpdf = require_module("fpdf", "fpdf2")
+FPDF = fpdf.FPDF
+
+_UNICODE_FAMILY = "WinBrowUnicode"
 
 
 def _parse_pages(raw, page_count: int) -> list[int]:
@@ -36,6 +52,68 @@ def _parse_pages(raw, page_count: int) -> list[int]:
     return [page for page in pages if 0 <= page < page_count]
 
 
+def _is_cp1252(text: str) -> bool:
+    try:
+        text.encode("cp1252")
+        return True
+    except UnicodeEncodeError:
+        return False
+
+
+def _unicode_font_path() -> Path | None:
+    root = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+    for name in ("segoeui.ttf", "arial.ttf", "calibri.ttf"):
+        candidate = root / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _set_font(pdf, text: str, size: float, *, bold: bool = False) -> bool:
+    """Select a font for ``text``; return True when the text must be sanitized."""
+    if _is_cp1252(text):
+        pdf.set_font("helvetica", style="B" if bold else "", size=size)
+        return False
+    font_path = _unicode_font_path()
+    if font_path is not None:
+        if _UNICODE_FAMILY not in pdf.fonts:
+            pdf.add_font(_UNICODE_FAMILY, "", str(font_path))
+        # The same TTF is registered for the regular style only. Use size to
+        # distinguish a title rather than asking fpdf2 for a missing bold face.
+        pdf.set_font(_UNICODE_FAMILY, style="", size=size)
+        return False
+    pdf.set_font("helvetica", style="B" if bold else "", size=size)
+    return True
+
+
+def _cp1252(text: str) -> str:
+    return text.encode("cp1252", errors="replace").decode("cp1252")
+
+
+def _write_pdf(writer, output: Path) -> None:
+    ensure_parent(output)
+    temporary = output.with_name(output.name + ".tmp")
+    try:
+        with open(temporary, "wb") as handle:
+            writer.write(handle)
+        os.replace(temporary, output)
+    except Exception as exc:
+        fail(f"Could not write PDF: {type(exc).__name__}: {exc}")
+    finally:
+        try:
+            if temporary.exists():
+                temporary.unlink()
+        except OSError:
+            pass
+
+
+def _readable_reader(path: Path):
+    try:
+        return open_reader(path)
+    except PdfError as exc:
+        fail(str(exc))
+
+
 def create(spec: dict) -> None:
     output = resolve_path(spec.get("output_path") or spec.get("path") or "")
     if output.suffix.lower() != ".pdf":
@@ -44,30 +122,35 @@ def create(spec: dict) -> None:
     content = read_text_arg(spec)
     if not content:
         fail("Nothing to write. Provide content or content_path.")
-    title = str(spec.get("title") or "").strip()
-    if title:
-        content = f"{title}\n\n{content}"
+    title = " ".join(str(spec.get("title") or "").splitlines()).strip()
 
-    document = fitz.open()
-    page_width, page_height = fitz.paper_size("a4")
-    margin = 54
-    rect = fitz.Rect(margin, margin, page_width - margin, page_height - margin)
-    # Split the content into page-sized chunks on line boundaries.
-    lines = content.splitlines() or [""]
-    index = 0
-    # Approximate the number of lines that fit; insert_textbox wraps long
-    # lines within the rect. Drawing once per page avoids double-rendering.
-    line_height = 11 * 1.35
-    lines_per_page = max(10, int(rect.height / line_height))
-    while index < len(lines):
-        page = document.new_page(width=page_width, height=page_height)
-        chunk = lines[index:index + lines_per_page]
-        index += len(chunk)
-        page.insert_textbox(
-            rect, "\n".join(chunk), fontsize=11, fontname="helv", lineheight=1.35,
-        )
-    document.save(str(output))
-    document.close()
+    pdf = FPDF(unit="pt", format="A4")
+    pdf.set_margins(54, 54, 54)
+    pdf.set_auto_page_break(auto=True, margin=54)
+    pdf.add_page()
+
+    # A title is rendered larger; body text follows. fpdf2 adds pages
+    # automatically when multi_cell reaches the bottom margin.
+    if title:
+        sanitize = _set_font(pdf, title, 18, bold=True)
+        title_text = _cp1252(title) if sanitize else title
+        pdf.multi_cell(0, 24, title_text, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(8)
+
+    sanitize = _set_font(pdf, content, 11)
+    for line in content.splitlines():
+        line = line.replace("\t", "    ")
+        if sanitize:
+            line = _cp1252(line)
+        if line.strip():
+            pdf.multi_cell(0, 15, line, new_x="LMARGIN", new_y="NEXT")
+        else:
+            pdf.ln(15)
+
+    try:
+        pdf.output(str(output))
+    except Exception as exc:
+        fail(f"Could not create PDF: {type(exc).__name__}: {exc}")
     emit(True, f"Created PDF: {output}", path=output)
 
 
@@ -78,16 +161,15 @@ def merge(spec: dict) -> None:
     output = resolve_path(spec.get("output_path") or spec.get("path") or "")
     if output.suffix.lower() != ".pdf":
         output = output.with_suffix(".pdf")
-    ensure_parent(output)
-    merged = fitz.open()
+    writer = PdfWriter()
     for item in inputs:
         path = resolve_path(item)
         if not path.is_file():
             fail(f"Input PDF not found: {path}")
-        with fitz.open(str(path)) as source:
-            merged.insert_pdf(source)
-    merged.save(str(output))
-    merged.close()
+        reader = _readable_reader(path)
+        for page in reader.pages:
+            writer.add_page(page)
+    _write_pdf(writer, output)
     emit(True, f"Merged {len(inputs)} PDFs into {output}", path=output)
 
 
@@ -97,15 +179,17 @@ def split(spec: dict) -> None:
         fail(f"PDF not found: {path}")
     output_dir = resolve_path(spec.get("output_dir") or path.parent)
     output_dir.mkdir(parents=True, exist_ok=True)
+    reader = _readable_reader(path)
+    pages = _parse_pages(spec.get("pages"), len(reader.pages))
+    if not pages:
+        fail("No pages selected.")
     written: list[str] = []
-    with fitz.open(str(path)) as source:
-        pages = _parse_pages(spec.get("pages"), source.page_count)
-        for page_number in pages:
-            target = output_dir / f"{path.stem}_page_{page_number + 1}.pdf"
-            with fitz.open() as one:
-                one.insert_pdf(source, from_page=page_number, to_page=page_number)
-                one.save(str(target))
-            written.append(str(target))
+    for page_number in pages:
+        target = output_dir / f"{path.stem}_page_{page_number + 1}.pdf"
+        writer = PdfWriter()
+        writer.add_page(reader.pages[page_number])
+        _write_pdf(writer, target)
+        written.append(str(target))
     emit(True, f"Split {len(written)} page(s) into {output_dir}", paths=written)
 
 
@@ -114,15 +198,40 @@ def rotate(spec: dict) -> None:
     if not path.is_file():
         fail(f"PDF not found: {path}")
     output = resolve_path(spec.get("output_path") or path)
-    ensure_parent(output)
-    angle = int(spec.get("angle") or 90)
-    with fitz.open(str(path)) as document:
-        pages = _parse_pages(spec.get("pages"), document.page_count)
-        for page_number in pages:
-            page = document[page_number]
-            page.set_rotation((page.rotation + angle) % 360)
-        document.save(str(output))
+    try:
+        angle = int(spec.get("angle") or 90) % 360
+    except (TypeError, ValueError):
+        fail("The rotation angle must be a whole number.")
+    if angle % 90:
+        fail("The rotation angle must be a multiple of 90 degrees.")
+    reader = _readable_reader(path)
+    pages = _parse_pages(spec.get("pages"), len(reader.pages))
+    if not pages:
+        fail("No pages selected.")
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    for page_number in pages:
+        writer.pages[page_number].rotate(angle)
+    _write_pdf(writer, output)
     emit(True, f"Rotated {len(pages)} page(s) by {angle} degrees", path=output)
+
+
+def _watermark_overlay(width: float, height: float, text: str, font_size: float):
+    pdf = FPDF(unit="pt", format=(width, height))
+    pdf.set_margins(0, 0, 0)
+    pdf.set_auto_page_break(auto=False)
+    pdf.add_page()
+    sanitize = _set_font(pdf, text, font_size)
+    if sanitize:
+        text = _cp1252(text)
+    pdf.set_text_color(180, 180, 180)
+    text_width = pdf.get_string_width(text)
+    x = max(0.0, (width - text_width) / 2)
+    y = height / 2
+    with pdf.rotation(45, x=x + text_width / 2, y=y):
+        pdf.text(x, y, text)
+    return PdfReader(io.BytesIO(bytes(pdf.output()))).pages[0]
 
 
 def watermark(spec: dict) -> None:
@@ -130,21 +239,31 @@ def watermark(spec: dict) -> None:
     if not path.is_file():
         fail(f"PDF not found: {path}")
     output = resolve_path(spec.get("output_path") or path)
-    ensure_parent(output)
     text = str(spec.get("text") or "CONFIDENTIAL")
-    with fitz.open(str(path)) as document:
-        for page in document:
-            rect = page.rect
-            page.insert_text(
-                fitz.Point(rect.width * 0.16, rect.height * 0.55),
+    try:
+        font_size = float(spec.get("font_size") or 48)
+    except (TypeError, ValueError):
+        font_size = 48.0
+    reader = _readable_reader(path)
+    pages = _parse_pages(spec.get("pages"), len(reader.pages))
+    if not pages:
+        fail("No pages selected.")
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    try:
+        for page_number in pages:
+            page = writer.pages[page_number]
+            overlay = _watermark_overlay(
+                float(page.mediabox.width),
+                float(page.mediabox.height),
                 text,
-                fontsize=float(spec.get("font_size") or 48),
-                fontname="helv",
-                color=(0.7, 0.7, 0.7),
-                rotate=45,
-                overlay=True,
+                font_size,
             )
-        document.save(str(output))
+            page.merge_page(overlay)
+    except Exception as exc:
+        fail(f"Could not add watermark: {type(exc).__name__}: {exc}")
+    _write_pdf(writer, output)
     emit(True, f"Added watermark to {output}", path=output)
 
 
@@ -153,18 +272,21 @@ def encrypt(spec: dict) -> None:
     if not path.is_file():
         fail(f"PDF not found: {path}")
     output = resolve_path(spec.get("output_path") or path)
-    ensure_parent(output)
     user_pw = str(spec.get("user_password") or "")
     owner_pw = str(spec.get("owner_password") or user_pw)
     if not user_pw:
         fail("A user_password is required for encryption.")
-    with fitz.open(str(path)) as document:
-        document.save(
-            str(output),
-            encryption=fitz.PDF_ENCRYPT_AES_256,
-            user_pw=user_pw,
-            owner_pw=owner_pw,
-        )
+    reader = _readable_reader(path)
+    if reader.is_encrypted:
+        fail("Input PDF is already encrypted.")
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    try:
+        writer.encrypt(user_pw, owner_pw, algorithm="AES-256")
+    except Exception as exc:
+        fail(f"Could not encrypt PDF: {type(exc).__name__}: {exc}")
+    _write_pdf(writer, output)
     emit(True, f"Encrypted PDF: {output}", path=output)
 
 
@@ -172,11 +294,17 @@ def extract_text(spec: dict) -> None:
     path = resolve_path(spec.get("path") or spec.get("input_path") or "")
     if not path.is_file():
         fail(f"PDF not found: {path}")
-    with fitz.open(str(path)) as document:
-        pages = _parse_pages(spec.get("pages"), document.page_count)
-        chunks = []
+    reader = _readable_reader(path)
+    pages = _parse_pages(spec.get("pages"), len(reader.pages))
+    if not pages:
+        fail("No pages selected.")
+    chunks = []
+    try:
         for page_number in pages:
-            chunks.append(f"\n--- Page {page_number + 1} ---\n{document[page_number].get_text()}")
+            text = reader.pages[page_number].extract_text() or ""
+            chunks.append(f"\n--- Page {page_number + 1} ---\n{text}")
+    except Exception as exc:
+        fail(f"Could not extract PDF text: {type(exc).__name__}: {exc}")
     emit(True, clip("".join(chunks)))
 
 

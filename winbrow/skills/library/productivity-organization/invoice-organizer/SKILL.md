@@ -31,7 +31,8 @@ rename them consistently for an accountant.
 
 - `run_skill_script` with `skill="invoice-organizer"` and
   `script="organize_invoices.py"`.
-- PyMuPDF is installed. PDFs need a text layer for extraction.
+- The pure-Python PDF text extractor is installed. PDFs need a text layer for
+  extraction.
 - Images (PNG/JPG/TIFF) need OCR first.
 
 ## Step Pattern
