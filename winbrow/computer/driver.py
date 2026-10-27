@@ -67,6 +67,9 @@ user32.SetClipboardData.restype = ctypes.c_void_p
 user32.SetClipboardData.argtypes = [wt.UINT, ctypes.c_void_p]
 user32.GetClipboardData.restype = ctypes.c_void_p
 user32.GetClipboardData.argtypes = [wt.UINT]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.SetCursorPos.restype = wt.BOOL
 
 VK_MENU = 0x12
 SW_RESTORE = 9
@@ -133,6 +136,96 @@ class ComputerDriver:
     def screen_size(self) -> Tuple[int, int]:
         return (user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
 
+    # ---------------------------------------------------------------- geometry
+    def _cursor_pos(self) -> Tuple[int, int]:
+        point = wt.POINT()
+        user32.GetCursorPos(ctypes.byref(point))
+        return int(point.x), int(point.y)
+
+    @staticmethod
+    def _virtual_rect() -> Tuple[int, int, int, int]:
+        """Virtual desktop bounds across all monitors (x, y, w, h)."""
+        return (
+            int(user32.GetSystemMetrics(76)),   # SM_XVIRTUALSCREEN
+            int(user32.GetSystemMetrics(77)),   # SM_YVIRTUALSCREEN
+            int(user32.GetSystemMetrics(78)),   # SM_CXVIRTUALSCREEN
+            int(user32.GetSystemMetrics(79)),   # SM_CYVIRTUALSCREEN
+        )
+
+    def _validate_point(self, x: int, y: int) -> str:
+        """Return '' when (x, y) is safe to click, else the reason."""
+        vx, vy, vw, vh = self._virtual_rect()
+        if vw > 0 and vh > 0 and not (vx <= x < vx + vw and vy <= y < vy + vh):
+            return f"target ({x},{y}) is outside the screen bounds"
+        w, h = self._primary_size()
+        corners = {
+            (0, 0), (max(0, w - 1), 0),
+            (0, max(0, h - 1)), (max(0, w - 1), max(0, h - 1)),
+        }
+        if (x, y) in corners:
+            return (
+                f"target ({x},{y}) is exactly on a screen corner "
+                "(PyAutoGUI fail-safe point)"
+            )
+        return ""
+
+    @staticmethod
+    def _primary_size() -> Tuple[int, int]:
+        return (int(user32.GetSystemMetrics(0)), int(user32.GetSystemMetrics(1)))
+
+    def _escape_failsafe_corner(self) -> bool:
+        """Nudge a cursor parked in a PyAutoGUI corner a few pixels inward.
+
+        PyAutoGUI checks the CURRENT position before every action, so a mouse
+        left resting in a corner makes every click fail even when the target is
+        valid. FAILSAFE stays enabled: a user who moves the mouse into a corner
+        while an action runs still aborts it.
+        """
+        try:
+            import pyautogui
+            x, y = pyautogui.position()
+            w, h = pyautogui.size()
+        except Exception:
+            return False
+        x, y, w, h = int(x), int(y), int(w), int(h)
+        corners = {
+            (0, 0), (max(0, w - 1), 0),
+            (0, max(0, h - 1)), (max(0, w - 1), max(0, h - 1)),
+        }
+        if (x, y) not in corners:
+            return False
+        nx = 2 if x < w // 2 else max(2, w - 3)
+        ny = 2 if y < h // 2 else max(2, h - 3)
+        user32.SetCursorPos(nx, ny)
+        time.sleep(0.02)
+        log.info(
+            f"Cursor was in a PyAutoGUI fail-safe corner; nudged to ({nx},{ny})"
+        )
+        return True
+
+    @staticmethod
+    def _to_pyautogui(x: int, y: int) -> Tuple[int, int]:
+        """Scale to PyAutoGUI's space if DPI awareness made the sizes differ."""
+        try:
+            import pyautogui
+            pw, ph = pyautogui.size()
+        except Exception:
+            return x, y
+        rw = int(user32.GetSystemMetrics(0))
+        rh = int(user32.GetSystemMetrics(1))
+        if rw <= 0 or rh <= 0 or (int(pw), int(ph)) == (rw, rh):
+            return x, y
+        return int(round(x * pw / rw)), int(round(y * ph / rh))
+
+    @staticmethod
+    def _failsafe_output(target: str = "") -> str:
+        where = f" at {target}" if target else ""
+        return (
+            f"PyAutoGUI fail-safe triggered{where}: the cursor is in a screen "
+            "corner. Move the mouse away from the corner (or use a keyboard "
+            "shortcut) and retry."
+        )
+
     # ---------------------------------------------------------------- mouse
     def click(
         self, x: Optional[int] = None, y: Optional[int] = None,
@@ -141,32 +234,79 @@ class ComputerDriver:
         """Click at coordinates (defaults: current cursor position)."""
         self._guard("click")
         import pyautogui
+        target = ""
         if x is not None and y is not None:
-            pyautogui.moveTo(int(x), int(y), duration=0.0) if move_first else None
-        pyautogui.click(button=button, clicks=2 if double else 1, interval=0.05 if double else 0)
-        return {"success": True, "output": f"Clicked {button} at ({x}, {y})" if x is not None else "Clicked"}
+            x, y = int(x), int(y)
+            target = f"({x},{y})"
+            problem = self._validate_point(x, y)
+            if problem:
+                return {"success": False, "output": f"Refusing click: {problem}."}
+        self._escape_failsafe_corner()
+        if x is not None and y is not None:
+            x, y = self._to_pyautogui(x, y)
+        try:
+            if x is not None and y is not None and move_first:
+                pyautogui.moveTo(x, y, duration=0.0)
+            pyautogui.click(
+                button=button, clicks=2 if double else 1,
+                interval=0.05 if double else 0,
+            )
+        except pyautogui.FailSafeException:
+            log.warning(
+                f"Click fail-safe target={target or 'current cursor'} "
+                f"cursor={self._cursor_pos()} screen={self._primary_size()}"
+            )
+            return {"success": False, "output": self._failsafe_output(target)}
+        return {
+            "success": True,
+            "output": f"Clicked {button} at ({x}, {y})" if x is not None else "Clicked",
+        }
 
     def move(self, x: int, y: int) -> dict:
         self._guard("move")
         import pyautogui
-        pyautogui.moveTo(int(x), int(y), duration=0.0)
+        x, y = int(x), int(y)
+        problem = self._validate_point(x, y)
+        if problem:
+            return {"success": False, "output": f"Refusing move: {problem}."}
+        self._escape_failsafe_corner()
+        x, y = self._to_pyautogui(x, y)
+        try:
+            pyautogui.moveTo(x, y, duration=0.0)
+        except pyautogui.FailSafeException:
+            return {"success": False, "output": self._failsafe_output(f"({x},{y})")}
         return {"success": True, "output": f"Moved cursor to ({x}, {y})"}
 
     def drag(self, x1: int, y1: int, x2: int, y2: int, duration: float = 0.25) -> dict:
         self._guard("drag")
         import pyautogui
-        pyautogui.moveTo(int(x1), int(y1), duration=0.0)
-        pyautogui.drag(int(x2) - int(x1), int(y2) - int(y1), duration=duration, button="left")
+        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+        problem = self._validate_point(x1, y1) or self._validate_point(x2, y2)
+        if problem:
+            return {"success": False, "output": f"Refusing drag: {problem}."}
+        self._escape_failsafe_corner()
+        ax, ay = self._to_pyautogui(x1, y1)
+        bx, by = self._to_pyautogui(x2, y2)
+        try:
+            pyautogui.moveTo(ax, ay, duration=0.0)
+            pyautogui.drag(bx - ax, by - ay, duration=duration, button="left")
+        except pyautogui.FailSafeException:
+            return {"success": False, "output": self._failsafe_output(f"({x2},{y2})")}
         return {"success": True, "output": f"Dragged ({x1},{y1}) -> ({x2},{y2})"}
 
     def scroll(self, amount: int = 3, direction: str = "down", x: Optional[int] = None,
                y: Optional[int] = None) -> dict:
         self._guard("scroll")
         import pyautogui
-        if x is not None and y is not None:
-            pyautogui.moveTo(int(x), int(y), duration=0.0)
-        clicks = int(amount) * (-1 if direction == "down" else 1)
-        pyautogui.scroll(clicks)
+        self._escape_failsafe_corner()
+        try:
+            if x is not None and y is not None:
+                px, py = self._to_pyautogui(int(x), int(y))
+                pyautogui.moveTo(px, py, duration=0.0)
+            clicks = int(amount) * (-1 if direction == "down" else 1)
+            pyautogui.scroll(clicks)
+        except pyautogui.FailSafeException:
+            return {"success": False, "output": self._failsafe_output()}
         return {"success": True, "output": f"Scrolled {direction} {amount}"}
 
     # ---------------------------------------------------------------- keyboard
@@ -205,7 +345,11 @@ class ComputerDriver:
         self._guard("press keys")
         import pyautogui
         keys = self.parse_key_combo(combo)
-        pyautogui.hotkey(*keys)
+        self._escape_failsafe_corner()
+        try:
+            pyautogui.hotkey(*keys)
+        except pyautogui.FailSafeException:
+            return {"success": False, "output": self._failsafe_output()}
         return {"success": True, "output": f"Pressed {'+'.join(keys)}"}
 
     def type_text(self, text: str, via_clipboard: bool = True) -> dict:
@@ -218,7 +362,11 @@ class ComputerDriver:
             time.sleep(0.05)
             return self.press_key("ctrl+v")
         import pyautogui
-        pyautogui.typewrite(text, interval=0.01)
+        self._escape_failsafe_corner()
+        try:
+            pyautogui.typewrite(text, interval=0.01)
+        except pyautogui.FailSafeException:
+            return {"success": False, "output": self._failsafe_output()}
         return {"success": True, "output": f"Typed {len(text)} chars"}
 
     def paste(self, text: Optional[str] = None) -> dict:

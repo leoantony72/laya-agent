@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Algorithmic Art</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.7.0/p5.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600&family=Lora:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #141413; --paper: #faf9f5; --line: #e6e2d9;
+    --accent: #d97757; --muted: #6b6862;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--paper); color: var(--ink);
+    font-family: Poppins, system-ui, sans-serif;
+    display: grid; grid-template-columns: 300px 1fr; min-height: 100vh;
+  }
+  aside {
+    border-right: 1px solid var(--line); padding: 24px 20px;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  h1 { font-family: Lora, serif; font-size: 22px; margin: 0; }
+  h2 { font-size: 11px; letter-spacing: .12em; text-transform: uppercase;
+       color: var(--muted); margin: 4px 0 0; }
+  .seed-row, .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  button {
+    font: inherit; font-size: 12px; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid var(--line); background: #fff; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  input[type="number"] {
+    width: 90px; padding: 6px; border: 1px solid var(--line); border-radius: 6px;
+    font: inherit; font-size: 12px; background: #fff;
+  }
+  .control { display: grid; gap: 4px; }
+  .control label { font-size: 12px; display: flex; justify-content: space-between; }
+  .control input[type="range"] { width: 100%; accent-color: var(--accent); }
+  #seed-display { font-family: Lora, serif; font-size: 28px; }
+  main { display: grid; place-items: center; padding: 24px; }
+  #canvas-container { width: min(88vh, 100%); aspect-ratio: 1; }
+  #canvas-container canvas { width: 100% !important; height: auto !important; }
+  .hint { font-size: 11px; color: var(--muted); line-height: 1.5; }
+</style>
+</head>
+<body>
+<aside>
+  <div>
+    <h1 id="art-title">Algorithmic Art</h1>
+    <h2>Seed</h2>
+  </div>
+  <div id="seed-display">12345</div>
+  <div class="seed-row">
+    <button id="seed-prev">Prev</button>
+    <button id="seed-next">Next</button>
+    <button id="seed-random">Random</button>
+  </div>
+  <div class="seed-row">
+    <input id="seed-input" type="number" min="0" step="1" value="12345">
+    <button id="seed-go">Go</button>
+  </div>
+  <div>
+    <h2>Parameters</h2>
+    <div id="controls" style="display:grid; gap:12px; margin-top:10px;"></div>
+  </div>
+  <div>
+    <h2>Actions</h2>
+    <div class="actions" style="margin-top:10px;">
+      <button id="regenerate">Regenerate</button>
+      <button id="reset">Reset</button>
+      <button id="download">Download PNG</button>
+    </div>
+  </div>
+  <p class="hint">Same seed + same parameters = identical artwork. Move a slider to explore the system.</p>
+</aside>
+<main><div id="canvas-container"></div></main>
+
+<script src="sketch.js"></script>
+<script>
+(() => {
+  const seedDisplay = document.getElementById("seed-display");
+  const seedInput = document.getElementById("seed-input");
+  const controls = document.getElementById("controls");
+
+  function seedOf(value) {
+    const number = Math.abs(Math.floor(Number(value) || 0));
+    params.seed = number;
+    seedDisplay.textContent = String(number);
+    seedInput.value = String(number);
+    if (typeof applySeed === "function") {
+      applySeed(number);
+    } else {
+      randomSeed(number);
+      noiseSeed(number);
+    }
+    if (typeof resetArt === "function") resetArt();
+    if (typeof redraw === "function") redraw();
+  }
+
+  function buildControls() {
+    controls.innerHTML = "";
+    const specs = (typeof parameterSpec !== "undefined" && parameterSpec) || [];
+    specs.forEach((spec) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "control";
+      const label = document.createElement("label");
+      const name = document.createElement("span");
+      name.textContent = spec.label || spec.key;
+      const value = document.createElement("span");
+      value.textContent = String(params[spec.key]);
+      label.append(name, value);
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = spec.min;
+      input.max = spec.max;
+      input.step = spec.step || 1;
+      input.value = params[spec.key];
+      input.addEventListener("input", () => {
+        params[spec.key] = Number(input.value);
+        value.textContent = String(params[spec.key]);
+        if (typeof resetArt === "function") resetArt();
+        if (typeof redraw === "function") redraw();
+      });
+      wrapper.append(label, input);
+      controls.append(wrapper);
+    });
+  }
+
+  document.getElementById("seed-prev").addEventListener("click", () => seedOf(params.seed - 1));
+  document.getElementById("seed-next").addEventListener("click", () => seedOf(params.seed + 1));
+  document.getElementById("seed-random").addEventListener("click", () => seedOf(Math.floor(Math.random() * 1e6)));
+  document.getElementById("seed-go").addEventListener("click", () => seedOf(seedInput.value));
+  document.getElementById("regenerate").addEventListener("click", () => seedOf(params.seed));
+  document.getElementById("reset").addEventListener("click", () => {
+    if (typeof defaultParams === "object") Object.assign(params, defaultParams);
+    buildControls();
+    seedOf(params.seed);
+  });
+  document.getElementById("download").addEventListener("click", () => {
+    saveCanvas(`algorithmic-art-${params.seed}`, "png");
+  });
+
+  const title = (typeof artTitle === "string" && artTitle) || document.title;
+  document.getElementById("art-title").textContent = title;
+  buildControls();
+  // p5 attaches its global functions during load; seeding before that throws.
+  window.addEventListener("load", () => seedOf(params.seed));
+})();
+</script>
+</body>
+</html>

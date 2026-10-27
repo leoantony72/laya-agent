@@ -61,9 +61,10 @@ class ScreenView:
 class OCRLine:
     text: str
     rect: Tuple[int, int, int, int]   # screen coords: left, top, w, h
+    words: List[dict] = field(default_factory=list)  # [{text, rect}] for precise clicks
 
     def to_dict(self) -> dict:
-        return {"text": self.text, "rect": list(self.rect)}
+        return {"text": self.text, "rect": list(self.rect), "words": self.words}
 
 
 # ---------------------------------------------------------------------------
@@ -117,14 +118,41 @@ try {
 
 $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
 
-$logDenom = [Math]::Max([Math]::Max($bitmap.PixelWidth, $bitmap.PixelHeight), 1)
 $lines = @()
 foreach ($line in $result.Lines) {
-    $w = $line.BoundingRect.Width
-    $h = $line.BoundingRect.Height
+    $words = @()
+    $left = [int]::MaxValue
+    $top = [int]::MaxValue
+    $right = [int]::MinValue
+    $bottom = [int]::MinValue
+    foreach ($word in $line.Words) {
+        $wr = $word.BoundingRect
+        $wx = [int]$wr.X
+        $wy = [int]$wr.Y
+        $ww = [int]$wr.Width
+        $wh = [int]$wr.Height
+        if ($wx -lt $left) { $left = $wx }
+        if ($wy -lt $top) { $top = $wy }
+        if (($wx + $ww) -gt $right) { $right = $wx + $ww }
+        if (($wy + $wh) -gt $bottom) { $bottom = $wy + $wh }
+        $words += [ordered]@{
+            text = [string]$word.Text
+            x = $wx
+            y = $wy
+            w = $ww
+            h = $wh
+        }
+    }
+    if ($words.Count -eq 0) {
+        $left = 0; $top = 0; $right = 0; $bottom = 0
+    }
     $lines += [ordered]@{
-        text = $line.Text
-        rect = @([int]$line.BoundingRect.X, [int]$line.BoundingRect.Y, [int]$w, [int]$h)
+        text  = [string]$line.Text
+        x     = $left
+        y     = $top
+        w     = [Math]::Max(0, $right - $left)
+        h     = [Math]::Max(0, $bottom - $top)
+        words = $words
     }
 }
 @{
@@ -135,6 +163,33 @@ foreach ($line in $result.Lines) {
     lines     = $lines
 } | ConvertTo-Json -Depth 4 -Compress | Set-Content -Path $OutPath -Encoding UTF8
 """
+
+
+def _rect4(raw: Any, ox: int = 0, oy: int = 0) -> Tuple[int, int, int, int]:
+    """Normalize an OCR rect from dict, list, or 'x y w h' string."""
+    if isinstance(raw, dict):
+        values = [
+            raw.get("x", raw.get("left", 0)),
+            raw.get("y", raw.get("top", 0)),
+            raw.get("w", raw.get("width", 0)),
+            raw.get("h", raw.get("height", 0)),
+        ]
+    else:
+        if isinstance(raw, str):
+            parts = raw.replace(",", " ").split()
+        elif isinstance(raw, (list, tuple)):
+            parts = list(raw)
+        else:
+            parts = []
+        values = []
+        for part in parts[:4]:
+            try:
+                values.append(int(float(part)))
+            except (TypeError, ValueError):
+                values.append(0)
+        values += [0] * (4 - len(values))
+    x, y, w, h = values
+    return int(x) + ox, int(y) + oy, int(w), int(h)
 
 
 class Screen:
@@ -225,11 +280,27 @@ class Screen:
         self._ocr_available = True
         ox, oy = view.rect[0], view.rect[1]
         lines = []
-        for ln in data.get("lines", []):
-            r = ln.get("rect", [0, 0, 0, 0])
+        raw_lines = data.get("lines") or []
+        if isinstance(raw_lines, dict):
+            raw_lines = [raw_lines]
+        for ln in raw_lines:
+            if not isinstance(ln, dict):
+                continue
+            raw_words = ln.get("words") or []
+            if isinstance(raw_words, dict):
+                raw_words = [raw_words]
+            words = []
+            for word in raw_words:
+                if not isinstance(word, dict):
+                    continue
+                words.append({
+                    "text": str(word.get("text", "")),
+                    "rect": _rect4(word, ox, oy),
+                })
             lines.append(OCRLine(
                 text=str(ln.get("text", "")),
-                rect=(int(r[0]) + ox, int(r[1]) + oy, int(r[2]), int(r[3])),
+                rect=_rect4(ln.get("rect", ln), ox, oy),
+                words=words,
             ).to_dict())
         return {
             "available": True,

@@ -60,19 +60,26 @@ class AccessibilityTree:
         self._initialized = False
         
     def _init_uia(self) -> bool:
-        """Initialize UIAutomation COM interface."""
+        """Initialize UIAutomation COM interface (by CLSID, not ProgID)."""
         try:
             import comtypes
             import comtypes.client
-            from comtypes.gen import UIAutomationClient
-            
+            try:
+                from comtypes.gen import UIAutomationClient as UIA
+            except Exception:
+                comtypes.client.GetModule("UIAutomationCore.dll")
+                from comtypes.gen import UIAutomationClient as UIA
+
             # Initialize COM
-            import pythoncom
-            pythoncom.CoInitialize()
-            
-            # Create UIAutomation instance
-            self._uia = comtypes.client.CreateObject(
-                "UIAutomationClient.CUIAutomation"
+            comtypes.CoInitialize()
+
+            # Create UIAutomation instance. CreateObject("UIAutomationClient
+            # .CUIAutomation") raises CO_E_CLASSSTRING on systems where that
+            # ProgID is not registered; the CLSID always exists.
+            self._uia = comtypes.CoCreateInstance(
+                UIA.CUIAutomation._reg_clsid_,
+                interface=UIA.IUIAutomation,
+                clsctx=comtypes.CLSCTX_INPROC_SERVER,
             )
             return True
         except ImportError:

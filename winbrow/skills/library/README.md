@@ -1,7 +1,11 @@
 # Converted Skill Library
 
-This folder contains 43 skills converted from the six requested sections of
-[ComposioHQ/awesome-claude-skills](https://github.com/ComposioHQ/awesome-claude-skills).
+This folder contains 46 playbook skills. Most were converted from the six
+requested sections of
+[ComposioHQ/awesome-claude-skills](https://github.com/ComposioHQ/awesome-claude-skills);
+`docx`, `pdf`, `pptx`, `algorithmic-art`, and `skill-creator` were adapted from
+[anthropics/skills](https://github.com/anthropics/skills); `html-ppt` is adapted
+from [lewislulu/html-ppt-skill](https://github.com/lewislulu/html-ppt-skill).
 No skills from Development, Business, Security, Assistive Technology, or App
 Automation were used.
 

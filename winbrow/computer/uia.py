@@ -82,11 +82,10 @@ def w_pos(rect: Tuple[int, int, int, int]) -> bool:
 
 
 def _com_init_once() -> bool:
-    """Initialize comtypes + CoInitialize on this thread once."""
+    """Initialize COM on this thread once (safe to call repeatedly)."""
     try:
-        import comtypes.client
-        import pythoncom
-        pythoncom.CoInitialize()
+        import comtypes
+        comtypes.CoInitialize()
         return True
     except Exception as e:
         log.info(f"UIA unavailable ({e}) — OCR/window rungs remain.")
@@ -99,33 +98,66 @@ class UIATree:
     def __init__(self, max_nodes: int = 150, max_depth: int = 10):
         self.max_nodes = max_nodes
         self.max_depth = max_depth
-        self._engine = None
-        self._lock = threading.Lock()
+        # COM objects are apartment-bound. Tools run via asyncio.to_thread, so
+        # keep one engine per worker thread instead of sharing one across them.
+        self._local = threading.local()
+        self._warned = False
+
+    @staticmethod
+    def _create_engine():
+        """Create IUIAutomation by CLSID, not by the unregistered ProgID."""
+        import comtypes
+        import comtypes.client
+        try:
+            from comtypes.gen import UIAutomationClient as UIA
+        except Exception:
+            comtypes.client.GetModule("UIAutomationCore.dll")
+            from comtypes.gen import UIAutomationClient as UIA
+        return comtypes.CoCreateInstance(
+            UIA.CUIAutomation._reg_clsid_,
+            interface=UIA.IUIAutomation,
+            clsctx=comtypes.CLSCTX_INPROC_SERVER,
+        )
 
     def _get_engine(self) -> Optional[Any]:
-        """Create the CUIAutomation COM object (thread-safe, once)."""
-        if self._engine is not None:
-            return self._engine
-        with self._lock:
-            if self._engine is not None:
-                return self._engine
+        """Create the CUIAutomation COM object (per-thread, once)."""
+        engine = getattr(self._local, "engine", None)
+        if engine is not None:
+            return engine
+        if not _com_init_once():
+            return None
+        errors = []
+        engine = None
+        try:
+            engine = self._create_engine()
+        except Exception as e:
+            errors.append(f"CLSID init: {e}")
+        if engine is None:
+            # Legacy fallback for systems where the generated module is absent.
             try:
                 import comtypes.client
-                self._engine = comtypes.client.CreateObject("UIAutomationClient.CUIAutomation")
+                engine = comtypes.client.CreateObject(
+                    "UIAutomationClient.CUIAutomation"
+                )
             except Exception as e:
-                log.info(f"UIA engine init failed: {e}")
-                return None
-        return self._engine
+                errors.append(f"ProgID init: {e}")
+        if engine is None:
+            if not self._warned:
+                log.warning("UIA engine init failed: " + "; ".join(errors))
+                self._warned = True
+            return None
+        self._local.engine = engine
+        return engine
 
     # ------------------------------------------------------------------ observe
     def observe(self, hwnd: int, max_nodes: Optional[int] = None) -> List[UIAElement]:
         """Interactive element list for the given window (prompt-friendly)."""
-        engines = self._get_engine()
-        if not engines or not _com_init_once():
+        engine = self._get_engine()
+        if not engine or not hwnd:
             return []
         elements: List[UIAElement] = []
         try:
-            root = self._engine.ElementFromHandle(hwnd)
+            root = engine.ElementFromHandle(hwnd)
 
             def walk(el, depth):
                 if len(elements) >= (max_nodes or self.max_nodes) or depth > self.max_depth:

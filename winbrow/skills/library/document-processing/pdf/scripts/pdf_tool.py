@@ -13,6 +13,10 @@ import os
 from pathlib import Path
 
 from winbrow.pdf_utils import PdfError, open_reader
+from winbrow.image_search import find_image as find_web_image
+from winbrow.image_search import search_and_download
+from winbrow.layout.pdf import PAGE_SIZES, PdfTheme, parse_blocks, render_pdf
+from winbrow.layout.validate import validate_pdf
 from winbrow.skill_script_utils import (
     clip, emit, ensure_parent, fail, load_spec, read_text_arg, require_module,
     resolve_path,
@@ -114,44 +118,210 @@ def _readable_reader(path: Path):
         fail(str(exc))
 
 
+def _rgb(value, default: tuple[int, int, int]) -> tuple[int, int, int]:
+    if value is None:
+        return default
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return tuple(max(0, min(255, int(part))) for part in value)  # type: ignore[return-value]
+    text = str(value).strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(char * 2 for char in text)
+    if len(text) != 6:
+        return default
+    try:
+        return tuple(int(text[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        return default
+
+
+def _theme_from_spec(spec: dict) -> PdfTheme:
+    from winbrow.layout.pdf import THEMES
+
+    name = str(spec.get("theme") or "corporate").strip().lower()
+    if name not in THEMES:
+        name = "corporate"
+    base = THEMES[name]
+    raw_margins = spec.get("margins")
+    if isinstance(raw_margins, dict):
+        margins = (
+            float(raw_margins.get("left", 56)),
+            float(raw_margins.get("top", 56)),
+            float(raw_margins.get("right", 56)),
+            float(raw_margins.get("bottom", 56)),
+        )
+    elif isinstance(raw_margins, (list, tuple)) and len(raw_margins) == 4:
+        margins = tuple(float(value) for value in raw_margins)  # type: ignore[assignment]
+    else:
+        margins = (56.0, 56.0, 56.0, 56.0)
+    colors = {}
+    for key, value in (spec.get("colors") or {}).items():
+        if key in base:
+            colors[key] = _rgb(value, base[key])
+    return PdfTheme(
+        name=name,
+        page_size=str(spec.get("page_size") or "a4").strip().lower(),
+        orientation=str(spec.get("orientation") or "portrait").strip().lower(),
+        margins=margins,
+        title=str(spec.get("title") or "").strip(),
+        author=str(spec.get("author") or "").strip(),
+        header=str(spec.get("header") or "").strip(),
+        footer=str(spec.get("footer") or "").strip(),
+        page_numbers=bool(spec.get("page_numbers", True)),
+        header_on_first=bool(spec.get("header_on_first", False)),
+        body_size=spec.get("body_size"),
+        body_spacing=spec.get("body_spacing"),
+        heading_sizes=tuple(spec["heading_sizes"]) if spec.get("heading_sizes") else None,
+        colors=colors,
+    )
+
+
+def _resolve_image_block(block: dict, *, base_dir: Path, assets_dir: Path,
+                         spec: dict) -> None:
+    raw_path = block.get("path") or block.get("image_path")
+    query = str(block.get("query") or "").strip()
+    if raw_path:
+        path = Path(str(raw_path))
+        if not path.is_absolute():
+            path = (base_dir / path).resolve()
+        if not path.is_file():
+            if not query:
+                fail(f"Image not found: {path}")
+        else:
+            block["path"] = str(path)
+            return
+    if query:
+        try:
+            found = find_web_image(query, assets_dir, min_width=900)
+        except Exception as exc:
+            if spec.get("allow_missing_images"):
+                block["path"] = ""
+                block["credit"] = ""
+                return
+            fail(f"Could not find a reusable image for '{query}': {exc}")
+        block["path"] = found["path"]
+        block["credit"] = block.get("credit") or found.get("credit", "")
+        block["caption"] = block.get("caption") or found.get("title", query)
+        return
+    fail("An image block needs a local 'path' or a web 'query'.")
+
+
+def _blocks_from_spec(spec: dict, output: Path) -> tuple[list[dict], PdfTheme]:
+    theme = _theme_from_spec(spec)
+    content = read_text_arg(spec)
+    raw_blocks = spec.get("blocks")
+    if isinstance(raw_blocks, list) and raw_blocks:
+        blocks = [dict(block) for block in raw_blocks if isinstance(block, dict)]
+        base_dir = output.parent
+    else:
+        if not content and not (spec.get("images") or spec.get("image_query")):
+            fail("Nothing to write. Provide content, blocks, or images.")
+        base_dir = output.parent
+        if spec.get("content_path"):
+            base_dir = resolve_path(spec["content_path"]).parent
+        blocks = parse_blocks(content, base_dir=base_dir)
+    title = str(spec.get("title") or "").strip()
+    if title:
+        first = blocks[0] if blocks else None
+        if not (
+            first and str(first.get("kind") or "").lower() == "heading"
+            and str(first.get("text") or "").strip().lower() == title.lower()
+        ):
+            blocks.insert(0, {"kind": "heading", "text": title, "level": 1})
+    subtitle = str(spec.get("subtitle") or "").strip()
+    if subtitle:
+        insert_at = 1 if blocks and blocks[0].get("kind") == "heading" else 0
+        blocks.insert(insert_at, {
+            "kind": "paragraph", "text": subtitle, "align": "center",
+            "muted": True, "size": max(10.0, float(theme.palette["body_size"]) + 1.5),
+        })
+
+    assets_dir = output.parent / f"{output.stem}_assets"
+    image_blocks: list[dict] = []
+    for block in blocks:
+        if str(block.get("kind") or "").lower() == "image":
+            _resolve_image_block(block, base_dir=base_dir, assets_dir=assets_dir, spec=spec)
+
+    images = spec.get("images")
+    if isinstance(images, list):
+        for item in images:
+            if isinstance(item, str):
+                item = {"query": item}
+            if not isinstance(item, dict):
+                continue
+            block = {
+                "kind": "image",
+                "path": item.get("path") or item.get("image_path"),
+                "query": item.get("query"),
+                "caption": item.get("caption") or "",
+                "credit": item.get("credit") or "",
+            }
+            _resolve_image_block(block, base_dir=base_dir, assets_dir=assets_dir, spec=spec)
+            if block.get("path"):
+                image_blocks.append(block)
+    query = str(spec.get("image_query") or "").strip()
+    if query:
+        block = {"kind": "image", "query": query,
+                 "caption": spec.get("image_caption") or "",
+                 "credit": spec.get("image_credit") or ""}
+        _resolve_image_block(block, base_dir=base_dir, assets_dir=assets_dir, spec=spec)
+        if block.get("path"):
+            image_blocks.append(block)
+
+    position = str(spec.get("image_position") or "end").strip().lower()
+    if image_blocks:
+        if position == "start":
+            blocks = image_blocks + blocks
+        else:
+            blocks = blocks + image_blocks
+    return blocks, theme
+
+
 def create(spec: dict) -> None:
     output = resolve_path(spec.get("output_path") or spec.get("path") or "")
     if output.suffix.lower() != ".pdf":
         output = output.with_suffix(".pdf")
     ensure_parent(output)
-    content = read_text_arg(spec)
-    if not content:
-        fail("Nothing to write. Provide content or content_path.")
-    title = " ".join(str(spec.get("title") or "").splitlines()).strip()
-
-    pdf = FPDF(unit="pt", format="A4")
-    pdf.set_margins(54, 54, 54)
-    pdf.set_auto_page_break(auto=True, margin=54)
-    pdf.add_page()
-
-    # A title is rendered larger; body text follows. fpdf2 adds pages
-    # automatically when multi_cell reaches the bottom margin.
-    if title:
-        sanitize = _set_font(pdf, title, 18, bold=True)
-        title_text = _cp1252(title) if sanitize else title
-        pdf.multi_cell(0, 24, title_text, new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(8)
-
-    sanitize = _set_font(pdf, content, 11)
-    for line in content.splitlines():
-        line = line.replace("\t", "    ")
-        if sanitize:
-            line = _cp1252(line)
-        if line.strip():
-            pdf.multi_cell(0, 15, line, new_x="LMARGIN", new_y="NEXT")
-        else:
-            pdf.ln(15)
-
+    blocks, theme = _blocks_from_spec(spec, output)
+    if not blocks:
+        fail("No content blocks to render.")
     try:
-        pdf.output(str(output))
+        result = render_pdf(blocks, theme, output)
     except Exception as exc:
         fail(f"Could not create PDF: {type(exc).__name__}: {exc}")
-    emit(True, f"Created PDF: {output}", path=output)
+
+    validation = None
+    if spec.get("validate", True):
+        render_dir = spec.get("render_dir") or output.parent / f"{output.stem}_validation"
+        validation = validate_pdf(
+            output,
+            margins=theme.margins,
+            expected_size=theme.page_format(),
+            render_dir=render_dir,
+        )
+        if validation and not validation["ok"] and spec.get("strict"):
+            fail(
+                "PDF was generated but failed layout validation:\n"
+                + "\n".join(validation["errors"][:8]),
+                data={"pages": result["pages"], "validation": validation},
+                path=output,
+            )
+
+    message = f"Created PDF: {output} ({result['pages']} page(s))"
+    if validation:
+        message += (
+            f"; validation: {len(validation['errors'])} error(s), "
+            f"{len(validation['warnings'])} warning(s)"
+        )
+    emit(
+        True,
+        message,
+        path=output,
+        data={
+            "pages": result["pages"],
+            "page_size": [round(result["width"], 2), round(result["height"], 2)],
+            "validation": validation,
+        },
+    )
 
 
 def merge(spec: dict) -> None:
@@ -308,6 +478,258 @@ def extract_text(spec: dict) -> None:
     emit(True, clip("".join(chunks)))
 
 
+def metadata(spec: dict) -> None:
+    path = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if not path.is_file():
+        fail(f"PDF not found: {path}")
+    reader = _readable_reader(path)
+    meta = reader.metadata or {}
+    data = {
+        "pages": len(reader.pages),
+        "encrypted": bool(reader.is_encrypted),
+        "title": str(meta.get("/Title") or ""),
+        "author": str(meta.get("/Author") or ""),
+        "subject": str(meta.get("/Subject") or ""),
+        "creator": str(meta.get("/Creator") or ""),
+        "producer": str(meta.get("/Producer") or ""),
+        "file_size": path.stat().st_size,
+    }
+    emit(
+        True,
+        f"{path.name}: {data['pages']} page(s), "
+        f"title={data['title'] or '(none)'}, encrypted={data['encrypted']}",
+        data=data,
+        path=path,
+    )
+
+
+def tables(spec: dict) -> None:
+    """Extract tables with pdfplumber; returns rows grouped by page."""
+    path = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if not path.is_file():
+        fail(f"PDF not found: {path}")
+    pdfplumber = require_module("pdfplumber", "pdfplumber")
+    try:
+        pdf = pdfplumber.open(str(path))
+    except Exception as exc:
+        fail(f"Could not open PDF: {type(exc).__name__}: {exc}")
+    with pdf:
+        pages = _parse_pages(spec.get("pages"), len(pdf.pages))
+        if not pages:
+            fail("No pages selected.")
+        found = []
+        for page_number in pages:
+            try:
+                extracted = pdf.pages[page_number].extract_tables() or []
+            except Exception as exc:
+                fail(f"Table extraction failed on page {page_number + 1}: "
+                     f"{type(exc).__name__}: {exc}")
+            for table_index, table in enumerate(extracted, start=1):
+                found.append({
+                    "page": page_number + 1,
+                    "table": table_index,
+                    "rows": table,
+                })
+    summary = "\n".join(
+        f"Page {item['page']} table {item['table']}: {len(item['rows'])} row(s)"
+        for item in found
+    ) or "No tables found."
+    emit(True, clip(summary), data={"tables": found, "count": len(found)}, path=path)
+
+
+def fields(spec: dict) -> None:
+    """List AcroForm fields (name, type, current value, choices)."""
+    path = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if not path.is_file():
+        fail(f"PDF not found: {path}")
+    reader = _readable_reader(path)
+    try:
+        raw = reader.get_fields() or {}
+    except Exception as exc:
+        fail(f"Could not read form fields: {type(exc).__name__}: {exc}")
+    items = []
+    for name, field in raw.items():
+        items.append({
+            "name": str(name),
+            "type": str(field.get("/FT") or ""),
+            "value": str(field.get("/V") or ""),
+            "choices": [str(choice) for choice in (field.get("/Opt") or [])],
+            "required": bool(field.get("/Ff", 0) & 2) if field.get("/Ff") else False,
+        })
+    if not items:
+        emit(True, "This PDF has no fillable AcroForm fields; treat it as a flat PDF.",
+             data={"fields": []}, path=path)
+    summary = "\n".join(
+        f"- {item['name']} ({item['type'] or 'field'}) = {item['value'] or '(empty)'}"
+        for item in items
+    )
+    emit(True, clip(f"{len(items)} field(s):\n{summary}"),
+         data={"fields": items, "count": len(items)}, path=path)
+
+
+def fill_form(spec: dict) -> None:
+    """Fill AcroForm fields and write a new PDF (optionally flatten)."""
+    path = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if not path.is_file():
+        fail(f"PDF not found: {path}")
+    values = spec.get("fields")
+    if not isinstance(values, dict) or not values:
+        fail("Provide fields as a JSON object: {\"FieldName\": \"value\"}.")
+    output = resolve_path(
+        spec.get("output_path")
+        or path.with_name(f"{path.stem}_filled{path.suffix or '.pdf'}")
+    )
+    ensure_parent(output)
+    reader = _readable_reader(path)
+    writer = PdfWriter()
+    try:
+        writer.clone_document_from_reader(reader)
+    except Exception:
+        for page in reader.pages:
+            writer.add_page(page)
+    flatten = bool(spec.get("flatten", False))
+    clean = {}
+    for key, value in values.items():
+        if isinstance(value, bool):
+            clean[str(key)] = "/Yes" if value else "/Off"
+        else:
+            clean[str(key)] = str(value)
+    try:
+        writer.set_need_appearances_writer(True)
+        writer.update_page_form_field_values(
+            None, clean,
+            auto_regenerate=False, flatten=flatten,
+        )
+    except Exception as exc:
+        fail(f"Could not fill form fields: {type(exc).__name__}: {exc}")
+    _write_pdf(writer, output)
+    emit(
+        True,
+        f"Filled {len(values)} field(s) into {output}"
+        + (" (flattened)" if flatten else ""),
+        path=output,
+        count=len(values),
+    )
+
+
+def images(spec: dict) -> None:
+    """Extract embedded images to a folder."""
+    path = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if not path.is_file():
+        fail(f"PDF not found: {path}")
+    output_dir = resolve_path(
+        spec.get("output_dir") or (path.parent / f"{path.stem}_images")
+    )
+    ensure_parent(output_dir / "placeholder")
+    reader = _readable_reader(path)
+    pages = _parse_pages(spec.get("pages"), len(reader.pages))
+    written = []
+    for page_number in pages:
+        try:
+            page_images = list(reader.pages[page_number].images)
+        except Exception:
+            continue
+        for index, image in enumerate(page_images, start=1):
+            suffix = Path(str(image.name)).suffix or ".png"
+            destination = output_dir / f"page{page_number + 1}_{index}{suffix}"
+            try:
+                destination.write_bytes(image.data)
+                written.append(str(destination))
+            except Exception:
+                continue
+    if not written:
+        emit(True, "No embedded images found.", data={"files": []}, path=output_dir)
+    emit(True, f"Extracted {len(written)} image(s) to {output_dir}",
+         data={"files": written}, paths=written, path=output_dir)
+
+
+def from_html(spec: dict) -> None:
+    """Print a local HTML page or deck to PDF with headless Chrome/Edge."""
+    from winbrow.html_to_pdf import html_to_pdf
+
+    source = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if source.is_dir():
+        source = source / "index.html"
+    if not source.is_file():
+        fail(f"HTML file not found: {source}")
+    output = resolve_path(
+        spec.get("output_path") or source.with_suffix(".pdf")
+    )
+    page = str(spec.get("page") or "16:9").strip().lower()
+    try:
+        result = html_to_pdf(source, output, page=page)
+    except Exception as exc:
+        fail(f"HTML→PDF export failed: {type(exc).__name__}: {exc}")
+    emit(
+        True,
+        f"Exported HTML to PDF: {result['path']} "
+        f"({result['bytes']} bytes, page={result['page']})",
+        path=result["path"],
+        data=result,
+    )
+
+
+def find_image_op(spec: dict) -> None:
+    query = str(spec.get("query") or "").strip()
+    if not query:
+        fail("A search 'query' is required.")
+    output_dir = resolve_path(
+        spec.get("output_dir") or (Path.cwd() / "images")
+    )
+    try:
+        count = max(1, min(int(spec.get("count") or 3), 8))
+    except (TypeError, ValueError):
+        count = 3
+    results = search_and_download(query, output_dir, count=count)
+    if not results:
+        fail(
+            f"No reusable image found for '{query}'. Use a local image path "
+            "or a diagram instead; do not insert a placeholder."
+        )
+    emit(
+        True,
+        f"Downloaded {len(results)} licensed image(s) for '{query}' to {output_dir}\n"
+        + "\n".join(
+            f"- {item['path']} | {item['credit']}" for item in results
+        ),
+        path=output_dir,
+        paths=[item["path"] for item in results],
+        data={"images": results},
+    )
+
+
+def validate_op(spec: dict) -> None:
+    path = resolve_path(spec.get("path") or spec.get("input_path") or "")
+    if not path.is_file():
+        fail(f"PDF not found: {path}")
+    margins = (56.0, 56.0, 56.0, 56.0)
+    raw = spec.get("margins")
+    if isinstance(raw, (list, tuple)) and len(raw) == 4:
+        margins = tuple(float(value) for value in raw)  # type: ignore[assignment]
+    expected = None
+    if spec.get("page_size"):
+        page = str(spec["page_size"]).lower()
+        width, height = PAGE_SIZES.get(page, (0, 0))
+        if width and height:
+            expected = (width, height)
+            if str(spec.get("orientation") or "portrait").lower() in {"landscape", "horizontal"}:
+                expected = (height, width)
+    render_dir = spec.get("render_dir") or path.parent / f"{path.stem}_validation"
+    result = validate_pdf(
+        path, margins=margins, expected_size=expected, render_dir=render_dir,
+    )
+    summary = (
+        f"{path.name}: {result['pages']} page(s), "
+        f"{len(result['errors'])} error(s), {len(result['warnings'])} warning(s), "
+        f"{len(result['rendered'])} page(s) rendered."
+    )
+    if result["errors"]:
+        summary += "\nErrors:\n" + "\n".join(f"- {item}" for item in result["errors"][:10])
+    if result["warnings"]:
+        summary += "\nWarnings:\n" + "\n".join(f"- {item}" for item in result["warnings"][:10])
+    emit(result["ok"], summary, path=path, data=result)
+
+
 def main() -> None:
     spec = load_spec()
     operation = str(spec.get("operation") or "create").strip().lower()
@@ -320,12 +742,21 @@ def main() -> None:
         "encrypt": encrypt,
         "extract_text": extract_text,
         "read": extract_text,
+        "metadata": metadata,
+        "tables": tables,
+        "fields": fields,
+        "fill_form": fill_form,
+        "images": images,
+        "from_html": from_html,
+        "find_image": find_image_op,
+        "validate": validate_op,
     }
     handler = handlers.get(operation)
     if handler is None:
         fail(
             f"Unknown PDF operation '{operation}'. Use create, merge, split, "
-            "rotate, watermark, encrypt, or extract_text."
+            "rotate, watermark, encrypt, extract_text, metadata, tables, "
+            "fields, fill_form, images, from_html, find_image, or validate."
         )
     handler(spec)
 

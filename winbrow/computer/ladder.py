@@ -31,6 +31,56 @@ def _norm(s: str) -> str:
     return " ".join(w for w in s.split() if w not in _FUZZ_STOPWORDS)
 
 
+def _rect_union(rects: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int, int]:
+    left = min(int(r[0]) for r in rects)
+    top = min(int(r[1]) for r in rects)
+    right = max(int(r[0]) + int(r[2]) for r in rects)
+    bottom = max(int(r[1]) + int(r[3]) for r in rects)
+    return (left, top, max(1, right - left), max(1, bottom - top))
+
+
+def _ocr_word_hits(lines: List[dict], target: str) -> List[Tuple[float, int, tuple, str]]:
+    """Match the target phrase against OCR *words*, not merged lines.
+
+    Windows OCR often merges several UI elements into one line; clicking that
+    line's center lands between controls. Word boxes give the exact span.
+    """
+    want = _norm(target)
+    if not want:
+        return []
+    want_tokens = want.split()
+    hits: List[Tuple[float, int, tuple, str]] = []
+    for line in lines or []:
+        words = [
+            word for word in (line.get("words") or [])
+            if _norm(word.get("text", ""))
+        ]
+        if not words:
+            continue
+        tokens = [_norm(word.get("text", "")) for word in words]
+        max_span = min(len(tokens), len(want_tokens) + 2)
+        for size in range(len(want_tokens), max_span + 1):
+            for start in range(0, len(tokens) - size + 1):
+                phrase = " ".join(tokens[start:start + size])
+                if phrase == want:
+                    score = 100.0
+                elif want in phrase:
+                    score = 70.0
+                elif phrase in want:
+                    score = 60.0
+                else:
+                    continue
+                rect = _rect_union([
+                    tuple(words[k]["rect"]) for k in range(start, start + size)
+                ])
+                matched = " ".join(
+                    words[k]["text"] for k in range(start, start + size)
+                )
+                hits.append((score, size, rect, matched))
+    hits.sort(key=lambda hit: (-hit[0], hit[1]))
+    return hits
+
+
 @dataclass
 class GroundingHit:
     ok: bool
@@ -136,7 +186,16 @@ class GroundingLadder:
                 ocr = {"available": False, "lines": []}
                 log.debug(f"OCR rung failed: {e}")
             ocr_hits: List[Tuple[float, Tuple[int, int, int, int], str]] = []
-            for ln in ocr.get("lines", []):
+            lines = ocr.get("lines", [])
+            word_hits = _ocr_word_hits(lines, target)
+            if word_hits:
+                score, _span, rect, matched = word_hits[0]
+                x = rect[0] + rect[2] // 2
+                y = rect[1] + rect[3] // 2
+                return GroundingHit(ok=True, source="ocr", x=int(x), y=int(y),
+                                    matched=matched[:60],
+                                    candidates=[h[3] for h in word_hits[:5]])
+            for ln in lines:
                 lnorm = _norm(ln.get("text", ""))
                 if lnorm == target:
                     ocr_hits.append((100.0, tuple(ln["rect"]), ln["text"]))

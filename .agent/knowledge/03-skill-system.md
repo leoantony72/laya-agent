@@ -111,9 +111,9 @@ HTTP 202 bot challenge) and HTTP GET + Trafilatura main-content extraction
 only the most relevant Markdown sections (~6k chars). A search provider failure
 is reported honestly; it never falls back to the browser for research.
 
-**Converted playbooks (43):** the six requested sections live under
-`winbrow/skills/library/<section>/<name>/SKILL.md`. Six document, five data,
-seven writing, ten creative, nine productivity, six collaboration. Every one
+**Converted playbooks (46):** the six sections live under
+`winbrow/skills/library/<section>/<name>/SKILL.md`. Seven document, five data,
+seven writing, eleven creative, ten productivity, six collaboration. Every one
 uses `kind: playbook` and a unique `playbook_*` key. See
 `winbrow/skills/library/README.md` and `PROVENANCE.md`.
 

@@ -7,9 +7,12 @@ license before redistribution.
 
 | Skill | Source | License | Conversion |
 |---|---|---|---|
-| docx | anthropics/skills/tree/main/skills/docx | Proprietary | Rewritten; new python-docx helper |
-| pdf | anthropics/skills/tree/main/skills/pdf | Proprietary | Rewritten; pure-Python pypdf/fpdf2 helper |
-| pptx | anthropics/skills/tree/main/skills/pptx | Proprietary | Rewritten; python-pptx helper |
+| docx | anthropics/skills/tree/main/skills/docx | Proprietary | Rewritten; upstream workflow + extended python-docx helper |
+| pdf | anthropics/skills/tree/main/skills/pdf | Proprietary | Rewritten; pure-Python pypdf/fpdf2/pdfplumber helper; upstream forms/reference docs vendored under `references/` |
+| pptx | anthropics/skills/tree/main/skills/pptx | Proprietary | Rewritten; python-pptx helper + design guidance |
+| algorithmic-art | anthropics/skills/tree/main/skills/algorithmic-art | See upstream LICENSE.txt | Rewritten; p5.js viewer + scaffold helper; upstream templates referenced |
+| skill-creator | anthropics/skills/tree/main/skills/skill-creator | See upstream LICENSE.txt | Rewritten for WinBrow frontmatter; new scaffold/validate helpers |
+| html-ppt | lewislulu/html-ppt-skill | MIT | Vendored assets/templates/references; new Windows scaffold + PDF/PNG exporter |
 | xlsx | anthropics/skills/tree/main/skills/xlsx | Proprietary | Rewritten; openpyxl/pandas helper |
 | markdown-to-epub | smerchek/claude-epub-skill | See upstream | Rewritten; stdlib EPUB 3 builder |
 | legal-workflows | sboghossian/master-claude-for-legal | See upstream | Rewritten; 6 workflow references, 3 templates |

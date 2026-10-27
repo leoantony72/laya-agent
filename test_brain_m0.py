@@ -243,7 +243,12 @@ class TestGatewayChain(unittest.TestCase):
         self.assertEqual(payloads[1]["reasoning"], {"enabled": False})
 
     def test_openrouter_chain_from_env(self):
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-test-123"}):
+        # Force OpenRouter first: a developer .env may also contain
+        # NEBIUS_API_KEY, whose auto-order would otherwise lead the chain.
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "sk-test-123",
+            "WINBROW_BRAIN_PROVIDER": "openrouter",
+        }):
             gw = ModelGateway()
         self.assertTrue(gw.available)
         p = gw.providers[0]

@@ -108,6 +108,9 @@ def _computer_click_text(args: dict) -> dict:
                 "grounding": data}
     r = driver.click(x=hit.x, y=hit.y)
     r["grounding"] = data
+    if not r.get("success"):
+        where = f"{hit.source} hit '{hit.matched}' at ({hit.x},{hit.y})"
+        r["output"] = f"{r.get('output', 'click failed')} [{where}]"
     return r
 
 
@@ -118,10 +121,16 @@ def _computer_type(args: dict) -> dict:
 
 
 def _computer_key(args: dict) -> dict:
-    """args: {combo} e.g. 'ctrl+s', 'alt+f4'"""
-    combo = str(args.get("combo", "")).strip()
+    """args: {combo} e.g. 'ctrl+s', 'alt+f4' (key/keys/hotkey accepted too)."""
+    combo = str(
+        args.get("combo") or args.get("key") or args.get("keys")
+        or args.get("hotkey") or ""
+    ).strip()
     if not combo:
-        return {"success": False, "output": "Missing key combo"}
+        return {
+            "success": False,
+            "output": "Missing key combo — pass combo='ctrl+f' (argument name: combo)",
+        }
     try:
         return _get_driver().press_key(combo)
     except ValueError as e:
@@ -553,7 +562,11 @@ def get_computer_tools():
     return [
         Tool(
             name="computer_click_text",
-            description="Click a button/menu/text item by description in the focused app window (UIA→OCR grounding).",
+            description=(
+                "Click a button/menu/text item by description in the focused "
+                "app window. Uses UIA, then OCR word-level grounding, and "
+                "reports the matched source and coordinates."
+            ),
             script="",
             impl=COMPUTER_IMPL,
             args=[ArgSpec(name="text", kind="text", instructions="Text on the control to click, e.g. 'Save As'")],
@@ -580,11 +593,15 @@ def get_computer_tools():
         ),
         Tool(
             name="computer_key",
-            description="Press a keyboard shortcut in the focused app, e.g. ctrl+s, alt+f4.",
+            description=(
+                "Press a keyboard shortcut in the focused app, e.g. ctrl+s, "
+                "alt+f4, ctrl+f. Use the 'combo' argument."
+            ),
             script="",
             impl=COMPUTER_IMPL,
-            args=[ArgSpec(name="combo", kind="text", instructions="Key combo like ctrl+shift+s")],
-            examples=["save with ctrl s", "press escape"],
+            args=[ArgSpec(name="combo", kind="text",
+                          instructions="Key combo like ctrl+shift+s (argument name: combo)")],
+            examples=["save with ctrl s", "press escape", "open find with ctrl f"],
         ),
         Tool(
             name="computer_scroll",

@@ -1,4 +1,4 @@
-"""Conversion lint: all 43 skills exist, parse, and use WinBrow conventions."""
+"""Conversion lint: all 46 playbooks exist, parse, and use WinBrow conventions."""
 
 from __future__ import annotations
 
@@ -25,7 +25,8 @@ EXPECTED = {
     "invoice-organizer", "kaizen", "n8n-workflows", "raffle-winner",
     "solo-founder", "tailored-resume", "ship-learn-next", "tapestry",
     "git-pushing", "google-workspace", "mercury", "outline",
-    "review-implementing", "test-fixing",
+    "review-implementing", "test-fixing", "algorithmic-art", "skill-creator",
+    "html-ppt",
 }
 
 BANNED = (
@@ -55,6 +56,9 @@ SCRIPTS = {
     "google-workspace": "google_api.py",
     "outline": "outline_api.py",
     "pixelbin-media": "pixelbin.py",
+    "algorithmic-art": "scaffold_art.py",
+    "skill-creator": "validate_skill.py",
+    "html-ppt": "new_deck.py",
 }
 
 
@@ -67,7 +71,7 @@ def test_all_expected_skills_exist_and_parse():
     registry = load_skill_registry(str(ROOT / "winbrow" / "skills"), sync_learned=False)
     playbooks = {meta.name for meta in registry.values() if meta.kind == "playbook"}
     assert playbooks == EXPECTED
-    assert len(playbooks) == 43
+    assert len(playbooks) == 46
 
 
 def test_each_skill_has_required_sections_and_clean_body():

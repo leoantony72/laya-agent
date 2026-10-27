@@ -222,6 +222,13 @@ SKILL RULES:
      returns only the sections that answer the question. When two sources
      agree, stop gathering and answer. Do not run synonym searches once a
      source already answers the question.
+  23. Native app control: call app_focus_or_launch (or focus_window) FIRST,
+     then read the screen. Never screen-read a browser or another app when the
+     task names the app. For search boxes and list results, prefer the
+     keyboard: focus the field, type the query, then Down + Enter to open the
+     first match. If a click reports "PyAutoGUI fail-safe" or "Refusing click",
+     do NOT retry it — the cursor is in a screen corner or the coordinates are
+     bad. Use the keyboard path or ask the user to move the mouse.
 
 WEB ACCESS HIERARCHY — read this before choosing any skill
 ══════════════════════════════════════════════════════════

@@ -401,3 +401,136 @@ and Docker/SearXNG.
 
 Tests: `winbrow/tests/test_web_extract.py` covers extraction, fallback, BM25,
 section selection, fact retention, focus plumbing, and wall detection.
+
+## 15. Native input: UIA CLSID init, fail-safe corners, word-level OCR (2026-10-27)
+
+A WhatsApp run failed on `computer_click_text`: UIA never initialized
+(CO_E_CLASSSTRING), OCR line boxes were all `[0,0,0,0]`, and PyAutoGUI aborted
+with its fail-safe.
+
+Fixed:
+
+- `winbrow/computer/uia.py`: create IUIAutomation by CLSID
+  (`comtypes.client.GetModule("UIAutomationCore.dll")` + `CoCreateInstance`)
+  instead of the unregistered `"UIAutomationClient.CUIAutomation"` ProgID.
+  COM-init the thread before creating the engine and keep one engine per worker
+  thread (computer tools run via `asyncio.to_thread`). `accessibility.py` uses
+  the same CLSID path.
+- `winbrow/computer/screen.py`: Windows OCR's `OcrLine.BoundingRect` is null in
+  PowerShell 5.1, so every line rect was `0,0,0,0` — a click at the "line
+  center" became `(0,0)` and tripped the corner fail-safe. Line rects are now
+  derived from word rects; the script emits explicit x/y/w/h for lines and
+  words, and `_rect4()` accepts dict, list, or `"x y w h"` strings.
+- `winbrow/computer/ladder.py`: match the target phrase against OCR *words* and
+  click the union of their rects, so merged OCR lines (WhatsApp sidebar, chat
+  rows) no longer land between controls. Line matching remains as fallback.
+- `winbrow/computer/driver.py`: FAILSAFE stays enabled, but a cursor resting
+  exactly on a corner is nudged 2 px inward via `SetCursorPos` before the
+  action. Clicks outside the desktop or exactly on a corner are refused, and
+  fail-safe failures report the target/cursor/screen. Coordinates are scaled to
+  PyAutoGUI's space if DPI awareness made the sizes differ.
+- `winbrow/computer/tools.py`: `computer_key` accepts `combo`, `key`, `keys`,
+  or `hotkey`; click failures include the grounding source and coordinates.
+- Prompt rule 23: focus the named app first, prefer the keyboard for search
+  boxes and result lists, and never retry a fail-safe/refused click.
+- Tests: `winbrow/tests/test_computer_input.py` covers corner validation, the
+  cursor nudge, key aliases, CLSID engine init, word-level phrase grounding,
+  and rect normalization.
+
+## 16. Anthropic skills integrated (2026-10-27)
+
+Added/upgraded five skills from `anthropics/skills`, adapted to WinBrow's
+playbook format and Python toolchain (no Node, LibreOffice, pandoc, or Poppler
+dependency):
+
+- `docx` (document-processing): upgraded workflow (TOC, page numbers, headers/
+  footers, comments, images, run merging, inspection) and extended
+  `docx_tool.py` with `comment`, `toc`, `page_numbers`, `header_footer`,
+  `image`, `merge_runs`, and `inspect`. Uses `python-docx 1.2` comments.
+- `pdf` (document-processing): added `metadata`, `tables` (pdfplumber),
+  `fields`, `fill_form` (pypdf, optional flatten), and `images`; upgraded the
+  playbook for forms/tables/verification and vendored upstream `forms.md` and
+  `reference.md` under `references/`.
+- `pptx` (document-processing): upgraded design guidance (palette, motif, one
+  idea per slide) and added `add_table`, `add_image`, `set_notes`,
+  `delete_slide`; `read` now includes tables and speaker notes.
+- `algorithmic-art` (creative-media): new two-phase skill (philosophy →
+  p5.js), a custom responsive viewer, `scaffold_art.py`, and the upstream
+  generator template as reference.
+- `skill-creator` (productivity-organization): new authoring playbook plus
+  `scaffold_skill.py` and `validate_skill.py` for WinBrow frontmatter, script
+  contract, trigger descriptions, and category rules.
+
+Registry: 46 playbooks + 27 tool skills. `validate_skill.py --all` reports 0
+errors across 73 skills. Tests: `winbrow/tests/test_anthropic_skills.py` covers
+registry wiring, validation, and live helper calls for docx/pdf/pptx/art/skill
+scaffolding.
+
+## 17. HTML PPT Studio integrated (2026-10-27)
+
+Added `html-ppt` (document-processing), the complete
+[lewislulu/html-ppt-skill](https://github.com/lewislulu/html-ppt-skill) design
+system: 36 themes, 36 layout pages, 15 full-deck templates, 27 CSS animations,
+20 canvas FX, keyboard runtime, presenter mode with notes, and print/PDF rules.
+Vendored under `winbrow/skills/library/document-processing/html-ppt/` (MIT).
+
+Windows-native helpers replace the upstream shell scripts:
+
+- `scripts/new_deck.py` copies a template, copies `assets/` into the deck so it
+  is portable across drives, rewrites every asset reference, and verifies all
+  local HTML/CSS references before reporting success.
+- `scripts/render_deck.py` exports PDF (default 16:9) or per-slide PNG through
+  installed Chrome/Edge. `winbrow/html_to_pdf.py` discovers the browser, injects
+  `@page` size, and renders with `--print-to-pdf`.
+- `pdf_tool.py` adds `operation="from_html"` for the same export path, and the
+  PDF playbook documents it.
+- The `pptx` playbook now routes designed/animated/presenter decks to
+  `html-ppt` and keeps `python-pptx` for genuinely editable `.pptx` work.
+
+Verified live: pitch-deck template → 10-page PDF at 13.33×7.5 in; starter deck
+→ 6-page PDF; page renders checked visually. Tests:
+`winbrow/tests/test_html_ppt_skill.py` covers registry wiring, asset copying,
+reference verification, PDF page count/size, and the PDF skill's `from_html`.
+
+## 19. Measured PDF/PPTX layout + image search + visual QA (2026-10-27)
+
+Replaced the fixed-coordinate PDF writer and the basic pptx builder with
+measured layout engines under `winbrow/layout/`:
+
+- `measure.py` — font metrics, wrapping (including long URLs/words), font-size
+  fitting, and proportional image fitting.
+- `pdf.py` — `PdfReport` paginates from actual page geometry. Paragraphs, code,
+  and quotes split across pages instead of leaving a stranded heading/blank
+  block; table rows split with repeated headers; images are proportional,
+  captioned, credited, and bordered; headers/footers/page numbers reserve their
+  own space. Themes: corporate, academic, minimal, editorial. Page sizes A4,
+  Letter, Legal; portrait/landscape.
+- `pptx.py` — `PptxBuilder` with 16:9/4:3 sizes, five themes, auto-fit bullets
+  that split into continuation slides, measured tables with centered layout,
+  proportional image/gallery placement, native editable charts, diagrams,
+  quotes, sections, notes, footers, and slide numbers.
+- `validate.py` + `preview.py` — PDF validation renders every page with
+  pypdfium2, checks text outside page/margins, page size, blank pages, and
+  horizontal whitespace. PPTX validation checks shape bounds, text fit, image
+  aspect ratio, overlap, and renders every slide with a PIL preview because
+  PowerPoint/LibreOffice is absent (disclosed in the result); charts are
+  simplified in that preview.
+- `winbrow/image_search.py` — Wikimedia Commons search with public-domain/CC
+  filtering, HTML-cleaned credits, download + PIL validation, proportional
+  resizing, no placeholders. PDF `images`/`image_query` and PPTX slide `images`
+  accept `query`; `find_image` is available in both skills. Openverse was
+  attempted but times out on this network, so Commons is the provider.
+
+Skill docs (`pdf`, `pptx`) now include the measured spec, themes, image rules,
+mandatory validation workflow, and acceptance criteria.
+
+Samples generated and inspected:
+`data/samples/document-generation/sample-report.pdf`,
+`sample-deck.pptx`, plus `sample-report_validation/` and
+`sample-deck_slides/`. The deck includes a Wikimedia image with credit; the
+report has a table, wrapped long URL, Unicode, image, caption, and credit.
+
+Tests: `test_pdf_layout.py`, `test_pptx_layout.py`, and
+`test_image_search.py` cover dense pages, 70-row tables, landscape Letter,
+long URLs, images, 16:9/4:3, continuation slides, native charts, geometry
+validation, and local/live image search.
