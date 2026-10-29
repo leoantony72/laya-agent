@@ -77,10 +77,8 @@ def test_wallhaven_search_filters_size_and_orientation(monkeypatch):
 
 
 def test_auto_search_falls_back_to_licensed_wikimedia(monkeypatch):
-    def fake_json(url, params=None, timeout=15):
-        return {"data": []}                    # Wallhaven has nothing
-
-    monkeypatch.setattr(image_tools, "http_json", fake_json)
+    # Web search is the first source for real subjects; make it empty.
+    monkeypatch.setattr(image_tools, "search_web_images", lambda *a, **k: [])
 
     from winbrow import image_search
 
@@ -98,6 +96,72 @@ def test_auto_search_falls_back_to_licensed_wikimedia(monkeypatch):
     assert [hit.source for hit in hits] == ["Wikimedia Commons"]
     assert hits[0].credit.startswith("Eiffel Tower")
     assert hits[0].license == "CC BY-SA 4.0"
+
+
+def test_auto_prefers_general_web_for_real_subject(monkeypatch):
+    web = image_tools.ImageCandidate(
+        "web1", "https://example.com/dog.jpg", "https://example.com/dog",
+        1200, 800, "Web (example.com)", title="Golden Retriever",
+        license="unknown",
+    )
+    monkeypatch.setattr(image_tools, "search_web_images", lambda *a, **k: [web])
+
+    def fail_wallhaven(*args, **kwargs):
+        raise AssertionError("Wallhaven must not run before web search")
+
+    monkeypatch.setattr(image_tools, "search_wallhaven", fail_wallhaven)
+    hits = search_images("golden retriever", count=2)
+    assert [hit.source for hit in hits] == ["Web (example.com)"]
+
+
+def test_real_subject_never_falls_back_to_anime(monkeypatch):
+    monkeypatch.setattr(image_tools, "search_web_images", lambda *a, **k: [])
+    monkeypatch.setattr(image_tools, "search_wikimedia", lambda *a, **k: [])
+    monkeypatch.setattr(image_tools, "search_wallhaven", lambda *a, **k: [])
+    called = {"anime": False}
+
+    def fake_nekosapi(*args, **kwargs):
+        called["anime"] = True
+        return []
+
+    monkeypatch.setattr(image_tools, "search_nekosapi", fake_nekosapi)
+    with pytest.raises(ImageToolError):
+        search_images("office interior", count=2)
+    assert called["anime"] is False
+
+
+def test_wallhaven_can_exclude_anime_category(monkeypatch):
+    def fake_json(url, params=None, timeout=15):
+        return {"data": [
+            {"id": "anime", "path": "https://w.wallhaven.cc/a.jpg",
+             "dimension_x": 1920, "dimension_y": 1080, "category": "anime"},
+            {"id": "general", "path": "https://w.wallhaven.cc/b.jpg",
+             "dimension_x": 1920, "dimension_y": 1080, "category": "general"},
+        ]}
+
+    monkeypatch.setattr(image_tools, "http_json", fake_json)
+    hits = search_wallhaven("cat", 5, categories="101")
+    assert [hit.id for hit in hits] == ["general"]
+
+
+def test_web_search_maps_ddgs_results(monkeypatch):
+    rows = [{
+        "title": "Golden Retriever",
+        "image": "https://cdn.example.com/dog.jpg",
+        "url": "https://example.com/golden-retriever",
+        "width": 1600,
+        "height": 1067,
+        "source": "example.com",
+    }]
+
+    monkeypatch.setattr(image_tools, "_web_rows", lambda *a, **k: rows)
+    hits = image_tools.search_web_images("golden retriever", 1, min_width=800)
+    assert len(hits) == 1
+    hit = hits[0]
+    assert hit.source == "Web (example.com)"
+    assert hit.page == "https://example.com/golden-retriever"
+    assert hit.license == "unknown"
+    assert (hit.width, hit.height) == (1600, 1067)
 
 
 def test_auto_search_falls_back_to_safe_anime(monkeypatch):

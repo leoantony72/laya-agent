@@ -131,6 +131,23 @@ class VoiceLoop:
         self._wake_ready = False            # wake word spoken since last command?
         self.last_stages: list[dict] = []   # per-utterance stage report (tests/observability)
 
+    # ------------------------------------------------------------------ UI hooks
+    # Overridden by the server-side UIVoiceLoop. Base loop stays headless.
+    def _speech_started(self) -> None:
+        """VAD saw speech begin (island: enter the listening state)."""
+
+    def _speech_tick(self, frames: list[bytes]) -> None:
+        """~1/s while speech is in progress (island: partial transcript)."""
+
+    def _speech_ended(self) -> None:
+        """VAD saw end-of-speech, before transcription starts."""
+
+    def _speech_unrecognized(self) -> None:
+        """Speech ended but Whisper returned no text (UI returns to idle)."""
+
+    def _on_level(self, level: float) -> None:
+        """Microphone peak 0..1 from the recorder (island: waveform)."""
+
     # ------------------------------------------------------------------ helpers
     def _stages_reset(self) -> None:
         self.last_stages = []
@@ -232,7 +249,7 @@ class VoiceLoop:
             except Exception:
                 return None
             return self._save_wav(frames) if frames else None
-        rec = AudioRecorder()
+        rec = AudioRecorder(on_level=self._on_level)
         try:
             rec.start()
             await asyncio.sleep(seconds)
@@ -304,7 +321,9 @@ class VoiceLoop:
                 await asyncio.sleep(0.05)
                 continue
             await asyncio.sleep(1.2)   # let the user press + start speaking
+            self._speech_started()
             path = await self._capture(MAX_UTTERANCE_S)
+            self._speech_ended()
             if path is None:
                 continue
             prime = build_prime_prompt(get_session(self.session_id), get_store())
@@ -322,6 +341,7 @@ class VoiceLoop:
         """VAD-gated wake word loop: transcribe ONLY while speech is present."""
         speaking = False
         silence_after = 0.0
+        last_tick = 0.0
         utter_frames: list[bytes] = []
         pre_roll: list[bytes] = []
         async for chunk, dt in self._iter_mic():
@@ -329,17 +349,24 @@ class VoiceLoop:
                 if not speaking:
                     speaking = True
                     silence_after = 0.0
+                    last_tick = time.perf_counter()
                     utter_frames = list(pre_roll[-max(1, int(PRE_ROLL_S / max(dt, 0.05))):])
                     stage_event(new_command_id(), "vad", 0,
                                 {"event": "speech_start", "speech": True})
+                    self._speech_started()
                 utter_frames.append(chunk)
                 silence_after = 0.0
+                now = time.perf_counter()
+                if now - last_tick >= 0.9:
+                    last_tick = now
+                    self._speech_tick(list(utter_frames))
             else:
                 if speaking:                    # inside an utterance
                     utter_frames.append(chunk)
                     silence_after += dt
                     if silence_after >= EOS_SILENCE_S:
                         speaking = False
+                        self._speech_ended()
                         await self._on_utterance(utter_frames)
                         utter_frames = []
                 else:
@@ -363,6 +390,7 @@ class VoiceLoop:
                 pass
         text = self.strip_wake(res.text)
         if not text:
+            self._speech_unrecognized()
             return
         stage_event(new_command_id(), "wake", res.duration_ms,
                     {"wake_matched": res.text.lower() != text, "text": text[:80]})

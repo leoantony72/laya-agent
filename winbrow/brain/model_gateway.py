@@ -294,6 +294,34 @@ def _post_json(url: str, payload: dict, headers: Dict[str, str], timeout: float)
     return json.loads(body)
 
 
+def _accepts_kwarg(fn: Any, name: str) -> bool:
+    """True when ``fn`` can be called with ``name=`` (test fakes may not)."""
+    import inspect
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is p.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return name in parameters
+
+
+def _safe_delta(on_delta: Any, kind: str, text: str) -> None:
+    """Call a streaming callback, tolerating sync/async and failures."""
+    if on_delta is None:
+        return
+    try:
+        result = on_delta(kind, text)
+        if hasattr(result, "__await__"):
+            import asyncio
+            try:
+                asyncio.get_running_loop().create_task(result)
+            except RuntimeError:
+                pass
+    except Exception:
+        pass
+
+
 def _redact(obj: Any) -> Any:
     """Best-effort removal of key-like strings from error payloads."""
     try:
@@ -662,6 +690,7 @@ class ModelGateway:
         max_tokens: int = 900,
         timeout: Optional[float] = None,
         reasoning: Optional[dict] = None,
+        on_delta: Optional[Any] = None,
     ) -> GatewayResponse:
         """One chat completion across the provider chain. Async wrapper.
 
@@ -669,6 +698,10 @@ class ModelGateway:
         (e.g. {"enabled": False} for normalizers/chat). By default, structured
         calls get a bounded reasoning budget and unstructured calls disable it,
         so hidden reasoning can never eat the whole max_tokens allowance.
+
+        `on_delta(kind, text)` receives streamed chunks when the provider
+        supports SSE ("reasoning" or "content"). It is best-effort: streaming
+        failures fall back to the normal buffered call.
         """
         if not self.providers:
             raise GatewayUnavailable(
@@ -702,9 +735,15 @@ class ModelGateway:
                         last_err = last_err or TimeoutError(
                             "brain deadline exceeded")
                         break
+                    stream_kwargs = (
+                        {"on_delta": on_delta}
+                        if on_delta is not None
+                        and _accepts_kwarg(self._chat_with_provider, "on_delta")
+                        else {}
+                    )
                     resp = await self._chat_with_provider(
                         provider, messages, tools, json_schema, temperature, max_tokens,
-                        call_timeout, reasoning,
+                        call_timeout, reasoning, **stream_kwargs,
                     )
                     # Reasoning can exhaust max_tokens before any content is
                     # emitted. Retry with a hard reasoning cap, then with
@@ -844,6 +883,7 @@ class ModelGateway:
         max_tokens: int,
         timeout: float,
         reasoning: Optional[dict] = None,
+        on_delta: Optional[Any] = None,
     ) -> GatewayResponse:
         import asyncio
         messages = _adapt_messages(messages, provider)
@@ -924,12 +964,123 @@ class ModelGateway:
                 payload["max_tokens"] = clamped
 
         headers = {"Authorization": f"Bearer {provider.api_key}", **provider.extra_headers}
+        if (
+            on_delta is not None
+            and provider.name != "local"
+            and os.environ.get("WINBROW_STREAM", "1").strip().lower()
+            not in {"0", "false", "off", "no"}
+        ):
+            try:
+                return await self._stream_provider(
+                    provider, payload, headers, timeout, on_delta)
+            except GatewayError as exc:
+                log.warning(
+                    f"Streaming via '{provider.name}' failed "
+                    f"({_redact(exc)}); falling back to a buffered call.")
+            except Exception as exc:
+                log.warning(
+                    f"Streaming via '{provider.name}' unavailable "
+                    f"({_redact(exc)}); falling back to a buffered call.")
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
             lambda: _post_json(f"{provider.base_url}/chat/completions", payload, headers, timeout),
         )
         return self._parse_response(result, provider)
+
+    async def _stream_provider(
+        self,
+        provider: Provider,
+        payload: Dict[str, Any],
+        headers: Dict[str, str],
+        timeout: float,
+        on_delta: Any,
+    ) -> GatewayResponse:
+        """SSE streaming for OpenAI-compatible providers (Nebius/OpenRouter).
+
+        Emits reasoning/content chunks to ``on_delta`` as they arrive and
+        returns the same ``GatewayResponse`` shape as the buffered path.
+        """
+        try:
+            import httpx
+        except ImportError as exc:  # pragma: no cover - dependency is standard
+            raise GatewayError(f"httpx missing: {exc}")
+
+        body = dict(payload)
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+        url = f"{provider.base_url}/chat/completions"
+
+        content: List[str] = []
+        reasoning: List[str] = []
+        finish_reason = ""
+        usage: Dict[str, Any] = {}
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST", url, json=body,
+                    headers={"Content-Type": "application/json", **headers},
+                ) as resp:
+                    if resp.status_code >= 400:
+                        raw = (await resp.aread()).decode("utf-8", "replace")
+                        raise GatewayError(
+                            f"HTTP {resp.status_code}: {_redact(raw)[:300]}")
+                    async for line in resp.aiter_lines():
+                        line = (line or "").strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                        except ValueError:
+                            continue
+                        if isinstance(chunk.get("usage"), dict):
+                            usage = chunk["usage"]
+                        choices = chunk.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0] or {}
+                        delta = choice.get("delta") or {}
+                        think = (
+                            delta.get("reasoning_content")
+                            or delta.get("reasoning")
+                            or ""
+                        )
+                        if think:
+                            reasoning.append(str(think))
+                            _safe_delta(on_delta, "reasoning", str(think))
+                        text = delta.get("content") or ""
+                        if text:
+                            content.append(str(text))
+                            _safe_delta(on_delta, "content", str(text))
+                        if choice.get("finish_reason"):
+                            finish_reason = str(choice["finish_reason"])
+        except GatewayError:
+            raise
+        except Exception as exc:
+            raise GatewayError(f"stream failed: {_redact(exc)}")
+
+        prompt_details = usage.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+        return GatewayResponse(
+            content="".join(content),
+            provider=provider.name,
+            model=provider.model,
+            reasoning="".join(reasoning),
+            finish_reason=finish_reason,
+            usage=usage,
+            input_tokens=int(
+                usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            output_tokens=int(
+                usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+            cache_read_input_tokens=int(
+                usage.get("cache_read_input_tokens")
+                or usage.get("prompt_cache_hit_tokens")
+                or prompt_details.get("cached_tokens") or 0),
+        )
 
     def _parse_response(self, result: dict, provider: Provider) -> GatewayResponse:
         try:

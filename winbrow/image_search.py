@@ -93,8 +93,20 @@ def _commons_search(query: str, limit: int, min_width: int) -> list[ImageResult]
         "format": "json",
     }
     response = _get(COMMONS_API, params=params)
+    if response.status_code == 429:
+        # Commons rate-limits bursts. One short retry, then report the limit so
+        # callers do not mistake it for "no matching images".
+        delay = 1.0
+        try:
+            delay = min(3.0, max(0.5, float(
+                (getattr(response, "headers", {}) or {}).get("Retry-After", 1.0)
+            )))
+        except (TypeError, ValueError):
+            pass
+        time.sleep(delay)
+        response = _get(COMMONS_API, params=params)
     if response.status_code != 200:
-        return []
+        raise ImageSearchError(f"Wikimedia Commons HTTP {response.status_code}")
     try:
         pages = response.json().get("query", {}).get("pages", {})
     except Exception:
@@ -193,6 +205,8 @@ def search_images(
                 continue
             seen.add(item.url)
             results.append(item)
+    except ImageSearchError:
+        raise
     except Exception:
         return []
     return results

@@ -68,6 +68,11 @@ from .skill_writer import (
     write_skill_to_disk,
 )
 from ..computer.tools import screen_read_text
+from ..events import (
+    bus as event_bus,
+    new_step_id,
+    step_scope,
+)
 from ..policy import PolicyError, validate_script_safety
 from ..registry import ArgSpec, Tool
 from ..trace import log_event
@@ -566,6 +571,7 @@ class BrainStepResult:
     warning: str = ""
     url: str = ""
     title: str = ""
+    step_id: str = ""
 
     def to_dict(self) -> dict:
         # The UI/trace copy used to be cut to 400 chars, which also dropped the
@@ -590,6 +596,8 @@ class BrainStepResult:
             d["url"] = self.url
         if self.title:
             d["title"] = self.title
+        if self.step_id:
+            d["step_id"] = self.step_id
         return d
 
 
@@ -978,6 +986,7 @@ class AgentBrain:
             text = str(plan.get("response") or plan.get("summary")
                        or plan.get("question") or "").strip()
             log.info(f"brain turn {len(result.steps) + 1}: kind={kind}")
+            _emit_thinking(plan, kind)
 
             if kind == "stop":
                 result.kind = "stop"
@@ -1024,10 +1033,12 @@ class AgentBrain:
                     result.response = text or self._history_summary(history) or "Done."
                     if result.complete:
                         self._fire_skill_writer(utterance, list(history))
+                    _stream_answer(result.response)
                     return result
                 result.kind = "chat"
                 result.success = True
                 result.response = text
+                _stream_answer(result.response)
                 return result
 
             if kind == "clarify":
@@ -1083,6 +1094,7 @@ class AgentBrain:
                 result.response = text or self._history_summary(history) or "Done."
                 if result.complete:
                     self._fire_skill_writer(utterance, list(history))
+                _stream_answer(result.response)
                 return result
 
             steps = _extract_steps(plan)
@@ -1616,14 +1628,26 @@ class AgentBrain:
                 "max_tokens": reasoning_config["max_tokens"],
                 "reasoning": reasoning,
             }
-            try:
-                resp = await self.gateway.chat(messages, **chat_kwargs)
-            except TypeError as exc:
-                # Older/third-party gateways may not accept a reasoning policy.
-                if "reasoning" not in str(exc):
-                    raise
-                chat_kwargs.pop("reasoning", None)
-                resp = await self.gateway.chat(messages, **chat_kwargs)
+            if attempt == 0:
+                chat_kwargs["on_delta"] = _planner_delta
+            for _attempt in range(3):
+                try:
+                    resp = await self.gateway.chat(messages, **chat_kwargs)
+                    break
+                except TypeError as exc:
+                    # Older/third-party gateways may not accept the reasoning
+                    # policy or the streaming callback; drop one and retry.
+                    message = str(exc)
+                    dropped = False
+                    for key in ("on_delta", "reasoning"):
+                        if key in message and key in chat_kwargs:
+                            chat_kwargs.pop(key, None)
+                            dropped = True
+                            break
+                    if not dropped:
+                        raise
+            else:
+                raise
             plan = extract_json_object(resp.content)
             if plan:
                 if isinstance(plan, list):
@@ -1722,6 +1746,45 @@ class AgentBrain:
 
     # ------------------------------------------------------------------ step execution
     async def _run_step(self, skill: str, args: dict, why: str = "", ctx: Any = None) -> BrainStepResult:
+        """Execute one step and stream tool.started/tool.result to the UI.
+
+        The event wrapper lives here (not in each branch of the implementation)
+        so every exit path — playbook ack, permission pending, early failure —
+        produces a matching started/result pair.
+        """
+        step_id = new_step_id(skill)
+        try:
+            event_bus().emit(
+                "tool.started",
+                {
+                    "skill": str(skill or ""),
+                    "args": _clip_args(args),
+                    "why": str(why or "")[:500],
+                },
+                step_id=step_id,
+            )
+        except Exception:
+            pass
+        with step_scope(step_id):
+            result = await self._run_step_inner(skill, args, why, ctx)
+        result.step_id = step_id
+        try:
+            event_bus().emit(
+                "tool.result",
+                {
+                    "skill": result.skill,
+                    "success": bool(result.success),
+                    "output": str(result.output or "")[:4000],
+                    "warning": str(result.warning or "")[:800],
+                    "elapsed_ms": result.elapsed_ms,
+                },
+                step_id=step_id,
+            )
+        except Exception:
+            pass
+        return result
+
+    async def _run_step_inner(self, skill: str, args: dict, why: str = "", ctx: Any = None) -> BrainStepResult:
         t0 = time.perf_counter()
 
         def _ms() -> float:
@@ -2216,6 +2279,67 @@ def _step_signature(skill: str, args: dict) -> tuple:
     except Exception:
         args_key = str(args)
     return (skill, args_key)
+
+
+def _clip_args(args: Any, limit: int = 1200) -> dict:
+    """Small, UI-safe copy of step args (avoid shipping whole file bodies)."""
+    out: dict = {}
+    for key, value in dict(args or {}).items():
+        name = str(key)
+        if isinstance(value, str):
+            out[name] = value if len(value) <= limit else (
+                value[:limit] + f"… <{len(value)} chars>")
+        elif isinstance(value, (dict, list)):
+            try:
+                blob = json.dumps(value, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                blob = str(value)
+            out[name] = blob if len(blob) <= limit else blob[:limit] + "…"
+        else:
+            out[name] = value
+    return out
+
+
+def _emit_thinking(plan: dict, kind: str) -> None:
+    """Publish a short plan summary for action turns.
+
+    Chat/done replies already stream as the answer; using their text as a
+    thinking summary showed the same paragraph twice in the trace.
+    """
+    try:
+        if kind != "action":
+            return
+        steps = _extract_steps(plan)
+        skill = str(steps[0].get("skill") or "") if steps else ""
+        summary = str(plan.get("why") or "").strip()
+        if not summary and skill:
+            summary = f"Next action: {skill}"
+        if not summary:
+            return
+        event_bus().emit("thinking.summary", {
+            "kind": kind,
+            "summary": summary[:1000],
+            "skill": skill,
+        })
+    except Exception:
+        pass
+
+
+def _planner_delta(kind: str, text: str) -> None:
+    """Forward provider reasoning chunks to the UI (never the JSON payload)."""
+    if kind != "reasoning" or not text:
+        return
+    try:
+        event_bus().emit("thinking.delta", {"text": str(text)})
+    except Exception:
+        pass
+
+
+def _stream_answer(text: str) -> None:
+    try:
+        event_bus().stream_answer(str(text or ""))
+    except Exception:
+        pass
 
 
 def _extract_steps(plan: dict) -> List[dict]:

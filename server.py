@@ -42,6 +42,9 @@ from winbrow.integrations import (
     test_integration,
 )
 from winbrow.subagents import list_profiles as list_subagent_profiles
+from winbrow import events as agent_events
+from winbrow.tasks.store import get_store
+from winbrow.voice_service import get_voice_service
 
 
 def _load_env_file() -> None:
@@ -76,7 +79,25 @@ log = logging.getLogger("winbrow-server")
 # Load OPENROUTER_API_KEY etc. from .env (if present) before anything reads env
 _load_env_file()
 
-app = FastAPI(title="WinBrow — Hands-free Windows & Browser Control", version="3.0.0")
+app = FastAPI(title="WinBrow - Hands-free Windows & Browser Control", version="3.0.0")
+
+# The Electron app loads the built bundle from file:// (Origin: null) and the
+# Vite dev server runs on localhost. Only those origins may read the local
+# API; arbitrary websites must not be able to drive the desktop agent.
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "null",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8765",
+        "http://127.0.0.1:8765",
+    ],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
 # Global Agent Instance
 agent = WinBrowAgent()
@@ -129,6 +150,9 @@ runtime_settings = {
 
 # Active WebSocket connections (for broadcast)
 _ws_clients: list[WebSocket] = []
+# Task id → asyncio.Task for executions started from a WebSocket, so the UI can
+# cancel a run mid-step (Stop button / kill switch).
+_running_tasks: dict[str, asyncio.Task] = {}
 
 
 @app.on_event("startup")
@@ -141,6 +165,13 @@ async def _startup() -> None:
     global llm_instance
 
     log.info("Starting WinBrow server...")
+    agent_events.bind_loop(asyncio.get_running_loop())
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: get_store().prune(int(
+                os.environ.get("WINBROW_TASKS_RETENTION_DAYS", "30") or 30)))
+    except Exception as exc:
+        log.debug(f"task store prune failed (non-fatal): {exc}")
 
     # 1. Ensure STT models are downloaded (whisper). Skip LLM models in cloud mode.
     try:
@@ -212,6 +243,17 @@ async def _mcp_connect_loop() -> None:
     except Exception as e:
         log.warning(f"MCP bridge connect failed (non-fatal): {e}")
 
+    # 6. Local voice mode (VAD/wake/PTT + local Whisper/SAPI). Opt-in: a mic
+    # that starts listening on every server boot is a trust problem.
+    if os.environ.get("WINBROW_VOICE", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }:
+        try:
+            status = await get_voice_service().start(agent)
+            log.info(f"Voice service: {status}")
+        except Exception as e:
+            log.warning(f"Voice service failed to start (non-fatal): {e}")
+
 
 # ids of preload servers given a second connect attempt by /api/mcp; kept on
 # failure so a genuinely dead server is not re-spawned on every poll
@@ -256,6 +298,10 @@ async def _shutdown() -> None:
     _mcp_conns = []
     try:
         reset_mcp_hub()          # terminates all MCP subprocesses
+    except Exception:
+        pass
+    try:
+        await get_voice_service().stop()
     except Exception:
         pass
     for ws in list(_ws_clients):   # unblock the graceful window immediately
@@ -326,6 +372,116 @@ async def index():
 # REST API
 # ---------------------------------------------------------------------------
 
+async def _run_agent_task(
+    cmd: str,
+    *,
+    task_id: str,
+    session_id: str,
+    emit=None,
+    api_key: Optional[str] = None,
+    provider: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    custom_endpoint: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> dict:
+    """Run one agent task with typed task.* events around it.
+
+    The event task id comes from a context variable, so every event emitted by
+    the brain/executor inside this call is grouped under the same task without
+    threading the id through the whole agent stack.
+    """
+    store = get_store()
+    bus = agent_events.bus()
+    bus.bind_loop()
+    bus.reset_task(task_id)
+    store.start_task(
+        task_id,
+        goal=cmd,
+        session_id=session_id,
+        provider=str(provider or runtime_settings.get("provider", "")),
+    )
+    bus.emit("task.started", {
+        "goal": cmd, "session_id": session_id,
+    }, task_id=task_id)
+    try:
+        with agent_events.task_scope(task_id):
+            result = await agent.execute(
+                cmd,
+                api_key=api_key,
+                provider=provider or "auto",
+                custom_endpoint=(
+                    custom_endpoint if custom_endpoint is not None else endpoint
+                ),
+                project_id=project_id,
+                emit=emit,
+                session_id=session_id,
+            )
+    except asyncio.CancelledError:
+        store.finish_task(task_id, "cancelled")
+        bus.emit("task.cancelled", {"goal": cmd}, task_id=task_id)
+        raise
+    except Exception as exc:
+        store.finish_task(task_id, "failed", error=str(exc))
+        bus.emit("task.failed", {"error": str(exc)[:2000]}, task_id=task_id)
+        raise
+
+    execution = result.get("execution") or {}
+    ok = bool(execution.get("success"))
+    summary = str(execution.get("output") or "")
+    options = execution.get("options")
+    need_input = bool(execution.get("needs_input"))
+    store.finish_task(
+        task_id, "completed" if ok else "failed", summary=summary)
+    bus.emit("task.completed", {
+        "success": ok,
+        "summary": summary[:12000],
+        "elapsed_ms": result.get("total_elapsed_ms", 0),
+        # A clarification is a successful pause, not a finished goal. Carry the
+        # question/options so the UI can render them as buttons and continue
+        # the same session when the user picks one.
+        "needs_input": need_input,
+        "question": str(execution.get("question") or "")[:2000] if need_input else "",
+        "options": [
+            str(option)[:300] for option in (options or [])
+            if str(option).strip()
+        ][:6] if need_input else [],
+        "evidence": execution.get("evidence") or {},
+    }, task_id=task_id)
+    return result
+
+
+@app.get("/api/sessions")
+async def api_list_sessions(limit: int = 50):
+    """Recent chat sessions for the dashboard sidebar."""
+    return JSONResponse({
+        "sessions": get_store().list_sessions(limit=limit),
+    })
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    """Delete a chat session and its tasks."""
+    ok = get_store().delete_session(session_id)
+    return JSONResponse({"deleted": ok, "session_id": session_id})
+
+
+@app.get("/api/tasks")
+async def api_list_tasks(limit: int = 40, session_id: str = ""):
+    """Recent tasks for the dashboard rail (newest first)."""
+    return JSONResponse({
+        "tasks": get_store().list_tasks(limit=limit, session_id=session_id),
+    })
+
+
+@app.get("/api/tasks/{task_id}")
+async def api_get_task(task_id: str):
+    """Full task: metadata + steps + ordered events (replay)."""
+    task = get_store().get_task(task_id)
+    if task is None:
+        return JSONResponse({"error": "Task not found"}, status_code=404)
+    return JSONResponse(task)
+
+
 @app.post("/api/execute")
 async def execute_command(req: ExecuteRequest):
     """Execute a desktop or browser task through the routing engine + brain."""
@@ -342,14 +498,15 @@ async def execute_command(req: ExecuteRequest):
         """Stream brain plan/step events to WebSocket clients."""
         await _broadcast(event)
 
-    result = await agent.execute(
+    result = await _run_agent_task(
         cmd,
+        task_id=agent_events.new_task_id(),
+        session_id=req.session_id or "default",
+        emit=_emit,
         api_key=api_key if api_key else None,
         provider=provider,
-        custom_endpoint=endpoint if endpoint else None,
+        endpoint=endpoint if endpoint else None,
         project_id=project_id if project_id else None,
-        emit=_emit,
-        session_id=req.session_id or "default",
     )
 
     # NOTE: We intentionally do NOT broadcast the result over WebSocket here.
@@ -368,6 +525,40 @@ async def get_context():
     loop = asyncio.get_event_loop()
     ctx = await loop.run_in_executor(None, agent.get_context)
     return JSONResponse(ctx.to_dict())
+
+
+@app.get("/api/voice")
+async def voice_status():
+    """Local voice service state (VAD/wake/PTT, no cloud)."""
+    return JSONResponse(get_voice_service().status())
+
+
+@app.post("/api/voice/{action}")
+async def voice_control(action: str):
+    """start | start-wake | stop | toggle | mute | unmute | toggle-mute |
+    ptt | interrupt."""
+    service = get_voice_service()
+    if action == "start":
+        return JSONResponse(await service.start(agent))
+    if action == "start-wake":
+        # The island's "Voice on" uses the wake-word loop; push-to-talk is a
+        # separate one-shot so both can coexist.
+        return JSONResponse(await service.start(agent, mode="vad"))
+    if action == "stop":
+        return JSONResponse(await service.stop())
+    if action == "toggle":
+        return JSONResponse(await service.toggle(agent))
+    if action in ("mute", "unmute"):
+        return JSONResponse(service.set_muted(action == "mute"))
+    if action in ("toggle-mute", "toggle_mute"):
+        return JSONResponse(service.set_muted(not service.muted))
+    if action == "ptt":
+        if service.agent is None:
+            service.agent = agent
+        return JSONResponse(await service.push_to_talk())
+    if action in ("interrupt", "stop-speaking"):
+        return JSONResponse(await service.interrupt())
+    return JSONResponse({"error": "Unknown action"}, status_code=400)
 
 
 @app.get("/api/system")
@@ -857,6 +1048,24 @@ async def _broadcast(msg: dict) -> None:
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     _ws_clients.append(ws)
+    bus = agent_events.bus()
+    bus.bind_loop()
+    queue = bus.subscribe()
+    # Empty = every task. The island/dashboard can narrow this after opening a
+    # specific task without tearing down the socket.
+    filters: set[str] = set()
+
+    async def _pump_events() -> None:
+        while True:
+            envelope = await queue.get()
+            if filters and str(envelope.get("task_id") or "") not in filters:
+                continue
+            try:
+                await ws.send_json(envelope)
+            except Exception:
+                return
+
+    pump = asyncio.create_task(_pump_events())
     log.info(f"WebSocket client connected (total: {len(_ws_clients)})")
     try:
         while True:
@@ -872,17 +1081,81 @@ async def websocket_endpoint(ws: WebSocket):
             elif action == "execute":
                 cmd = msg.get("command", "").strip()
                 if cmd:
-                    await ws.send_json({"type": "routing", "command": cmd})
-                    res = await agent.execute(
-                        cmd,
-                        api_key=runtime_settings.get("api_key") or None,
-                        provider=runtime_settings.get("provider", "auto"),
-                        custom_endpoint=runtime_settings.get("endpoint") or None,
-                        project_id=runtime_settings.get("project_id") or None,
-                        session_id=str(msg.get("session_id") or "default"),
-                        emit=lambda ev: ws.send_json(ev),
-                    )
-                    await ws.send_json({"type": "result", "data": res})
+                    task_id = agent_events.new_task_id()
+                    session_id = str(msg.get("session_id") or "default")
+                    await ws.send_json({
+                        "type": "routing", "command": cmd, "task_id": task_id,
+                    })
+                    run = asyncio.create_task(
+                        _ws_execute(ws, task_id, cmd, session_id))
+                    _running_tasks[task_id] = run
+
+                    def _done(_t: asyncio.Task, tid: str = task_id) -> None:
+                        _running_tasks.pop(tid, None)
+
+                    run.add_done_callback(_done)
+
+            elif action == "cancel":
+                task_id = str(msg.get("task_id") or "")
+                run = _running_tasks.get(task_id)
+                if run is not None and not run.done():
+                    run.cancel()
+                    await ws.send_json({
+                        "type": "cancel.requested", "task_id": task_id,
+                    })
+                else:
+                    # A task waiting on a permission prompt has no runner yet.
+                    from winbrow.permissions import get_permissions
+                    pm = get_permissions()
+                    pending = pm.pending_list()
+                    if pending:
+                        last = pending[-1]
+                        pm.resolve_pending(last["confirmation_id"], approve=False)
+                        pm.consume(last["tool"], last["args"])
+                        await ws.send_json({
+                            "type": "cancel.requested",
+                            "task_id": task_id,
+                            "confirmation_id": last["confirmation_id"],
+                        })
+
+            elif action == "subscribe":
+                raw = msg.get("task_ids")
+                filters.clear()
+                if isinstance(raw, list):
+                    filters.update(str(t) for t in raw if t)
+                await ws.send_json({
+                    "type": "subscribed", "task_ids": sorted(filters),
+                })
+
+            elif action == "replay":
+                task_id = str(msg.get("task_id") or "")
+                task = get_store().get_task(task_id) if task_id else None
+                await ws.send_json({
+                    "type": "replay",
+                    "task_id": task_id,
+                    "data": task,
+                })
+
+            elif action == "confirm":
+                from winbrow.permissions import get_permissions
+                pm = get_permissions()
+                pending = pm.get_pending(str(msg.get("confirmation_id") or ""))
+                if not pending:
+                    await ws.send_json({
+                        "type": "confirm.result", "status": "unknown",
+                    })
+                else:
+                    approve = bool(msg.get("approve"))
+                    remember = bool(msg.get("remember")) or pending.tier == "t2"
+                    pm.resolve_pending(
+                        pending.id, approve=approve, remember=remember)
+                    pm.consume(pending.tool, pending.args)
+                    await ws.send_json({
+                        "type": "confirm.result",
+                        "status": "approved" if approve else "denied",
+                        "confirmation_id": pending.id,
+                        "tool": pending.tool,
+                    })
 
             elif action == "system":
                 loop = asyncio.get_event_loop()
@@ -901,8 +1174,51 @@ async def websocket_endpoint(ws: WebSocket):
     except Exception as e:
         log.error(f"WebSocket error: {e}")
     finally:
+        pump.cancel()
+        bus.unsubscribe(queue)
         if ws in _ws_clients:
             _ws_clients.remove(ws)
+
+
+async def _ws_execute(ws: WebSocket, task_id: str, cmd: str,
+                      session_id: str) -> None:
+    """Run a task started from the UI socket, streaming v2 events via the bus."""
+    try:
+        result = await _run_agent_task(
+            cmd,
+            task_id=task_id,
+            session_id=session_id,
+            emit=lambda ev: ws.send_json(ev),
+            api_key=runtime_settings.get("api_key") or None,
+            provider=runtime_settings.get("provider", "auto"),
+            custom_endpoint=runtime_settings.get("endpoint") or None,
+            project_id=runtime_settings.get("project_id") or None,
+        )
+        await ws.send_json({
+            "type": "result", "data": result, "task_id": task_id,
+        })
+    except asyncio.CancelledError:
+        try:
+            await ws.send_json({
+                "type": "result",
+                "task_id": task_id,
+                "data": {
+                    "utterance": cmd,
+                    "execution": {
+                        "success": False, "type": "cancelled",
+                        "output": "Task cancelled by the user.",
+                    },
+                },
+            })
+        except Exception:
+            pass
+    except Exception as exc:
+        try:
+            await ws.send_json({
+                "type": "error", "error": str(exc), "task_id": task_id,
+            })
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

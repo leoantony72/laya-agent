@@ -15,10 +15,37 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import threading
 from typing import Optional
-import subprocess
 
 log = logging.getLogger("winbrow.tts")
+
+# One spoken utterance at a time. Keeping the handle lets the island implement
+# barge-in ("stop speaking") without touching the agent loop.
+_lock = threading.Lock()
+_active: Optional[subprocess.Popen] = None
+
+
+def stop_speaking() -> bool:
+    """Kill the current SAPI utterance. Returns True if something was playing."""
+    global _active
+    with _lock:
+        proc = _active
+        _active = None
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        proc.kill()
+        return True
+    except Exception as exc:  # pragma: no cover - OS race
+        log.debug(f"TTS stop failed (non-fatal): {exc}")
+        return False
+
+
+def speaking() -> bool:
+    with _lock:
+        proc = _active
+    return bool(proc is not None and proc.poll() is None)
 
 
 def tts_enabled() -> bool:
@@ -56,6 +83,8 @@ def speak(
     voice = voice or os.environ.get("WINBROW_TTS_VOICE") or None
     rate = int(os.environ.get("WINBROW_TTS_RATE", "1")) if rate is None else int(rate)
     cap = 400  # spoken messages stay terse; cap runaway output
+    global _active
+    stop_speaking()  # a new reply barges in over the previous one
     try:
         proc = subprocess.Popen(
             [
@@ -66,12 +95,18 @@ def speak(
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        with _lock:
+            _active = proc
         if wait:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 log.warning("TTS timed out")
+            finally:
+                with _lock:
+                    if _active is proc:
+                        _active = None
         return True
     except Exception as e:
         log.debug(f"TTS failed (non-fatal): {e}")

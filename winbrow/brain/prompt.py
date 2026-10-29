@@ -133,6 +133,20 @@ DONE IS A STATE, NOT AN ACTION:
   action. Include the evidence in the done object:
     {"kind":"done","summary":"...","evidence":{"url":"...","page_title":"...","confirmation":"<observed proof>"}}
 
+ANSWER QUALITY — THE ANSWER IS THE PRODUCT:
+  • done.summary and chat.response are shown verbatim to the user. They are not
+    status reports. Never answer "Compared X and Y", "Created the file", or
+    "Searched the web" — give the actual result.
+  • Research, comparison, recommendation and analysis tasks: report the concrete
+    findings (models, specs, prices, dates, facts), use a compact markdown table
+    when comparing two or more items, state the trade-offs, give a clear
+    recommendation, and list source URLs. 150–600 words is normal.
+  • Multiple candidates or matches: use a numbered list, explain how they differ,
+    and recommend one. Use clarify+options when the user must choose before you
+    can continue; otherwise present the options in the answer.
+  • Procedures: give numbered steps the user can follow, with exact paths/URLs.
+  • Only small talk and acknowledgements should be 1–2 sentences.
+
 """
     # AVAILABLE SKILLS is injected as a separate cached block.
     # See winbrow/brain/skill_registry.py → build_skills_metadata().
@@ -155,7 +169,7 @@ OUTPUT — ONLY one raw JSON object, no markdown fences, no commentary:
   {"kind":"action","step":{"skill":"<name>","args":{…},"why":"<one sentence>"}}
   {"kind":"done","summary":"<what was accomplished>","evidence":{…}}
   {"kind":"clarify","question":"<what you need from the user>","options":["<choice 1>","<choice 2>"]}
-  {"kind":"chat","response":"<≤2 sentence answer>"}
+  {"kind":"chat","response":"<markdown answer; complete and specific>"}
   {"kind":"stop","response":"..."}
 
   The "skill" value in your action must exactly match one of the skill keys
@@ -253,9 +267,13 @@ SKILL RULES:
   25. ANY other image request — "download/find/save some pictures of X", "get
      an image of X", "download this image <url>", document assets — is
      download_images(query=<subject or direct image URL>, count, folder,
-     source). It searches keyless sources, validates each file and saves it.
-     Never open the browser or web_search for pictures, and never download an
-     image with download_file. Report the saved paths.
+     source). It searches general web photos first (DuckDuckGo/Bing), then
+     licensed Wikimedia photos; Wallhaven/NekosAPI are used only for art,
+     anime, or wallpaper requests. Validates each file and saves it. Never
+     open the browser or web_search for pictures, and never download an image
+     with download_file. Report the saved paths and the source page for web
+     images (their license is unknown). For images embedded in a PDF/deck,
+     use the document skill's licensed image helper, not web results.
   26. PRESENTATIONS vs PAPER DOCUMENTS — choose the page size and engine first:
      • Presentation / deck / slides / keynote / pitch: use playbook_html_ppt.
        Scaffold with new_deck.py, then EDIT the scaffolded index.html IN PLACE.

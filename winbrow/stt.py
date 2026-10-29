@@ -144,16 +144,22 @@ class WhisperSTT:
 
 class AudioRecorder:
     """Simple audio recorder using Windows WASAPI or sounddevice."""
-    
-    def __init__(self, sample_rate: int = 16000, channels: int = 1):
+
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        channels: int = 1,
+        on_level: Optional[Callable[[float], None]] = None,
+    ):
         self.sample_rate = sample_rate
         self.channels = channels
+        self.on_level = on_level
         self._recording = False
         self._thread: Optional[threading.Thread] = None
         self._frames: list[bytes] = []
         self._audio = None
         self._stream = None
-        
+
     def start(self) -> None:
         """Start recording."""
         try:
@@ -165,6 +171,14 @@ class AudioRecorder:
             def callback(indata, frames, time, status):
                 if self._recording:
                     self._frames.append(indata.copy())
+                    if self.on_level is not None:
+                        try:
+                            # 16-bit PCM → 0..1 peak so the island waveform is
+                            # driven by the actual microphone, not a CSS loop.
+                            peak = abs(float(indata.max()))
+                            self.on_level(min(1.0, peak / 12000.0))
+                        except Exception:
+                            pass
             
             self._stream = sd.InputStream(
                 samplerate=16000,

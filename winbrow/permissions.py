@@ -126,6 +126,15 @@ def action_key(tool_name: str, args: dict) -> str:
 
 # --------------------------------------------------------------------------- pending store
 
+def _emit_confirm(pending: "PendingAction") -> None:
+    """Tell the island/dashboard that a decision is waiting on the user."""
+    try:
+        from .events import emit
+        emit("confirm.required", dict(pending.to_dict()))
+    except Exception:
+        pass
+
+
 @dataclass
 class PendingAction:
     id: str
@@ -142,6 +151,9 @@ class PendingAction:
             "confirmation_id": self.id, "tier": self.tier, "tool": self.tool,
             "args": self.args, "utterance": self.utterance,
             "session_id": self.session_id, "status": self.status,
+            "message": f"Allow {self.tier.upper()} action '{self.tool}'?",
+            "created": self.created,
+            "expires_at": self.created + PENDING_TTL_S,
         }
 
 
@@ -280,6 +292,7 @@ class PermissionManager:
             if existing.status == "denied":
                 return (False, "denied by user", None)
             if existing.status == "pending":
+                _emit_confirm(existing)
                 return (False, None, existing.to_dict())
 
         p = PendingAction(
@@ -290,6 +303,7 @@ class PermissionManager:
         self._pending[p.id] = p
         self._prune_pending()
         log.info(f"Permission {tier.upper()} needed for '{tool_name}': pending {p.id}")
+        _emit_confirm(p)
         return (False, None, p.to_dict())
 
     def _desc(self, tool_name: str, args: dict, tier: str, utterance: str) -> dict:

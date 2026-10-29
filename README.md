@@ -881,6 +881,33 @@ py -3 -m venv .venv
 pip install -r requirements.txt
 ```
 
+### 1b. Desktop app (optional, Electron)
+
+The classic web UI stays at `http://127.0.0.1:8765/`. A second, separate desktop
+app adds the dynamic-island pill and the Codex-style trace dashboard.
+
+**Double-click `desktop.bat`.** It builds the UI if needed and starts the app;
+the app starts the Python sidecar itself, so there is no terminal to keep open.
+
+```powershell
+cd frontend
+npm install        # first time only
+npm start          # or: npm run dev:electron for hot reload
+```
+
+Until the packaged build lands, the machine needs Python for the sidecar.
+Quit from the tray icon; closing the dashboard leaves the island running. The
+app can also start at login (tray → "Start at login").
+
+The island is a click-through, near-opaque idle pill (196×36). The main process
+hit-tests the cursor against its bounds: outside, clicks pass to the app
+underneath; inside, the island is interactive. It never steals keyboard focus
+unless you click its text input.
+
+See [frontend/README.md](frontend/README.md) for the event protocol, shortcuts,
+and packaging notes, and [frontend/ISLAND.md](frontend/ISLAND.md) for the island
+state machine and non-interference guarantees.
+
 `websockets` is used by the CDP transport but is not listed in `requirements.txt`. If browser control fails to import it:
 
 ```powershell

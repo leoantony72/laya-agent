@@ -79,6 +79,11 @@ planner_prompt_*.txt
 htmlcov/
 .tox/
 
+# Electron desktop app
+frontend/node_modules/
+frontend/release/
+frontend/*.tsbuildinfo
+
 # Distribution / Packaging
 *.tgz
 *.tar.gz
