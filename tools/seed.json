@@ -703,27 +703,6 @@
     "speak": "done"
   },
   {
-    "name": "set_wallpaper",
-    "description": "Change the Windows desktop wallpaper/background to a given image file or a searched-for picture.",
-    "examples": [
-      "set wallpaper to sunset",
-      "change desktop background",
-      "change wallpaper to C:\\img.jpg"
-    ],
-    "scope": null,
-    "args": [
-      {
-        "name": "image",
-        "kind": "text",
-        "instructions": "Image file path or picture name to use as wallpaper",
-        "criteria": {},
-        "default": ""
-      }
-    ],
-    "script": "\n            $ref = \"{{image}}\".Trim()\n            if (-not $ref) {\n                return \"Tell me which image to use, e.g. 'set wallpaper to C:\\Pictures\\sunset.jpg' or 'set wallpaper to sunset'.\"\n            }\n            $candidate = $ref\n            if ($ref.StartsWith(\"~\")) { $candidate = Join-Path $env:USERPROFILE $ref.Substring(1).TrimStart('\\','/') }\n            if (-not (Test-Path $candidate -PathType Leaf)) {\n                $roots = @(\n                    [Environment]::GetFolderPath('MyPictures'),\n                    [Environment]::GetFolderPath('Desktop'),\n                    (Join-Path $env:USERPROFILE 'Downloads')\n                )\n                $found = $null\n                foreach ($root in $roots) {\n                    if (-not (Test-Path $root)) { continue }\n                    $found = Get-ChildItem -Path $root -File -Include *.jpg,*.jpeg,*.png,*.bmp -ErrorAction SilentlyContinue |\n                        Where-Object { $_.BaseName -like \"*$ref*\" } | Select-Object -First 1\n                    if ($found) { break }\n                }\n                if ($found) { $candidate = $found.FullName }\n                else { return \"ERROR: Could not find an image matching '$ref' in Pictures, Desktop, or Downloads. Provide a full image path.\" }\n            }\n            Add-Type -TypeDefinition 'using System;using System.Runtime.InteropServices;public class WPP{[DllImport(\"user32.dll\",CharSet=CharSet.Auto)]public static extern int SystemParametersInfo(int a,int b,string c,int d);}'\n            [WPP]::SystemParametersInfo(20, 0, $candidate, 3) | Out-Null\n            return \"Desktop wallpaper set to $candidate\"\n            ",
-    "speak": "done"
-  },
-  {
     "name": "take_screenshot",
     "description": "Capture the full screen and save it as a PNG file in Desktop, Downloads, Documents, or Pictures.",
     "examples": [
@@ -870,7 +849,7 @@
   },
   {
     "name": "download_file",
-    "description": "Download a file from a URL into a known user folder (Desktop, Documents, Downloads).",
+    "description": "Download a non-image file (PDF, DOCX, ZIP, CSV...) from a URL into a known user folder (Desktop, Documents, Downloads). For pictures use download_images instead.",
     "examples": [
       "download the attention is all you need paper and save it in the desktop folder",
       "download this pdf from the url into downloads",

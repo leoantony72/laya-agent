@@ -74,6 +74,9 @@ TOOL_TIERS: Dict[str, str] = {
     "photoshop_save_as": T2, "photoshop_desaturate": T2, "photoshop_open_image": T1,
     "office_save_as_pdf": T2, "file_dialog_save": T2,
     "create_text_file": T2, "download_file": T2,
+    # Image search/download writes into Pictures (or the requested folder);
+    # applying a wallpaper is reversible.
+    "download_images": T2, "download_wallpaper": T2, "set_wallpaper": T1,
     # Bundled skill helpers may write user files; scripts are allowlisted but
     # the tool still runs user-visible work, so keep it at the write tier.
     "run_skill_script": T2,

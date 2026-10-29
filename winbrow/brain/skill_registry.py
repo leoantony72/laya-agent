@@ -62,6 +62,8 @@ PREFERRED_ORDER = (
     "screen_read_text",
     "web_search",
     "web_fetch",
+    "set_wallpaper",
+    "download_images",
     "remember_fact",
     "recall_memory",
     "build_tool",
@@ -72,13 +74,13 @@ PREFERRED_ORDER = (
 # The converted playbook library adds ~43 metadata entries. Playbooks are
 # guidance-only skills, so their trigger lines are deliberately shorter than
 # the core tool descriptions. 12,000 chars is roughly 3,000 tokens and leaves
-# room for the core 15 plus the six converted sections.
+# room for the core tool skills plus the six converted sections.
 META_DESC_LIMIT = 12000
 PLAYBOOK_DESC_LIMIT = 95
-CORE_SKILL_KEYS = frozenset(PREFERRED_ORDER[:15])
-META_SKILL_KEYS = frozenset(PREFERRED_ORDER[15:])
+CORE_SKILL_KEYS = frozenset(PREFERRED_ORDER[:19])
+META_SKILL_KEYS = frozenset(PREFERRED_ORDER[19:])
 # (core, meta, playbook, learned) description budgets. The first ladder rung
-# that fits under META_DESC_LIMIT wins, so the core 15 keep the richest
+# that fits under META_DESC_LIMIT wins, so the core tools keep the richest
 # triggers and playbooks stay compact.
 _DESC_LADDER = (
     (200, 130, 95, 100),

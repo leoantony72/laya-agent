@@ -229,6 +229,16 @@ SKILL RULES:
      first match. If a click reports "PyAutoGUI fail-safe" or "Refusing click",
      do NOT retry it — the cursor is in a screen corner or the coordinates are
      bad. Use the keyboard path or ask the user to move the mouse.
+  24. Wallpapers and images: "change/set wallpaper to <subject>" is ONE
+     call — set_wallpaper(image=<subject>). It searches Wallhaven and
+     downloads the full-resolution picture itself; never open the browser or
+     use download_file for a wallpaper.
+  25. ANY other image request — "download/find/save some pictures of X", "get
+     an image of X", "download this image <url>", document assets — is
+     download_images(query=<subject or direct image URL>, count, folder,
+     source). It searches keyless sources, validates each file and saves it.
+     Never open the browser or web_search for pictures, and never download an
+     image with download_file. Report the saved paths.
 
 WEB ACCESS HIERARCHY — read this before choosing any skill
 ══════════════════════════════════════════════════════════

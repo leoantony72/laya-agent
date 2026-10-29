@@ -96,7 +96,9 @@
 - public_ip(no args): Fetch and show the public internet IP address of this computer.
 - always_on_top(no args): Toggle the current window to stay always on top of other windows (requires PowerToys or manual WinAPI).
 - clean_downloads(no args): Move old files (30+ days) from Downloads folder to a cleanup archive.
-- set_wallpaper(image(text)): Change the Windows desktop wallpaper/background to a given image file or a searched-for picture.
+- set_wallpaper(image(text)): Change the Windows desktop wallpaper from a local image, a direct image URL, or a subject to search for (e.g. anime). Searches Wallhaven's keyless API and downloads the image itself; never opens a browser.
+- download_images(query(text), count(text), folder(enum), source(enum), min_width(text)): Download images for any task from a subject search or a direct image URL. Keyless sources, validated files, no browser opened.
+- download_wallpaper(query(text), count(text)): Download wallpaper-shaped images (landscape, 1600x900+) for a subject into Pictures\WinBrow Wallpapers without changing the desktop. No browser opened.
 - take_screenshot(location(text)): Capture the full screen and save it as a PNG file in Desktop, Downloads, Documents, or Pictures.
 - close_folder_window(folder(text)): Close File Explorer windows showing a specific folder (e.g. Downloads).
 - system_performance(no args): Show CPU and memory usage with the top resource-consuming processes.

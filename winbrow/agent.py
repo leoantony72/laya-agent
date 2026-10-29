@@ -54,6 +54,16 @@ from .skill_scripts import (
     get_skill_script_tools,
 )
 from .web_tools import WEB_IMPL, execute_web_tool_async, get_web_tools
+from .image_tools import (
+    IMAGE_IMPL,
+    execute_image_tool,
+    get_image_tools,
+)
+from .wallpaper import (
+    WALLPAPER_IMPL,
+    execute_wallpaper_tool,
+    get_wallpaper_tools,
+)
 from .integrations import (
     INTEGRATION_IMPL,
     execute_integration_tool,
@@ -333,7 +343,8 @@ class WinBrowAgent:
                    + get_installer_tools() + get_shell_tools()
                    + get_browser_tools() + get_document_tools()
                    + get_skill_script_tools() + get_integration_tools()
-                   + get_subagent_tools() + get_web_tools()):
+                   + get_subagent_tools() + get_web_tools()
+                   + get_image_tools() + get_wallpaper_tools()):
             if self.registry.get(_t.name) is None:
                 self.registry.register(_t)
         # v3/M6: MCP bridge — cached catalogs offline-register; fresh
@@ -605,6 +616,22 @@ class WinBrowAgent:
             out = await execute_web_tool_async(tool_name, args)
             out.update({
                 "type": "web",
+                "tool": tool_name,
+            })
+            return out
+        # wallpaper search/download/apply (HTTP only, never opens the browser)
+        if getattr(tool, "impl", None) == WALLPAPER_IMPL:
+            out = await asyncio.to_thread(execute_wallpaper_tool, tool_name, args)
+            out.update({
+                "type": "wallpaper",
+                "tool": tool_name,
+            })
+            return out
+        # general image search/download for any task (HTTP only, no browser)
+        if getattr(tool, "impl", None) == IMAGE_IMPL:
+            out = await asyncio.to_thread(execute_image_tool, tool_name, args)
+            out.update({
+                "type": "image",
                 "tool": tool_name,
             })
             return out
