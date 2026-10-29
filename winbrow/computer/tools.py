@@ -403,7 +403,11 @@ def _windows_ocr_text(image_path: str) -> str:
 
 def _ocr_output(text: str) -> str:
     """Visible step output: the count plus the extracted text for the planner."""
-    return f"OCR extracted {len(text)} characters:\n{text[:4000]}"
+    from ..utils.clip import clip_middle
+    return (
+        f"OCR extracted {len(text)} characters:\n"
+        + clip_middle(text, 12_000, label="screen_read_text")
+    )
 
 
 def _ocr_sync(region: str) -> dict:

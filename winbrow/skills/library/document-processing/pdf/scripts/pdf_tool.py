@@ -137,9 +137,13 @@ def _rgb(value, default: tuple[int, int, int]) -> tuple[int, int, int]:
 def _theme_from_spec(spec: dict) -> PdfTheme:
     from winbrow.layout.pdf import THEMES
 
-    name = str(spec.get("theme") or "corporate").strip().lower()
+    kind = str(spec.get("document_kind") or spec.get("kind") or "").strip().lower()
+    paper_kind = kind in {"resume", "cv", "cover_letter", "cover-letter", "official", "memo"}
+    name = str(spec.get("theme") or "").strip().lower()
+    if not name:
+        name = "resume" if paper_kind else "corporate"
     if name not in THEMES:
-        name = "corporate"
+        name = "resume" if paper_kind else "corporate"
     base = THEMES[name]
     raw_margins = spec.get("margins")
     if isinstance(raw_margins, dict):
@@ -152,21 +156,28 @@ def _theme_from_spec(spec: dict) -> PdfTheme:
     elif isinstance(raw_margins, (list, tuple)) and len(raw_margins) == 4:
         margins = tuple(float(value) for value in raw_margins)  # type: ignore[assignment]
     else:
-        margins = (56.0, 56.0, 56.0, 56.0)
+        margins = (50.0, 50.0, 50.0, 50.0) if paper_kind else (56.0, 56.0, 56.0, 56.0)
     colors = {}
     for key, value in (spec.get("colors") or {}).items():
         if key in base:
             colors[key] = _rgb(value, base[key])
+    page_size = str(spec.get("page_size") or "a4").strip().lower()
+    # Resumes, cover letters and official documents are paper, never slides.
+    if paper_kind and page_size in {"16:9", "16:10", "4:3"}:
+        page_size = "a4"
+    page_numbers = spec.get("page_numbers")
+    if page_numbers is None:
+        page_numbers = False if paper_kind else True
     return PdfTheme(
         name=name,
-        page_size=str(spec.get("page_size") or "a4").strip().lower(),
+        page_size=page_size,
         orientation=str(spec.get("orientation") or "portrait").strip().lower(),
         margins=margins,
         title=str(spec.get("title") or "").strip(),
         author=str(spec.get("author") or "").strip(),
         header=str(spec.get("header") or "").strip(),
         footer=str(spec.get("footer") or "").strip(),
-        page_numbers=bool(spec.get("page_numbers", True)),
+        page_numbers=bool(page_numbers),
         header_on_first=bool(spec.get("header_on_first", False)),
         body_size=spec.get("body_size"),
         body_spacing=spec.get("body_spacing"),
@@ -231,7 +242,8 @@ def _blocks_from_spec(spec: dict, output: Path) -> tuple[list[dict], PdfTheme]:
     if subtitle:
         insert_at = 1 if blocks and blocks[0].get("kind") == "heading" else 0
         blocks.insert(insert_at, {
-            "kind": "paragraph", "text": subtitle, "align": "center",
+            "kind": "paragraph", "text": subtitle,
+            "align": "left" if theme.name == "resume" else "center",
             "muted": True, "size": max(10.0, float(theme.palette["body_size"]) + 1.5),
         })
 
@@ -643,29 +655,109 @@ def images(spec: dict) -> None:
          data={"files": written}, paths=written, path=output_dir)
 
 
+def latex_op(spec: dict) -> None:
+    """Compile a LaTeX resume/cover letter/official document when TeX exists."""
+    from winbrow.layout.latex import LatexUnavailable, render_latex
+
+    source = read_text_arg(spec) or str(
+        spec.get("latex") or spec.get("source") or ""
+    )
+    if not source.strip():
+        fail("Provide LaTeX source in 'content', 'latex', or 'content_path'.")
+    output = resolve_path(
+        spec.get("output_path") or spec.get("path") or "document.pdf"
+    )
+    if output.suffix.lower() != ".pdf":
+        output = output.with_suffix(".pdf")
+    ensure_parent(output)
+    try:
+        result = render_latex(source, output, timeout=int(spec.get("timeout") or 120))
+    except LatexUnavailable as exc:
+        fail(str(exc))
+    except Exception as exc:
+        fail(f"LaTeX compile failed: {type(exc).__name__}: {exc}")
+
+    validation = None
+    if bool(spec.get("validate", True)):
+        expected = None
+        page_size = str(spec.get("page_size") or "").strip().lower()
+        if page_size in PAGE_SIZES:
+            raw = PAGE_SIZES[page_size]
+            expected = raw if isinstance(raw, tuple) else None
+        validation = validate_pdf(
+            result["path"], margins=(0, 0, 0, 0), expected_size=expected,
+        )
+        if validation.get("errors") and validation.get("pages", 0) > 0:
+            fail(
+                "LaTeX PDF validation failed:\n"
+                + "\n".join(f"- {item}" for item in validation["errors"][:8])
+            )
+    emit(
+        True,
+        f"Compiled LaTeX to PDF: {result['path']} "
+        f"({result['bytes']} bytes, engine={result['engine']})",
+        path=result["path"],
+        data={**result, "validation": validation},
+    )
+
+
 def from_html(spec: dict) -> None:
     """Print a local HTML page or deck to PDF with headless Chrome/Edge."""
-    from winbrow.html_to_pdf import html_to_pdf
+    from winbrow.deck_repair import repair_deck
+    from winbrow.html_to_pdf import PAGE_SIZES, detect_document_kind, html_to_pdf
 
     source = resolve_path(spec.get("path") or spec.get("input_path") or "")
     if source.is_dir():
         source = source / "index.html"
     if not source.is_file():
         fail(f"HTML file not found: {source}")
+
+    html_text = source.read_text(encoding="utf-8", errors="replace")
+    kind = detect_document_kind(html_text)
+    repair_report = {"ok": True, "repaired": False, "repairs": []}
+    if kind == "presentation" and bool(spec.get("repair", True)):
+        repair_report = repair_deck(source, write=True)
+        if not repair_report.get("ok"):
+            fail(
+                "Deck needs repair but unresolved references remain:\n"
+                + "\n".join(f"- {e}" for e in repair_report["errors"][:8])
+            )
+
     output = resolve_path(
         spec.get("output_path") or source.with_suffix(".pdf")
     )
-    page = str(spec.get("page") or "16:9").strip().lower()
+    # auto -> 16:9 for a slide deck, A4 for a document/resume.
+    page = str(spec.get("page") or "auto").strip().lower()
     try:
         result = html_to_pdf(source, output, page=page)
     except Exception as exc:
         fail(f"HTML→PDF export failed: {type(exc).__name__}: {exc}")
+
+    validation = None
+    if bool(spec.get("validate", True)):
+        from winbrow.layout.validate import validate_pdf
+
+        expected = PAGE_SIZES.get(result["page"])
+        expected_pt = (expected[0] * 72, expected[1] * 72) if expected else None
+        validation = validate_pdf(
+            result["path"],
+            margins=(0, 0, 0, 0),
+            expected_size=expected_pt,
+        )
+        problems = list(validation.get("errors") or [])
+        if problems and validation.get("pages", 0) > 0:
+            fail(
+                "PDF validation failed:\n"
+                + "\n".join(f"- {item}" for item in problems[:10])
+            )
+
     emit(
         True,
         f"Exported HTML to PDF: {result['path']} "
-        f"({result['bytes']} bytes, page={result['page']})",
+        f"({result['bytes']} bytes, page={result['page']}, "
+        f"{result['width_in']}x{result['height_in']}in)",
         path=result["path"],
-        data=result,
+        data={**result, "repair": repair_report, "validation": validation},
     )
 
 
@@ -748,6 +840,7 @@ def main() -> None:
         "fill_form": fill_form,
         "images": images,
         "from_html": from_html,
+        "latex": latex_op,
         "find_image": find_image_op,
         "validate": validate_op,
     }
@@ -756,7 +849,7 @@ def main() -> None:
         fail(
             f"Unknown PDF operation '{operation}'. Use create, merge, split, "
             "rotate, watermark, encrypt, extract_text, metadata, tables, "
-            "fields, fill_form, images, from_html, find_image, or validate."
+            "fields, fill_form, images, from_html, latex, find_image, or validate."
         )
     handler(spec)
 

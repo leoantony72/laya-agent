@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Optional
 
 from .browser_task import BrowserController, note_browser_from_text
@@ -696,7 +697,16 @@ class WinBrowAgent:
     # ------------------------------------------------------------------ brain helpers
     async def brain_chat(self, utterance: str, ctx: WindowsContext, session: SessionMemory) -> str:
         """Conversational answer via the gateway, grounded in session + episodic memory."""
-        messages = build_chat_messages(utterance, _ctx_block(ctx), session.context_block())
+        memory_block = session.context_block()
+        hint_fn = getattr(session, "reference_hint", None)
+        if callable(hint_fn):
+            try:
+                hint = hint_fn(utterance)
+            except Exception:
+                hint = ""
+            if hint:
+                memory_block = f"{memory_block}\n\n{hint}"
+        messages = build_chat_messages(utterance, _ctx_block(ctx), memory_block)
         resp = await self.gateway.chat(messages, temperature=0.5, max_tokens=300)
         return resp.content.strip() or "Nothing to say."
 
@@ -1208,6 +1218,7 @@ class WinBrowAgent:
 
         resolutions: dict = {}
         tier = "brain_first"
+        run_id = ""
         try:
             if _is_browser_intent(utterance):
                 brain_res, resolutions = await self.handle_browser_task(
@@ -1220,15 +1231,20 @@ class WinBrowAgent:
                 brain_res = await self.brain.handle(
                     contextualized, ctx, session, emit=emit,
                 )
+            run_id = getattr(brain_res, "run_id", "") or ""
             execution = brain_res.to_dict()
         except GatewayUnavailable:
             log.warning("Brain unavailable; falling back to legacy routing.")
+            self._trace_brain_run(
+                utterance, "", "unavailable", False, 0, 0, "no provider")
             return None
         except GatewayError as exc:
             # The provider is configured but failed (quota, 429, timeout after
             # retries). The brain was still tried first; let the legacy path
             # handle the command rather than dropping it entirely.
             log.warning(f"Brain provider failed ({exc}); falling back to legacy routing.")
+            self._trace_brain_run(
+                utterance, "", "gateway_error", False, 0, 0, str(exc))
             return None
         except Exception as exc:
             log.warning(f"Brain-first execution failed: {exc}")
@@ -1257,6 +1273,15 @@ class WinBrowAgent:
         }
         if resolutions:
             result["session_resolutions"] = resolutions
+        self._trace_brain_run(
+            utterance,
+            run_id,
+            str(execution.get("kind") or ""),
+            bool(execution.get("success")),
+            len(execution.get("steps") or []),
+            total_ms,
+            execution=execution,
+        )
         self.history.append(result)
         if len(self.history) > 100:
             self.history = self.history[-100:]
@@ -1266,6 +1291,37 @@ class WinBrowAgent:
         except Exception as exc:
             log.debug(f"Memory recording failed (non-fatal): {exc}")
         return result
+
+    def _trace_brain_run(
+        self,
+        utterance: str,
+        run_id: str,
+        outcome: str,
+        success: bool,
+        steps: int,
+        total_ms: float,
+        detail: str = "",
+        execution: Optional[dict] = None,
+    ) -> None:
+        """One brain_run row per brain task. Never raises."""
+        try:
+            from .trace import log_event
+            payload = execution if isinstance(execution, dict) else {}
+            log_event({
+                "type": "brain_run",
+                "run_id": run_id or f"br_{uuid.uuid4().hex[:10]}",
+                "utterance": str(utterance or "")[:500],
+                "outcome": outcome,
+                "success": bool(success),
+                "complete": bool(payload.get("complete")),
+                "steps": int(steps),
+                "total_ms": round(float(total_ms or 0.0), 1),
+                "provider": str(payload.get("provider") or ""),
+                "model": str(payload.get("model") or ""),
+                "detail": str(detail or "")[:300],
+            })
+        except Exception:
+            pass
 
     async def execute(
         self,

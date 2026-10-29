@@ -458,7 +458,8 @@ def _wrap_ps_script(script: str) -> str:
 
 
 def _run_powershell_blocking(
-    wrapped_script: str, timeout: int, t0: float
+    wrapped_script: str, timeout: int, t0: float,
+    script_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Blocking PowerShell spawn with temp-file output.
 
@@ -466,17 +467,25 @@ def _run_powershell_blocking(
     `code` shim) leave a child holding the inherited pipe open, and
     subprocess.run() would then wait for EOF forever. Waiting only on the
     process and reading the files avoids that hang.
+
+    ``script_path`` runs a saved .ps1 via ``-File`` (used for commands longer
+    than the Windows -Command limit). Otherwise ``wrapped_script`` runs via
+    ``-Command``.
     """
+    argv = [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy", "Bypass",
+    ]
+    if script_path:
+        argv += ["-File", str(script_path)]
+    else:
+        argv += ["-Command", wrapped_script]
     with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
         try:
             proc = subprocess.Popen(
-                [
-                    "powershell.exe",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy", "Bypass",
-                    "-Command", wrapped_script,
-                ],
+                argv,
                 stdin=subprocess.DEVNULL,
                 stdout=out_f,
                 stderr=err_f,
@@ -538,12 +547,14 @@ def run_powershell_sync(script: str, timeout: int = 30) -> dict[str, Any]:
 
 
 async def _run_powershell_sync(
-    wrapped_script: str, timeout: int, t0: float
+    wrapped_script: str, timeout: int, t0: float,
+    script_path: Optional[str] = None,
 ) -> dict[str, Any]:
     """Sync PowerShell in an executor — works on any event loop."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
-        None, _run_powershell_blocking, wrapped_script, timeout, t0)
+        None, _run_powershell_blocking, wrapped_script, timeout, t0,
+        script_path)
 
 
 # ---------------------------------------------------------------------------

@@ -1000,7 +1000,8 @@ All settings are environment variables, loaded from `.env` by `server.py`.
 | `WINBROW_LOCAL_LLM_TIMEOUT` | `600` | Local generation timeout |
 | `WINBROW_LOCAL_LLM_CTX` | `8192` | Local context size |
 | `WINBROW_LOCAL_LLM_THREADS` | core count | Local llama.cpp threads |
-| `WINBROW_BRAIN_TIMEOUT` | `45` (local higher) | Model request timeout |
+| `WINBROW_BRAIN_TIMEOUT` | `45` (`120` in .env.example) | Model request timeout |
+| `WINBROW_BRAIN_DEADLINE_S` | `300` | Wall-clock ceiling for the whole provider chain (`0` disables) |
 
 ### Planner and routing
 
@@ -1015,6 +1016,16 @@ All settings are environment variables, loaded from `.env` by `server.py`.
 | `WINBROW_REASONING_OFF_MAX_TOKENS` | `1000` | Final retry with reasoning disabled |
 | `WINBROW_PLANNER_MAX_TOKENS` | `16000` | Planner total budget |
 | `WINBROW_PLANNER_TEMPERATURE` | `1` | Planner temperature |
+| `WINBROW_NEBIUS_REASONING_EFFORT` | `low` | Nebius effort level (`low`/`medium`/`high`/`none`) |
+| `WINBROW_CONTEXT_TOKENS` | unset | Provider context window; derives the history budget |
+| `WINBROW_HISTORY_MAX_CHARS` | `240000` interim | Hard history char budget (overrides the formula) |
+| `WINBROW_HISTORY_FULL` | `0` | Full-fidelity history (one entry per step) |
+| `WINBROW_HISTORY_BROWSER_FIRST` | `1` | Evict stale browser snapshots first |
+| `WINBROW_PARALLEL_READS` | `0` | Run 2-3 read-only calls concurrently |
+| `WINBROW_NOVELTY_NUDGE` | `1` | One advisory nudge after 5 steps with no new URL/path |
+| `WINBROW_RESULTS_DIR` | `logs/results` | Full copies of clipped tool output |
+| `WINBROW_SCRIPTS_DIR` | `logs/scripts` | Temp `.ps1` files for long commands |
+| `WINBROW_RESULTS_RETENTION_DAYS` | `7` | Prune saved results/scripts after N days |
 | `LAYA_TIMEOUT_S` | ~`2` (router) | Laya prediction timeout |
 | `WINBROW_DISABLE_LAYA` | unset | Disable Laya in the router |
 | `WINBROW_ROUTER_LLM` | unset | Enable the Ollama router tier (`1`) |

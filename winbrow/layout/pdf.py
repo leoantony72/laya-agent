@@ -25,6 +25,7 @@ IMAGE_RE = re.compile(r"^!\[(.*?)\]\((.+?)\)\s*$")
 
 PAGE_SIZES: dict[str, tuple[float, float]] = {
     "a4": (595.28, 841.89),
+    "a5": (419.53, 595.28),
     "letter": (612.0, 792.0),
     "legal": (612.0, 1008.0),
 }
@@ -61,6 +62,16 @@ THEMES: dict[str, dict[str, Any]] = {
         "accent": (217, 119, 87), "table_header": (20, 20, 19),
         "table_header_text": (255, 255, 255), "table_row": (250, 249, 245),
         "code_bg": (246, 244, 240), "quote_bg": (250, 247, 242),
+    },
+    # Compact, high-contrast paper theme for resumes, cover letters and
+    # official documents. Dense but readable; no decorative fills.
+    "resume": {
+        "font": "sans", "body_size": 10.0, "body_spacing": 1.32,
+        "heading_sizes": (17.0, 12.0, 10.5),
+        "text": (23, 23, 23), "muted": (90, 90, 90),
+        "accent": (28, 52, 84), "table_header": (28, 52, 84),
+        "table_header_text": (255, 255, 255), "table_row": (246, 247, 249),
+        "code_bg": (245, 245, 245), "quote_bg": (247, 248, 250),
     },
 }
 

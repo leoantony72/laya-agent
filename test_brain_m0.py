@@ -334,6 +334,13 @@ class TestHistoryCompression(unittest.TestCase):
         # 2000 (and the newest 3000) characters of page state.
         self.assertLess(len(block), 8000)
 
+    def test_full_mode_keeps_every_step_verbatim(self):
+        block = format_history(
+            self._history(8), full=True, max_chars=100_000, run_id="br_t")
+        self.assertNotIn("--- last 5 steps in full ---", block)
+        self.assertIn("page 0", block)
+        self.assertIn("page 7", block)
+
     def test_old_file_search_keeps_matching_paths(self):
         history = [{
             "step": {"skill": "find_files",
@@ -671,7 +678,10 @@ class TestAgentIntegration(unittest.TestCase):
 
     def test_new_action_uses_brain_when_gateway_available(self):
         agent = self._agent()
-        agent.session.reset()
+        # Use an isolated session; never reset the real "default" session from
+        # a test (that used to wipe the user's conversation history on disk).
+        from winbrow.memory import get_session
+        agent.session = get_session("test")
         agent.gateway._responses = [plan("action", steps=[
             {"skill": "volume_set_level", "args": {"level": "55"}},
         ])]

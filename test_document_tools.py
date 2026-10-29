@@ -173,6 +173,19 @@ class DocumentToolsTest(unittest.TestCase):
         self.assertIn("content=<25000 chars>", block)
         self.assertNotIn("Q" * 200, block)
 
+    def test_max_chars_boundary_and_pagination(self):
+        from winbrow import document_tools as dt
+        self.assertEqual(dt.DEFAULT_MAX_CHARS, 60000)
+        self.assertEqual(dt.MAX_OUTPUT_CHARS, 100000)
+        path = self.root / "big.txt"
+        path.write_text("x" * 120_000, encoding="utf-8")
+        result = read_document(str(path), max_chars=100_001)
+        self.assertTrue(result["success"], result["output"])
+        self.assertEqual(result["next_offset"], 100_000)
+        self.assertIn("offset=100000", result["output"])
+        result = read_document(str(path), max_chars=500)
+        self.assertEqual(result["next_offset"], 1000)
+
     def test_document_history_budget_is_newest_first(self):
         history = []
         for index in range(5):
@@ -187,6 +200,22 @@ class DocumentToolsTest(unittest.TestCase):
         self.assertIn("marker-4", block)
         self.assertNotIn("marker-0", block)
         self.assertLess(len(block), 65000)
+
+    def test_document_history_full_mode_keeps_all_steps(self):
+        history = []
+        for index in range(5):
+            history.append({
+                "step": {"skill": "read_document", "args": {"offset": index}},
+                "result": {
+                    "success": True,
+                    "output": "z" * 20000 + f"marker-{index}",
+                },
+            })
+        block = format_history(
+            history, full=True, max_chars=200_000, run_id="br_doc")
+        for index in range(5):
+            self.assertIn(f"marker-{index}", block)
+        self.assertGreater(len(block), 90_000)
 
     def test_missing_file_is_reported(self):
         result = read_document(str(self.root / "does-not-exist.pdf"))

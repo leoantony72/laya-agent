@@ -66,11 +66,12 @@ Fields:
 | Field | Values |
 |---|---|
 | `title`, `subtitle`, `author`, `header`, `footer` | text |
-| `theme` | `corporate`, `academic`, `minimal`, `editorial` |
-| `page_size` | `a4`, `letter`, `legal` |
-| `orientation` | `portrait`, `landscape` |
+| `theme` | `corporate`, `academic`, `minimal`, `editorial`, `resume` |
+| `document_kind` | `document` (default), `resume`, `cover_letter`, `official`, `report`, `memo` |
+| `page_size` | `a4` (default), `letter`, `legal`, `a5` |
+| `orientation` | `portrait` (default), `landscape` |
 | `margins` | `[left,top,right,bottom]` in points, or an object |
-| `page_numbers` | true/false (default true) |
+| `page_numbers` | true/false (default true; false for resumes) |
 | `content` / `content_path` | Markdown-ish text: `#` headings, `-` bullets, `|` tables, fenced code, `>` quotes, `![caption](path)` images |
 | `blocks` | structured blocks (advanced): `heading`, `paragraph`, `bullet`, `numbered`, `table`, `image`, `code`, `quote`, `spacer`, `pagebreak` |
 | `images` | list of `{path}` or `{query, caption, credit}`; appended at the end |
@@ -100,6 +101,29 @@ the output folder. Always keep the returned `credit` with the image.
 - `academic`: serif, navy accent, wider line spacing.
 - `editorial`: warm serif, terracotta accent.
 - `minimal`: black/white, high contrast.
+- `resume`: compact, A4/Letter-friendly, high contrast, no page numbers by default.
+
+### Page size policy
+
+- A **presentation/deck/slides** is not a paper document. Export decks through
+  `html-ppt/render_deck.py` with `page="16:9"` (13.333 × 7.5 in, PowerPoint
+  widescreen). Never create a 16:9 slide deck for a resume or official letter.
+- **Resume / CV / cover letter / official document / report / memo:** use
+  `document_kind` and `page_size="a4"` (default) or `"letter"` for US paper.
+  Keep `page_numbers=false` for resumes and cover letters.
+- **HTML → PDF:** `from_html` defaults to `page="auto"`: a slide deck becomes
+  16:9, a document/resume becomes A4. Pass an explicit page only when the user
+  asks for it.
+
+### LaTeX (optional)
+
+For resumes, cover letters and official letters, LaTeX gives the most precise
+typography when a TeX engine is installed (`pdflatex`, `xelatex`, `lualatex` or
+`latexmk`). Use `operation="latex"` with a complete document or a body; the tool
+adds a sane A4 preamble when `\documentclass` is absent. If no TeX engine is
+installed the operation fails with an install hint — the pure-Python measured
+`create` engine (A4/Letter, `document_kind="resume"`) remains the default and
+always works.
 
 The engine uses measured text, not fixed coordinates. Headings stay with the
 following block; paragraphs, code, quotes, and table rows split across pages
@@ -120,7 +144,8 @@ captioned, and credited.
 | `tables` | `path`, `pages` |
 | `fields` / `fill_form` | AcroForm list / fill (`fields`, `flatten`) |
 | `images` | `path`, `pages`, `output_dir` |
-| `from_html` | `path` (HTML deck/page), `output_path`, `page` (`16:9`/`letter`/`a4`/`auto`) |
+| `from_html` | `path` (HTML deck/page), `output_path`, `page` (`auto`/`16:9`/`letter`/`a4`), `repair`, `validate` |
+| `latex` | `content` / `content_path` (LaTeX source), `output_path`, optional `page_size`, `validate`; requires a TeX engine |
 | `find_image` | `query`, `output_dir`, `count` |
 | `validate` | `path`, optional `margins`, `page_size`, `orientation`, `render_dir` |
 

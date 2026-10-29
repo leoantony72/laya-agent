@@ -25,8 +25,8 @@ from .resolvers import resolve_file
 log = logging.getLogger("winbrow.documents")
 
 DOCUMENT_IMPL = "document"
-DEFAULT_MAX_CHARS = 30000
-MAX_OUTPUT_CHARS = 40000
+DEFAULT_MAX_CHARS = 60000
+MAX_OUTPUT_CHARS = 100000
 MAX_FILE_BYTES = 100 * 1024 * 1024
 MAX_CACHE_CHARS = 2_000_000
 _CACHE_SIZE = 4
@@ -240,7 +240,7 @@ def get_document_tools() -> list[Tool]:
                 ),
                 ArgSpec(
                     name="max_chars", kind="text",
-                    instructions="Maximum characters to return (1000-40000)",
+                    instructions="Maximum characters to return (1000-100000)",
                     default=str(DEFAULT_MAX_CHARS),
                 ),
                 ArgSpec(

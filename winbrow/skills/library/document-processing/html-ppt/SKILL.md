@@ -78,26 +78,39 @@ and confirm):
    Press `T` to cycle themes, `O` for the overview, arrows to navigate.
 
 3. Replace the demo content with the user's material, one
-   `<section class="slide">` per logical page. Start from a layout in
-   `templates/single-page/`; do not invent markup from scratch.
+   `<section class="slide">` per logical page. **Edit the scaffolded
+   `index.html` in place** (or use `mcp_filesystem_edit_file` for exact
+   replacements). Do NOT replace the whole file with hand-written HTML:
+   keep the `<head>` asset links (`assets/fonts.css`, `assets/base.css`,
+   the theme/`style.css`, `assets/animations/animations.css`), the
+   `<body class="tpl-*">` theme class, the `<div class="deck">` wrapper, and
+   `assets/runtime.js`. Start from a layout in `templates/single-page/`;
+   do not invent markup from scratch.
 
 4. Put presenter-only text inside `<div class="notes">…</div>`, never as
    visible slide text. Press `S` to check the presenter view and script.
 
-5. Verify: open the deck, navigate all slides, check for overflow/clipped text,
-   missing images, and console errors.
+5. Verify: run `validate_deck.py` (or the export step, which repairs common
+   asset loss), then open the deck, navigate all slides, and check for
+   overflow/clipped text, missing images, and console errors.
+   ```json
+   {"input":"C:\\Users\\me\\Desktop\\q3-review\\index.html","repair":true}
+   ```
 
 6. Export to PDF when the user wants a shareable/printable file:
 
    ```json
    {"input":"C:\\Users\\me\\Desktop\\q3-review\\index.html",
     "output":"C:\\Users\\me\\Desktop\\q3-review\\q3-review.pdf",
-    "format":"pdf","page":"16:9"}
+    "format":"pdf","page":"16:9","repair":true,
+    "layout_check":true,"validate":true}
    ```
 
    `run_skill_script(skill="html-ppt", script="render_deck.py", spec=<JSON>)`
-   uses installed Chrome/Edge. For PNG thumbnails, `{"format":"png",
-   "slides":"all"}`.
+   uses installed Chrome/Edge. Deck PDFs are **16:9 (13.333 × 7.5 in)** by
+   default — the same geometry as a PowerPoint widescreen slide. Never export
+   a deck as A4/Letter unless the user explicitly wants a paper version.
+   For PNG thumbnails, `{"format":"png","slides":"all"}`.
 
 ## Authoring Rules
 
@@ -117,6 +130,11 @@ and confirm):
   computes and verifies paths.
 - **Keep content legible:** one idea per slide, title 32–40 pt equivalent, body
   16–20 pt, no walls of text; move detail to notes.
+- **PDF geometry:** decks export at 16:9 (13.333 × 7.5 in). Do not switch to
+  A4/Letter for a deck unless the user asks for a printable paper version.
+- **Print colors:** dark themes must keep their background in PDF. Use theme
+  tokens and never lighten text on an unset/white background.
+- **One slide, one page:** verify the PDF page count equals the slide count.
 
 ## References (load only when needed)
 
@@ -135,14 +153,20 @@ slides). Both print one JSON object for `run_skill_script`.
 
 ## Recovery
 
-- Scaffold reports unresolved references: do not edit paths by hand; pass a
-  different `output_parent` or re-scaffold from the template.
+- Scaffold or export reports unresolved references: the export step repairs
+  missing `base.css`/theme/`runtime.js` and wraps stray slides in `.deck`. If
+  errors remain, re-scaffold from the template; do not hand-edit `../` depth.
 - Browser does not open: report the absolute `index.html` path; the user can
   open it manually.
-- PDF export says Chrome/Edge not found: set `WINBROW_BROWSER` to
-  `chrome.exe`/`msedge.exe` or install one; do not claim the PDF exists.
-- A slide is blank: check that it has `class="slide"` and the runtime script is
-  present.
+- PDF export says Chrome/Edge not found: set `WINBROW_BROWSER` to the browser
+  executable path.
+- A slide is blank: check that it has `class="slide"`, the `.deck` wrapper, and
+  the runtime script.
 - Presenter view (`S`) does nothing: the deck must load `assets/runtime.js`.
-- Text overflows in print: reduce content or move detail to `.notes`; verify by
-  opening the exported PDF, not just the browser.
+- Text overflows in print: reduce content or move detail to `.notes`; the
+  fallback CSS and print rules preserve slide geometry, but cannot shrink an
+  overfull slide. Verify by opening the exported PDF, not just the browser.
+- PDF has the wrong page count or size: run `render_deck.py` with
+  `"page":"16:9","validate":true`; it fails instead of reporting a bad PDF.
+- Light text on a white PDF: the deck lost `base.css`/the theme. Run the export
+  (it repairs missing links) or re-scaffold; never ship the unstyled PDF.

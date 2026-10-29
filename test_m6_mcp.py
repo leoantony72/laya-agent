@@ -19,7 +19,7 @@ os.environ["WINBROW_TTS"] = "0"
 os.environ["WINBROW_NORMALIZE"] = "0"
 
 from winbrow.mcp import (McpHub, McpServerSpec, McpConnection, MCP_IMPL,
-                         MAX_ARG_CHARS, MAX_ARGS_JSON,
+                         MAX_ARG_CHARS, MAX_ARGS_JSON, MAX_OUTPUT_CHARS,
                          _StdioTransport, _parse_sse, _clamp_args,
                          _coerce_schema_args,
                          _extract_text, _slug, _mcp_parse, execute_mcp_tool,
@@ -189,7 +189,15 @@ class TestJsonHelpers(unittest.TestCase):
         res = {"content": [{"type": "text", "text": "abc def"},
                            {"type": "resource", "data": {"p": 1}}]}
         self.assertIn("abc def", _extract_text(res))
-        self.assertLessEqual(len(_extract_text(res)), 32_000)
+        self.assertLessEqual(len(_extract_text(res)), MAX_OUTPUT_CHARS)
+
+    def test_extract_text_clips_head_and_reports_full_copy(self):
+        from winbrow import mcp
+        body = "HEAD " + ("x" * 150_000)
+        out = mcp._extract_text({"content": [{"type": "text", "text": body}]})
+        self.assertTrue(out.startswith("HEAD "))
+        self.assertIn("truncated", out)
+        self.assertLessEqual(len(out), mcp.MAX_OUTPUT_CHARS + 300)
 
     def test_coerce_schema_args(self):
         schema = {"type": "object", "properties": {

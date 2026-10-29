@@ -34,6 +34,15 @@ TRACE_PATH = pathlib.Path(
 _lock = threading.Lock()
 
 
+def trace_path() -> pathlib.Path:
+    """Current trace path, read at call time so .env overrides apply.
+
+    ``TRACE_PATH`` remains the import-time default for older callers.
+    """
+    raw = os.environ.get("WINBROW_TRACE_PATH", "").strip()
+    return pathlib.Path(raw) if raw else TRACE_PATH
+
+
 def new_command_id() -> str:
     """Correlate one command across all pipeline stages."""
     return uuid.uuid4().hex[:12]
@@ -42,11 +51,12 @@ def new_command_id() -> str:
 def log_event(event: dict[str, Any]) -> None:
     """Append one event dict as a single JSON line. Never raises."""
     try:
-        TRACE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        path = trace_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         record = {"ts": time.time(), **event}
         line = json.dumps(record, ensure_ascii=False, default=str)
         with _lock:
-            with open(TRACE_PATH, "a", encoding="utf-8") as f:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
     except Exception as e:
         log.debug(f"Trace write failed (non-fatal): {e}")

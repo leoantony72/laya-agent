@@ -511,7 +511,7 @@ class SubagentManager:
             "task": spec.task[:500],
             "status": status,
             "success": success,
-            "summary": summary[:800],
+            "summary": summary[:4000],
             "steps": steps,
             "step_count": len(steps),
             "elapsed_ms": elapsed_ms,

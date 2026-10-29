@@ -100,6 +100,29 @@ class TestBlankPageState(unittest.TestCase):
         self.assertEqual(stub.fetches, 1)
 
 
+class TestBrowserCaps(unittest.TestCase):
+    def test_state_cap_and_link_budget(self):
+        from winbrow import browser_tools as bt
+        self.assertGreaterEqual(
+            bt._MAX_STATE_CHARS,
+            bt._MAX_READ_FULL_TEXT_CHARS + bt._MAX_READ_FULL_TREE_CHARS,
+        )
+        self.assertEqual(bt._MAX_PAGE_CHARS, 12_000)
+        self.assertEqual(bt._MAX_TREE_CHARS, 12_000)
+        self.assertEqual(bt._MAX_LINKS, 60)
+
+    def test_arg_specs_match_caps(self):
+        from winbrow.browser_tools import get_browser_tools
+        tools = {tool.name: tool for tool in get_browser_tools()}
+        read = {a.name: a for a in tools["browser_read_page"].args}
+        self.assertEqual(read["max_chars"].default, "12000")
+        full = {a.name: a for a in tools["browser_read_full"].args}
+        self.assertEqual(full["max_text_chars"].default, "12000")
+        self.assertEqual(full["max_tree_chars"].default, "12000")
+        tree = {a.name: a for a in tools["browser_get_accessibility_tree"].args}
+        self.assertEqual(tree["max_chars"].default, "12000")
+
+
 class TestPlannerRepeatAndWarnings(unittest.TestCase):
     def test_reads_and_waits_are_repeatable(self):
         for skill in ("browser_read_page", "browser_read_full",

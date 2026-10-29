@@ -13,6 +13,10 @@ from PIL import Image
 from .measure import wrap_text
 
 log = logging.getLogger("winbrow.layout.validate")
+# Font parsing warnings from pdfminer/pypdf are noisy and non-actionable; they
+# do not affect validation results.
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 def render_pdf_pages(pdf_path: str | Path, output_dir: str | Path,

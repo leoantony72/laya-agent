@@ -108,6 +108,44 @@ DONE — all six phases implemented; focused tests passing.
 - Tests: `test_nebius_gateway.py` (4) covers auto order, env model/base,
   provider preference, and reasoning payload translation.
 
+## Session context + artifacts (2026-10-29)
+
+- `SessionMemory.Turn` now stores `artifacts` (absolute paths created/opened)
+  and persists them; older turns are backfilled from stored snippets.
+- `reference_hint()` binds follow-ups ("where is the pdf?", "open it") to the
+  most recent artifact, flags format mismatches (asked PDF, produced HTML), and
+  is injected into the brain prompt. `context_block()` shows artifact paths.
+- Fixed `test_brain_m0` wiping the real `default` session via
+  `agent.session.reset()`; restored the 12-turn default history.
+- Tests: `test_session_context.py` + session/loop/brain suites (27 pass).
+
+## Presentation/PDF pipeline (2026-10-29)
+
+- Root cause of broken deck PDFs: the planner replaced `index.html` and linked
+  a non-existent `assets/index.css`, dropping `base.css`, the theme, `.deck`,
+  and `runtime.js`. Chrome then printed unstyled HTML (3 pages, light text on
+  white).
+- Added `winbrow/deck_repair.py`: restores required CSS/theme/runtime, wraps
+  stray slides in `.deck`, adds the `tpl-*` body class, normalises h1/h2, and
+  injects token-based fallback CSS. Idempotent; never changes slide text.
+- Added `winbrow/deck_layout.py`: headless Chrome measures each slide's
+  overflow; export fails with the exact slide instead of clipping text.
+- `html_to_pdf.py`: `auto` page resolves decks to 16:9 (13.333x7.5in) and
+  documents/resumes to A4; print CSS forces one slide per page and
+  `print-color-adjust: exact`; added legal/a5 sizes.
+- `render_deck.py` repairs + layout-checks + validates page count/size before
+  reporting success. `pdf_tool.from_html` defaults to `auto` and repairs decks.
+- `layout/pdf.py` adds a `resume` theme; `pdf_tool.create` supports
+  `document_kind=resume|cover_letter|official`, A4/Letter portrait, no page
+  numbers. Optional `latex` operation compiles via pdflatex/xelatex/lualatex/
+  latexmk when installed (not installed on this machine).
+- Prompt/SKILL rules now forbid replacing scaffolded HTML, require preserving
+  asset links, default decks to 16:9, and send resumes/official docs to
+  A4/Letter.
+- Verification: 24 PDF/deck tests pass; the real
+  `remote-execution-vulnerability` deck exported 12 pages at 960x540 with no
+  overflow; a sample resume exported A4 595.28x841.89 with no warnings.
+
 ## Next actions
 
 - Install optional packages as needed: `pip install -r

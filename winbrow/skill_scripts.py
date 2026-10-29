@@ -26,10 +26,11 @@ from pathlib import Path
 from typing import Any
 
 from .registry import ArgSpec, Tool
+from .utils.clip import clip_middle
 
 SKILL_SCRIPTS_IMPL = "skill_script"
 MAX_SPEC_CHARS = 200_000
-MAX_OUTPUT_CHARS = 12_000
+MAX_OUTPUT_CHARS = 60_000
 DEFAULT_TIMEOUT_S = 90
 MAX_TIMEOUT_S = 120
 
@@ -126,7 +127,8 @@ def _parse_script_output(stdout: str, stderr: str, returncode: int) -> dict[str,
                 output = f"Script failed: {lines[-1]}"
         return {
             "success": returncode == 0,
-            "output": output[:MAX_OUTPUT_CHARS],
+            "output": clip_middle(
+                output, MAX_OUTPUT_CHARS, label="skill_script"),
         }
 
     success = parsed.get("ok", parsed.get("success", returncode == 0))
@@ -139,7 +141,8 @@ def _parse_script_output(stdout: str, stderr: str, returncode: int) -> dict[str,
         message = f"{message}\n{stderr.strip()}"
     result: dict[str, Any] = {
         "success": bool(success),
-        "output": message[:MAX_OUTPUT_CHARS],
+        "output": clip_middle(
+            message, MAX_OUTPUT_CHARS, label="skill_script"),
     }
     data = parsed.get("data")
     if isinstance(data, (dict, list)):

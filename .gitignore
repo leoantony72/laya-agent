@@ -41,6 +41,8 @@ Thumbs.db
 
 # Logs
 logs/
+logs/results/
+logs/scripts/
 *.log
 
 # Models (large files)

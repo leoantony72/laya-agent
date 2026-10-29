@@ -711,6 +711,25 @@ class TestBrowserTools(unittest.TestCase):
             "upload the file", [{"skill": "browser_read_full"}])
         self.assertIn(BROWSER_BREVITY, message)
 
+    def test_brain_history_keeps_browser_evidence_full_mode(self):
+        from winbrow.brain.agent_loop import BrainStepResult, _history_block
+
+        block = _history_block([BrainStepResult(
+            "browser_read_page", {}, True, "repo evidence " * 500)], full=True)
+        self.assertIn("repo evidence", block)
+        self.assertGreater(len(block), 5_000)
+
+    def test_brain_history_caps_long_browser_loops_full_mode(self):
+        from winbrow.brain.agent_loop import BrainStepResult, _history_block
+
+        steps = [BrainStepResult(
+            "browser_read_page", {}, True, f"page {i} " + "x" * 4000)
+            for i in range(10)]
+        block = _history_block(steps, full=True)
+        self.assertIn("page 0", block)
+        self.assertIn("page 9", block)
+        self.assertGreater(len(block), 35_000)
+
     def test_brain_history_caps_long_browser_loops(self):
         from winbrow.brain.agent_loop import BrainStepResult, _history_block
 

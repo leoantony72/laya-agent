@@ -50,6 +50,22 @@ def test_web_fetch_budget_is_newest_first():
     assert len(block) < 26_000
 
 
+def test_web_fetch_full_mode_keeps_all_steps():
+    history = [
+        _entry(
+            "web_fetch",
+            {"url": f"https://example.com/{i}"},
+            "y" * 12_000 + f"marker-{i}",
+        )
+        for i in range(3)
+    ]
+    block = format_history(
+        history, full=True, max_chars=100_000, run_id="br_full")
+    assert "marker-0" in block
+    assert "marker-2" in block
+    assert len(block) > 30_000
+
+
 def test_web_search_keeps_all_results_visible():
     output = "\n\n".join(
         f"{i}. {'T' * 60}\n   https://example.com/{i}\n   {'s' * 160}"

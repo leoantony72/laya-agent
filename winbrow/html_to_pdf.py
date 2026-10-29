@@ -17,14 +17,53 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 PAGE_SIZES: dict[str, Optional[Tuple[float, float]]] = {
-    "16:9": (13.333, 7.5),      # 1920x1080 slide
+    # Slide sizes match PowerPoint defaults (inches).
+    "16:9": (13.333, 7.5),      # 1920x1080 design canvas
     "16:10": (13.333, 8.333),
     "4:3": (10.0, 7.5),
+    # Document sizes.
     "letter": (8.5, 11.0),
+    "legal": (8.5, 14.0),
     "a4": (8.27, 11.69),
-    "auto": None,               # let the document's own CSS decide
+    "a5": (5.83, 8.27),
+    "auto": None,               # infer from the HTML
 }
-DEFAULT_PAGE = "16:9"
+SLIDE_PAGES = frozenset({"16:9", "16:10", "4:3"})
+DOCUMENT_PAGES = frozenset({"letter", "legal", "a4", "a5"})
+DEFAULT_SLIDE_PAGE = "16:9"
+DEFAULT_DOCUMENT_PAGE = "a4"
+DEFAULT_PAGE = "auto"
+
+# A deck has slide sections (or the .deck canvas). A resume/official document
+# should use a paper page, never a 16:9 slide.
+_DECK_HTML_RE = re.compile(
+    r'<(?:section|div)\b[^>]*class\s*=\s*["\'][^"\']*\b(?:slide|deck)\b',
+    re.IGNORECASE,
+)
+_RESUME_HTML_RE = re.compile(
+    r"\b(?:resume|curriculum\s+vitae|cover[\s_-]*letter|official|memo)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_document_kind(html: str) -> str:
+    """Return ``presentation``, ``resume`` or ``document`` for page policy."""
+    text = str(html or "")
+    if _DECK_HTML_RE.search(text):
+        return "presentation"
+    head = text[:6000]
+    if _RESUME_HTML_RE.search(head):
+        return "resume"
+    return "document"
+
+
+def resolve_page(page: str | None, html: str = "") -> str:
+    """Resolve ``auto``/None to a slide size for decks, paper otherwise."""
+    raw = (page or DEFAULT_PAGE).strip().lower()
+    if raw in PAGE_SIZES and raw != "auto":
+        return raw
+    kind = detect_document_kind(html)
+    return DEFAULT_SLIDE_PAGE if kind == "presentation" else DEFAULT_DOCUMENT_PAGE
 
 
 def browser_candidates() -> list[Path]:
@@ -68,14 +107,48 @@ def find_browser() -> Optional[Path]:
     return found[0] if found else None
 
 
-def _page_css(page: str) -> str:
+def _page_css(page: str, *, deck: bool = False) -> str:
     size = PAGE_SIZES.get((page or "").strip().lower(), PAGE_SIZES[DEFAULT_PAGE])
     if size is None:
         return ""
     width, height = size
-    return (
+    # Print backgrounds/colors exactly as authored. Without this Chrome drops
+    # dark slide backgrounds, leaving light text on white paper.
+    base = (
         f"@page {{ size: {width}in {height}in; margin: 0; }}\n"
-        f"@media print {{ html, body {{ width: {width}in; }} }}\n"
+        "@media print {\n"
+        "  * { -webkit-print-color-adjust: exact !important; "
+        "print-color-adjust: exact !important; }\n"
+        "  html, body { margin: 0 !important; padding: 0 !important; }\n"
+    )
+    if deck:
+        # One .slide == one PDF page, regardless of whether base.css loaded.
+        # Every declaration is !important because template rules like
+        # `.tpl-name .slide` have higher specificity.
+        return base + (
+            f"  html, body {{ width: {width}in !important; height: {height}in "
+            "!important; overflow: visible !important; }\n"
+            f"  .deck {{ width: {width}in !important; height: auto !important; "
+            "transform: none !important; display: block !important; "
+            "min-height: 0 !important; max-height: none !important; "
+            "overflow: visible !important; }}\n"
+            f"  .slide {{ position: relative !important; inset: auto !important; "
+            f"width: {width}in !important; height: {height}in !important; "
+            f"min-height: {height}in !important; max-height: {height}in "
+            "!important; opacity: 1 !important; visibility: visible !important; "
+            "transform: none !important; display: flex !important; "
+            "page-break-after: always; break-after: page; "
+            "page-break-inside: avoid; break-inside: avoid; "
+            "overflow: hidden !important; }\n"
+            "  .slide:last-child { page-break-after: auto; break-after: auto; }\n"
+            "  .notes, .notes-overlay, .overview, .deck-header, .deck-footer, "
+            ".progress-bar { display: none !important; }\n"
+            "}\n"
+        )
+    return base + (
+        "  html, body { width: auto !important; height: auto !important; "
+        "overflow: visible !important; }\n"
+        "}\n"
     )
 
 
@@ -95,7 +168,10 @@ def html_to_pdf(
     page: str = DEFAULT_PAGE,
     timeout: int = 120,
 ) -> dict:
-    """Render ``html_path`` to ``pdf_path``. Raises RuntimeError on failure."""
+    """Render ``html_path`` to ``pdf_path``. Raises RuntimeError on failure.
+
+    ``page="auto"`` uses 16:9 for slide decks and A4 for documents/resumes.
+    """
     source = Path(html_path).resolve()
     target = Path(pdf_path).resolve()
     if not source.is_file():
@@ -109,12 +185,16 @@ def html_to_pdf(
             "executable path."
         )
 
-    css = _page_css(page)
+    original = source.read_text(encoding="utf-8", errors="replace")
+    kind = detect_document_kind(original)
+    resolved_page = resolve_page(page, original)
+    deck_mode = kind == "presentation"
+    css = _page_css(resolved_page, deck=deck_mode)
+    width_in, height_in = PAGE_SIZES.get(resolved_page) or (0.0, 0.0)
     temporary = source
     profile_dir = Path(tempfile.gettempdir()) / f"winbrow-print-{uuid.uuid4().hex}"
     try:
         if css:
-            original = source.read_text(encoding="utf-8", errors="replace")
             patched = _inject_css(original, css)
             temporary = source.with_name(f".winbrow_print_{uuid.uuid4().hex}.html")
             temporary.write_text(patched, encoding="utf-8")
@@ -127,10 +207,10 @@ def html_to_pdf(
             "--allow-file-access-from-files",
             "--no-pdf-header-footer",
             "--run-all-compositor-stages-before-draw",
-            "--virtual-time-budget=6000",
+            "--virtual-time-budget=8000",
             f"--user-data-dir={profile_dir}",
             f"--print-to-pdf={target}",
-            source.as_uri() if temporary == source else temporary.as_uri(),
+            temporary.as_uri(),
         ]
         log_path = profile_dir / "chrome.log"
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -151,7 +231,10 @@ def html_to_pdf(
             "path": str(target),
             "browser": str(browser),
             "bytes": target.stat().st_size,
-            "page": page,
+            "page": resolved_page,
+            "document_kind": kind,
+            "width_in": width_in,
+            "height_in": height_in,
         }
     finally:
         try:

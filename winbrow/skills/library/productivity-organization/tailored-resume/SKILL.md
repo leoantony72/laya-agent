@@ -46,6 +46,12 @@ rewrite, or optimize the resume for that role.
 6. Add a short gap note: what to learn or how to address it in an interview.
 7. Save the tailored version as a new file; never overwrite the original.
 8. If asked, generate a DOCX/PDF with the `docx` or `pdf` skill and verify it.
+   - PDF: use the `pdf` skill with `document_kind="resume"`, `page_size="a4"`
+     (or `"letter"` for US paper), `page_numbers=false`, portrait. Do not use a
+     16:9 slide deck for a resume.
+   - If a TeX engine is installed and the user wants maximum typographic
+     control, use the `pdf` skill's `latex` operation; otherwise use the
+     measured `create` engine.
 
 ## Output Shape
 

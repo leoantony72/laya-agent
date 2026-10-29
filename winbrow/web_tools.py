@@ -53,10 +53,10 @@ def _trafilatura_module():
 from .registry import ArgSpec, Tool
 
 WEB_IMPL = "web"
-DEFAULT_SEARCH_COUNT = 5
+DEFAULT_SEARCH_COUNT = 8
 MAX_SEARCH_COUNT = 10
-DEFAULT_FETCH_CHARS = 12000
-MAX_FETCH_CHARS = 40000
+DEFAULT_FETCH_CHARS = 40000
+MAX_FETCH_CHARS = 100000
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -578,7 +578,19 @@ def web_fetch(url: str, max_chars: Any = DEFAULT_FETCH_CHARS,
     total = len(text)
     clipped = text[:limit]
     if total > limit:
-        clipped += f"\n\n[TRUNCATED: {total - limit} chars remain]"
+        # Keep head and tail, but keep the TRUNCATED token: the brain's
+        # one-shot escalation path (_is_fetch_escalation) looks for it.
+        from .utils.clip import save_full_text
+        path = save_full_text(text, label="web_fetch")
+        head_len = int(limit * 0.6)
+        tail_len = int(limit * 0.25)
+        omitted = total - head_len - tail_len
+        where = f"; full output at {path}" if path else ""
+        clipped = (
+            text[:head_len]
+            + f"\n\n[TRUNCATED: {omitted} chars remain{where}]\n\n"
+            + (text[-tail_len:] if tail_len else "")
+        )
     header_lines = [
         f"URL: {response.url}",
         f"STATUS: {response.status_code}",
@@ -691,7 +703,7 @@ def get_web_tools() -> list[Tool]:
                 ),
                 ArgSpec(
                     name="max_chars", kind="text",
-                    instructions="Maximum characters to return (1000-40000)",
+                    instructions="Maximum characters to return (1000-100000)",
                     default=str(DEFAULT_FETCH_CHARS),
                 ),
                 ArgSpec(

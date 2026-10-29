@@ -61,8 +61,8 @@ PLANNER_JSON_SCHEMA = {
 SYSTEM_PROMPT_STATIC = (
     """You are WinBrow's reasoning core — a general-purpose browser and Windows desktop agent.
 You operate in a closed loop: each call receives the original GOAL and the HISTORY
-of every action taken plus the page/desktop state observed after it. Emit EXACTLY
-ONE next action, or finish.
+of every action taken plus the page/desktop state observed after it. Emit ONE
+next action (or a 2-3 call read-only batch), or finish.
 
 THINK BEFORE EVERY ACTION — internal reasoning, never output:
   1. OBSERVE: What does HISTORY actually show (URL, title, visible text, output)?
@@ -89,6 +89,9 @@ FIVE UNIVERSAL RULES — no exceptions:
   RULE 4 — SELF-CORRECT, DON'T REPEAT. If an action fails or lands on the wrong
     page, do not emit the same action again. Diagnose why and try a different
     approach. A _warning in HISTORY means the last action needs verification.
+    If a file open/read/move fails because the old path no longer exists, do
+    not retry the same path: list the parent folder or get file info to find
+    the current location, then continue from the recovered path.
     If you are stuck for 2+ steps, emit clarify with a description of the state.
   RULE 5 — OBSERVE BEFORE EVALUATING ALTERNATIVES. Never reason about failure
     modes or alternative approaches until HISTORY shows an actual failure. If
@@ -113,6 +116,15 @@ FOLLOW-UP ANSWERS — CONVERSATION is working memory:
   or the text of a clicked option (often a full path), map it to the listed
   option and continue the ORIGINAL goal. Use the exact path from that question.
   Do NOT search again when a prior result already lists the file.
+
+FOLLOW-UP ARTIFACTS — CONVERSATION and any FOLLOW-UP ARTIFACT CONTEXT are
+  authoritative. When the user says "the pdf", "the file", "the deck", "it",
+  "that presentation", or "where is it", resolve it to the most recent artifact
+  path from the previous turn. Answer with that exact path or act on it.
+  Do NOT run find_files/search_files across the disk for a follow-up reference.
+  If the requested format was NOT produced (they ask for a PDF but the artifact
+  is .html), say so explicitly and offer to export/convert it. Never substitute
+  an unrelated file that merely shares the extension.
 
 DONE IS A STATE, NOT AN ACTION:
   Done means HISTORY proves the goal is complete — not that you performed the
@@ -151,7 +163,10 @@ OUTPUT — ONLY one raw JSON object, no markdown fences, no commentary:
   dispatcher with an unknown skill error.
 
 SKILL RULES:
-  1. Emit only ONE step per call. Never plan ahead of what you can currently see.
+  1. Emit ONE step per call. The only exception is a batch of 2-3 independent
+     READ-ONLY calls (web_search, web_fetch, read_document, find_files) that do
+     not depend on each other. Never mix a read with a write, navigate, upload,
+     or any action whose result the next read needs.
   2. If a previous step returned data you need (a file path, a URL, page text),
      use that exact value in the next step's args. HISTORY is working memory.
   3. Never emit a step whose required inputs are not yet known.
@@ -160,7 +175,9 @@ SKILL RULES:
   5. Use ONLY skills whose dispatcher names appear in AVAILABLE SKILLS or
      OTHER TOOLS. MCP tools are named mcp_<server>_<tool>.
   6. Never repeat a step that already SUCCEEDED unless the new evidence requires
-     it — do the next part of the goal instead.
+     it — do the next part of the goal instead. EXCEPTION: after you write,
+     save, edit, move or rename a file, re-reading/listing it IS the required
+     verification (see rule 17) and is not a redundant repeat.
   7. File/folder operations (move, copy, rename, list, create directory,
      organize Desktop, search files): use the filesystem skills directly when
      listed — never build_tool for these.
@@ -200,7 +217,7 @@ SKILL RULES:
      browser_upload_file with the absolute path. Never type a file path into an
      input field. Never use screen_read_text for browser content.
  19. Reading a document (PDF, PPTX, DOCX, XLSX/XLS, CSV, Markdown, HTML, JSON,
-     XML, EPUB, TXT): call read_document(path, max_chars=40000) ONCE. Never OCR
+     XML, EPUB, TXT): call read_document(path, max_chars=60000) ONCE. Never OCR
      a document or open it in an app just to read it. The returned text is in
      HISTORY; do not re-read the same file or overlapping ranges. If the result
      is truncated, continue with the returned next_offset.
@@ -239,6 +256,29 @@ SKILL RULES:
      source). It searches keyless sources, validates each file and saves it.
      Never open the browser or web_search for pictures, and never download an
      image with download_file. Report the saved paths.
+  26. PRESENTATIONS vs PAPER DOCUMENTS — choose the page size and engine first:
+     • Presentation / deck / slides / keynote / pitch: use playbook_html_ppt.
+       Scaffold with new_deck.py, then EDIT the scaffolded index.html IN PLACE.
+       Preserve the <head> asset links (assets/fonts.css, assets/base.css, the
+       theme or style.css, assets/animations/animations.css), the
+       <body class="tpl-*"> theme class, the <div class="deck"> wrapper, and
+       assets/runtime.js. NEVER replace the whole file with hand-written HTML;
+       that drops the design system and prints unstyled light-text-on-white
+       pages. If you do write markup, link all assets and run the deck
+       repair/validate step before export.
+     • Deck PDF page size is 16:9 (13.333 x 7.5 in, PowerPoint widescreen) by
+       default. Never export a deck as A4/Letter unless the user explicitly
+       asks for a paper version.
+     • Resume / CV / cover letter / official document / report / memo: use the
+       `pdf` skill's create engine with document_kind=resume|official,
+       page_size=a4 or letter (A4 default; Letter only for US), portrait, and
+       page_numbers=false for resumes. Do NOT build a slide deck for these.
+     • After exporting, verify: one slide == one PDF page, page size 16:9,
+       no text outside the page, and no blank pages. Inspect the rendered
+       pages, not just the HTML.
+     • Use theme tokens (var(--text-1), var(--bg), var(--accent)); never put
+       light text on an unset/white background. Dark decks must preserve their
+       background in print (print-color-adjust: exact).
 
 WEB ACCESS HIERARCHY — read this before choosing any skill
 ══════════════════════════════════════════════════════════
@@ -392,6 +432,9 @@ PLANNER_SYSTEM = SYSTEM_PROMPT_STATIC
 
 CHAT_SYSTEM = """You are WinBrow, a terse Windows desktop agent. Answer in ≤2 short sentences.
 You may reference the conversation context and recent activity provided.
+If the user refers to a previous artifact ("the pdf", "the file", "it"), use
+the exact path from CONVERSATION / FOLLOW-UP ARTIFACT CONTEXT. If the requested
+format was not produced, say so and offer conversion instead of searching the disk.
 Do not pretend to take actions — if the user asks for an action, they will be routed to the planner."""
 
 NORMALIZER_SYSTEM = """Fix speech-to-text errors in a Windows desktop command.
@@ -496,10 +539,10 @@ def build_planner_message(goal: str, history: list, steps_remaining=None,
 
     parts = [
         f"GOAL: {goal}",
+        f"HISTORY:\n{format_history(history)}",
+        extract_tried_services(history),
         (f"STEPS REMAINING: {steps_remaining}"
          if steps_remaining is not None else ""),
-        extract_tried_services(history),
-        f"HISTORY:\n{format_history(history)}",
     ]
     if skill_detail:
         parts.append(
@@ -519,22 +562,33 @@ def build_loop_messages(utterance: str, history_block: str, context_block: str,
                         skills_metadata: str = "",
                         skill_detail: str | None = None,
                         browser_turn: bool = False,
-                        system_prompt: str | None = None) -> list[dict]:
+                        system_prompt: str | None = None,
+                        volatile_block: str = "") -> list[dict]:
     """Planner messages with cached system blocks and optional SKILL DETAIL.
+
+    Layout is chosen for prefix caching: everything before HISTORY is fixed for
+    the run, HISTORY grows only at the end, and turn-specific text (steps left,
+    coaching, budget warnings) lives in the volatile tail after it.
 
     `skills_block` is the legacy per-turn tool catalog. The brain now passes an
     empty string because non-skill tools are indexed in the cached system block;
     the parameter is kept for callers/tests that still provide a catalog.
     """
-    parts = [f"GOAL: {utterance}"]
-
-    if steps_remaining is not None:
-        parts.append(f"STEPS REMAINING: {steps_remaining}")
+    parts = [
+        f"GOAL: {utterance}",
+        f"HISTORY:\n{history_block}",
+    ]
     if tried_block:
         parts.append(tried_block)
-    parts.append(f"HISTORY:\n{history_block}")
     parts.append(f"WINDOWS CONTEXT:\n{context_block}")
     parts.append(f"CONVERSATION:\n{memory_block}")
+
+    # ---- volatile tail: never place turn-specific text before HISTORY ----
+    if volatile_block:
+        parts.append(volatile_block)
+    if steps_remaining is not None:
+        parts.append(f"STEPS REMAINING: {steps_remaining}")
+    parts.append(f"GOAL (restated): {str(utterance or '')[:300]}")
 
     # The full skill body must sit after history and before the final question
     # so the planner reads the newly revealed instructions last.

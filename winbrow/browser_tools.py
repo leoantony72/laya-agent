@@ -31,16 +31,17 @@ log = logging.getLogger("winbrow.browser_tools")
 
 BROWSER_IMPL = "browser"
 
-_MAX_PAGE_CHARS = 5000
-_MAX_STATE_CHARS = 9000
-_MAX_LINKS = 40
+_MAX_PAGE_CHARS = 12000
+# Must stay above page text + tree + links, or the outer clip cuts the tree.
+_MAX_STATE_CHARS = 30000
+_MAX_LINKS = 60
 _MAX_WAIT_S = 10.0
 _BROWSER_OP_TIMEOUT_S = 20.0
 # The accessibility tree is capped by CHARACTERS, not by element count, so a
 # dense page cannot cut off the control the brain needs before it appears.
-_MAX_TREE_CHARS = 6000
-_MAX_READ_FULL_TEXT_CHARS = 3000
-_MAX_READ_FULL_TREE_CHARS = 3000
+_MAX_TREE_CHARS = 12000
+_MAX_READ_FULL_TEXT_CHARS = 12000
+_MAX_READ_FULL_TREE_CHARS = 12000
 
 _A11Y_JS = r"""
 (() => {
@@ -169,8 +170,8 @@ def get_browser_tools():
                 ),
                 ArgSpec(
                     name="max_chars", kind="text",
-                    instructions="Maximum page-text characters to return (1000-5000)",
-                    default="5000",
+                    instructions="Maximum page-text characters to return (1000-12000)",
+                    default="12000",
                 ),
             ],
             speak="result",
@@ -200,13 +201,13 @@ def get_browser_tools():
                 ),
                 ArgSpec(
                     name="max_text_chars", kind="text",
-                    instructions="Maximum page-text characters (1000-5000)",
-                    default="3000",
+                    instructions="Maximum page-text characters (1000-12000)",
+                    default="12000",
                 ),
                 ArgSpec(
                     name="max_tree_chars", kind="text",
-                    instructions="Maximum accessibility-tree characters (1000-6000)",
-                    default="3000",
+                    instructions="Maximum accessibility-tree characters (1000-12000)",
+                    default="12000",
                 ),
             ],
             speak="result",
@@ -238,7 +239,7 @@ def get_browser_tools():
                 ArgSpec(
                     name="max_chars", kind="text",
                     instructions="Maximum tree characters to return (1000-12000)",
-                    default="6000",
+                    default="12000",
                 ),
             ],
             speak="result",
@@ -498,6 +499,12 @@ async def _state_output(browser: "BrowserController", url: str = "",
         "links": state.get("links") or [],
         "method": method,
     }
+    raw_text = str(state.get("text") or "")
+    if len(raw_text) > max_chars:
+        from .utils.clip import save_full_text
+        path = save_full_text(raw_text, label="browser_read_page")
+        if path:
+            result["output"] += f"\n\n[full page text at {path}]"
     if state.get("_blank"):
         result["_blank"] = True
         result["_warning"] = (
@@ -626,6 +633,13 @@ async def _read_full(browser: "BrowserController", args: dict) -> dict[str, Any]
         tree_text or "(no interactive elements found)",
     ])
 
+    if len(raw_text) > max_text:
+        from .utils.clip import save_full_text
+        full_path = save_full_text(raw_text, label="browser_read_full")
+        if full_path:
+            # Keep the pointer above the tree so the outer state clip cannot
+            # cut it off.
+            lines.insert(5, f"[full page text at {full_path}]")
     result: dict[str, Any] = {
         "success": True,
         "output": _clip("\n".join(lines), _MAX_STATE_CHARS),
@@ -695,7 +709,7 @@ async def _accessibility_tree(browser: "BrowserController", args: dict) -> dict[
     output cap is ``max_chars`` (characters, not elements).
     """
     target = str(args.get("target") or args.get("query") or "").strip()
-    max_chars = _int_arg(args, "max_chars", _MAX_TREE_CHARS, 1000, 12000)
+    max_chars = _int_arg(args, "max_chars", _MAX_TREE_CHARS, 1000, _MAX_TREE_CHARS)
     result = await browser.execute_js(_A11Y_JS)
     if not result.get("success"):
         return {

@@ -64,28 +64,58 @@ NEBIUS_DEFAULT_MODEL = (
 OPENROUTER_ONLY_PROVIDER = os.environ.get("WINBROW_OPENROUTER_PROVIDER", "relace").strip()
 OPENROUTER_ALLOW_FALLBACKS = os.environ.get("WINBROW_OPENROUTER_ALLOW_FALLBACKS", "0") == "1"
 
+# Module-level values are kept for callers/tests that import them directly.
+# The hot path reads the environment at call time instead: server.py imports
+# this module BEFORE _load_env_file(), so a module constant would silently
+# ignore WINBROW_* values from .env.
 REQUEST_TIMEOUT_S = float(os.environ.get("WINBROW_BRAIN_TIMEOUT", "45"))
+REASONING_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_MAX_TOKENS", "2000"))
+REASONING_RETRY_MAX_TOKENS = int(
+    os.environ.get("WINBROW_REASONING_RETRY_TOKENS", "400"))
+REASONING_OFF_MAX_TOKENS = int(
+    os.environ.get("WINBROW_REASONING_OFF_MAX_TOKENS", "1000"))
+PLANNER_CALL_CONFIG = {
+    "max_tokens": int(os.environ.get("WINBROW_PLANNER_MAX_TOKENS", "16000")),
+    "temperature": float(os.environ.get("WINBROW_PLANNER_TEMPERATURE", "1")),
+}
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def request_timeout_s() -> float:
+    """Planner HTTP timeout, read at call time so .env changes apply."""
+    return _env_float("WINBROW_BRAIN_TIMEOUT", 45.0)
+
+
+def reasoning_max_tokens() -> int:
+    return _env_int("WINBROW_REASONING_MAX_TOKENS", 2000)
+
+
+def planner_max_tokens() -> int:
+    return _env_int("WINBROW_PLANNER_MAX_TOKENS", 16000)
+
+
+def planner_temperature() -> float:
+    return _env_float("WINBROW_PLANNER_TEMPERATURE", 1.0)
+
 
 # Reasoning models (DeepSeek V4.1 Flash and R1-style models) spend completion
 # tokens on hidden reasoning BEFORE emitting content, and those tokens count
 # against max_tokens. Unbounded, a long think can consume the whole budget:
 # content comes back empty with finish_reason="length" and the planner sees an
 # unusable reply. Cap reasoning on structured calls so JSON always has room.
-REASONING_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_MAX_TOKENS", "2000"))
-
-# Retry ladder used when content is empty because reasoning ate the budget:
-# first tighten the reasoning cap (same total budget), then disable reasoning
-# entirely so the model has to emit its JSON answer.
-REASONING_RETRY_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_RETRY_TOKENS", "400"))
-REASONING_OFF_MAX_TOKENS = int(os.environ.get("WINBROW_REASONING_OFF_MAX_TOKENS", "1000"))
-
-# Planner call budget. Some reasoning models ignore reasoning.max_tokens and
-# spend most of max_tokens thinking, so the total must be large enough that
-# ~14k reasoning tokens still leave room for the JSON plan on the wire.
-PLANNER_CALL_CONFIG = {
-    "max_tokens": int(os.environ.get("WINBROW_PLANNER_MAX_TOKENS", "16000")),
-    "temperature": float(os.environ.get("WINBROW_PLANNER_TEMPERATURE", "1")),
-}
 
 
 def _history_skill(entry: Any) -> str:
@@ -113,8 +143,8 @@ def get_reasoning_config(history: List[Any]) -> dict:
     if browser_heavy:
         return {"max_tokens": 8000, "reasoning_max": 600}
     return {
-        "max_tokens": PLANNER_CALL_CONFIG["max_tokens"],
-        "reasoning_max": REASONING_MAX_TOKENS,
+        "max_tokens": planner_max_tokens(),
+        "reasoning_max": reasoning_max_tokens(),
     }
 
 # Built-in local brain: llama.cpp server started by server.py (winbrow/llm.py)
@@ -214,11 +244,8 @@ class Provider:
 def _provider_timeout(provider: Provider) -> float:
     """Local CPU models generate slower; give them a higher default ceiling."""
     if provider.name == "local":
-        try:
-            return float(os.environ.get("WINBROW_LOCAL_LLM_TIMEOUT", str(DEFAULT_LOCAL_TIMEOUT_S)))
-        except ValueError:
-            return DEFAULT_LOCAL_TIMEOUT_S
-    return REQUEST_TIMEOUT_S
+        return _env_float("WINBROW_LOCAL_LLM_TIMEOUT", DEFAULT_LOCAL_TIMEOUT_S)
+    return request_timeout_s()
 
 
 TRANSIENT_HTTP_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
@@ -648,6 +675,20 @@ class ModelGateway:
                 "No LLM provider configured (set NEBIUS_API_KEY or OPENROUTER_API_KEY)"
             )
         last_err: Optional[Exception] = None
+        # A dead provider with a 120s timeout, two attempts, and four providers
+        # could otherwise stall one turn for many minutes. The deadline bounds
+        # the whole chain; set 0 to disable.
+        deadline_s = _env_float("WINBROW_BRAIN_DEADLINE_S", 300.0)
+        deadline = time.monotonic() + deadline_s if deadline_s > 0 else 0.0
+
+        def _remaining_timeout(requested: float) -> Optional[float]:
+            if not deadline:
+                return requested
+            remaining = deadline - time.monotonic()
+            if remaining <= 1.0:
+                return None
+            return min(requested, remaining)
+
         for provider in self.providers:
             t0 = time.perf_counter()
             # One retry for transient failures (HTTP 429 from free tiers,
@@ -655,9 +696,15 @@ class ModelGateway:
             # quick succession, which makes rate limiting common.
             for attempt in range(2):
                 try:
+                    call_timeout = _remaining_timeout(
+                        timeout or _provider_timeout(provider))
+                    if call_timeout is None:
+                        last_err = last_err or TimeoutError(
+                            "brain deadline exceeded")
+                        break
                     resp = await self._chat_with_provider(
                         provider, messages, tools, json_schema, temperature, max_tokens,
-                        timeout or _provider_timeout(provider), reasoning,
+                        call_timeout, reasoning,
                     )
                     # Reasoning can exhaust max_tokens before any content is
                     # emitted. Retry with a hard reasoning cap, then with
@@ -671,9 +718,13 @@ class ModelGateway:
                             "retrying with capped reasoning."
                         )
                         try:
+                            retry_timeout = _remaining_timeout(
+                                timeout or _provider_timeout(provider))
+                            if retry_timeout is None:
+                                raise TimeoutError("brain deadline exceeded")
                             answered = await self._retry_with_capped_reasoning(
                                 provider, messages, tools, json_schema, temperature,
-                                max_tokens, timeout or _provider_timeout(provider),
+                                max_tokens, retry_timeout,
                             )
                         except GatewayUnavailable:
                             raise
@@ -746,8 +797,14 @@ class ModelGateway:
         disables reasoning entirely and only asks for enough tokens to emit
         the JSON answer. Returns the last response if none produce content.
         """
-        capped = min(REASONING_RETRY_MAX_TOKENS, max(64, max_tokens // 2))
-        answer_budget = max(256, min(max_tokens, REASONING_OFF_MAX_TOKENS))
+        capped = min(
+            _env_int("WINBROW_REASONING_RETRY_TOKENS", 400),
+            max(64, max_tokens // 2),
+        )
+        answer_budget = max(
+            256,
+            min(max_tokens, _env_int("WINBROW_REASONING_OFF_MAX_TOKENS", 1000)),
+        )
         ladder = (
             (max_tokens, {"max_tokens": capped}),
             (answer_budget, {"enabled": False}),
@@ -808,10 +865,10 @@ class ModelGateway:
                 payload["reasoning"] = reasoning
             elif json_schema:
                 # Leave the rest of the budget for the actual JSON object.
-                if REASONING_MAX_TOKENS > 0:
+                configured = reasoning_max_tokens()
+                if configured > 0:
                     payload["reasoning"] = {
-                        "max_tokens": min(
-                            REASONING_MAX_TOKENS, max(64, max_tokens // 2)),
+                        "max_tokens": min(configured, max(64, max_tokens // 2)),
                     }
             else:
                 # Short replies (chat, STT normalization, parameter fill) do
@@ -827,7 +884,16 @@ class ModelGateway:
                 if reasoning.get("enabled") is False:
                     effort = "none"
                 elif reasoning.get("max_tokens"):
-                    effort = "low"
+                    # Nebius exposes effort levels, not a token cap. The env
+                    # override lets Phase G compare low/medium/high without
+                    # changing the default ("low") for existing installs.
+                    override = (
+                        os.environ.get("WINBROW_NEBIUS_REASONING_EFFORT", "")
+                        .strip().lower()
+                    )
+                    effort = override if override in {
+                        "low", "medium", "high", "none",
+                    } else "low"
             payload["reasoning_effort"] = effort
         if (
             provider.name == "openrouter"

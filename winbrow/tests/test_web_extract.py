@@ -82,8 +82,10 @@ It also repeats the footer navigation and the subscription call to action.
 """ + ("Additional filler paragraph about legal notices. " * 20)
 
 
-def _serve(monkeypatch, html, url="https://example.com/a"):
-    monkeypatch.setattr(web_tools, "_cffi", _FakeCffi(_Response(html, url=url)))
+def _serve(monkeypatch, html, url="https://example.com/a",
+           ctype="text/html; charset=utf-8"):
+    monkeypatch.setattr(
+        web_tools, "_cffi", _FakeCffi(_Response(html, url=url, ctype=ctype)))
 
 
 def test_extraction_drops_navigation_and_footer():
@@ -159,6 +161,20 @@ def test_web_fetch_without_focus_returns_full_extract(monkeypatch):
     assert result["selected_sections"] == 0
     assert result["chars"] == len(DOC_MD)
     assert "founded in 2023" in result["output"]
+
+
+def test_web_fetch_keeps_head_tail_and_saves_clipped_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("WINBROW_RESULTS_DIR", str(tmp_path))
+    body = "HEAD-MARKER " + ("x" * 200_000) + " TAIL-MARKER"
+    _serve(monkeypatch, body, ctype="text/plain")
+    result = web_tools.web_fetch("https://example.com/a", 1000)
+    assert result["success"] is True
+    assert result["truncated"] is True
+    assert "HEAD-MARKER" in result["output"]
+    assert "TAIL-MARKER" in result["output"]
+    assert "TRUNCATED" in result["output"]
+    files = list(tmp_path.glob("*.txt"))
+    assert files and files[0].read_text(encoding="utf-8") == body
 
 
 def test_web_fetch_falls_back_when_extraction_empty(monkeypatch):

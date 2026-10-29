@@ -292,6 +292,20 @@ class TestRunSkillGate(unittest.TestCase):
         self.assertNotEqual(res.get("type"), "denied")
         _ = success
 
+    def test_long_t3_command_cannot_be_smuggled_through_a_script(self):
+        # >12k forces the temp-script path; the gate must still see the full
+        # original text and return T3 before anything is written or executed.
+        command = "Stop-Service Spooler; " + ("Write-Output x; " * 1500)
+        self.assertGreater(len(command), 12_000)
+        from winbrow import agent as agent_mod
+        with mock.patch.object(agent_mod, "execute_shell_tool",
+                               side_effect=AssertionError("must not execute")):
+            res = _run(self.agent.run_skill(
+                "run_command", {"command": command},
+                utterance="stop the spooler"))
+        self.assertEqual(res.get("type"), "permission_required")
+        self.assertEqual(res["pending"]["tier"], T3)
+
     def test_t3_pending(self):
         res = _run(self.agent.run_skill(
             "app_install", {"package": "7zip.7zip"}, utterance="install 7zip"))

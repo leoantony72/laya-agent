@@ -52,7 +52,7 @@ CACHE_PATH = TOOLS_DIR / "mcp_cache.json"
 PROTOCOL_VERSION = "2025-06-18"          # announced; the server's own choice wins
 DEFAULT_TIMEOUT_S = 30.0
 CONNECT_TIMEOUT_S = 25.0
-MAX_OUTPUT_CHARS = 32_000
+MAX_OUTPUT_CHARS = 100_000
 MAX_ARGS_JSON = 200_000                  # serialized args cap
 MAX_ARG_CHARS = 100_000                  # single arg cap (file contents)
 MAX_TOOLS_PER_SERVER = 64                # catalog cap
@@ -905,9 +905,18 @@ def _coerce_schema_args(args: dict, input_schema: Any) -> dict:
 def _extract_text(res: Any) -> str:
     """tools/call result → joined content[].text (resource blobs JSON'd).
     Servers that return only structuredContent (no text content) fall back
-    to a JSON dump of that structure."""
+    to a JSON dump of that structure.
+
+    The full text is collected up to 2× the output cap, then clipped head-only
+    (head/tail would leave invalid JSON for structured payloads) with the full
+    copy saved under logs/results.
+    """
+    from .utils.clip import clip_head
+
+    # Collect beyond the visible cap so the saved copy is actually full.
+    collect_limit = MAX_OUTPUT_CHARS * 2
     if not isinstance(res, dict):
-        return str(res)[:MAX_OUTPUT_CHARS]
+        return clip_head(str(res), MAX_OUTPUT_CHARS, label="mcp")
     content = res.get("content") or []
     texts: List[str] = []
     total = 0
@@ -920,13 +929,14 @@ def _extract_text(res: Any) -> str:
             s = json.dumps(c.get("data", c), ensure_ascii=False)
         else:
             s = json.dumps(c, ensure_ascii=False)
-        if total + len(s) > MAX_OUTPUT_CHARS:
-            s = s[: max(0, MAX_OUTPUT_CHARS - total)]
+        remaining = collect_limit - total
+        if remaining <= 0:
+            break
+        s = s[:remaining]
         texts.append(s)
         total += len(s)
-        if total >= MAX_OUTPUT_CHARS:
+        if total >= collect_limit:
             break
     if not texts and res.get("structuredContent") is not None:
-        texts.append(json.dumps(res["structuredContent"],
-                                ensure_ascii=False)[:MAX_OUTPUT_CHARS])
-    return "\n".join(texts)[:MAX_OUTPUT_CHARS]
+        texts.append(json.dumps(res["structuredContent"], ensure_ascii=False))
+    return clip_head("\n".join(texts), MAX_OUTPUT_CHARS, label="mcp")

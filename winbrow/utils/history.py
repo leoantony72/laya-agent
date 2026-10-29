@@ -9,12 +9,21 @@ recent stuck warnings so the loop can force a clarify instead of spinning.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List
+import os
+import re
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
+
+from .clip import save_full_text
 
 FULL_WINDOW = 5
 OUTCOME_LIMIT = 120
-RECENT_OUTPUT_LIMIT = 400
+# Observation output (screen OCR, command results) must survive the legacy
+# window too: 400 chars cut off everything after the first lines of a window,
+# so the planner could not see its own document content.
+RECENT_OUTPUT_LIMIT = 4000
+OBSERVATION_SKILLS = frozenset({"screen_read_text"})
+OBSERVATION_STEP_LIMIT = 12_000
 # Document text must survive the history window long enough for the planner to
 # summarize it. Normal tool output stays terse; document reads get a larger,
 # newest-first budget so a full read or a few chunks remain visible.
@@ -83,13 +92,76 @@ def _args_of(entry: Any) -> dict:
 
 _ARG_VALUE_LIMIT = 160
 _ARG_TOTAL_LIMIT = 600
+# Full-history mode must show what was actually typed/written. The old 2k/8k
+# caps silently replaced large text args with "<N chars>", so the planner could
+# not see the document it had just produced (e.g. type_text content) and
+# hallucinated about the file instead of answering from HISTORY.
+_FULL_ARG_VALUE_LIMIT = 8000
+_FULL_ARG_TOTAL_LIMIT = 32000
 _LARGE_TEXT_KEYS = frozenset({
     "content", "text", "body", "data", "oldtext", "newtext",
     "old_text", "new_text",
 })
 
+# Full-history defaults. The brain loop asks for full rendering by default;
+# WINBROW_HISTORY_FULL=0 restores the legacy compressed window for tests/UI.
+HISTORY_KEEP_RECENT = 5
+HISTORY_BUDGET_DEFAULT = 240_000
+HISTORY_BUDGET_CEILING = 400_000
 
-def _format_args(args: Dict[str, Any]) -> str:
+
+def history_budget_chars() -> int:
+    """Hard history budget, read at call time.
+
+    Formula (user decision): 25% of the context window, in chars, capped at
+    400k. Context window comes from WINBROW_CONTEXT_TOKENS; until that is
+    known for the deployed model, 240k chars (~60k tokens) is the interim.
+    """
+    raw = os.environ.get("WINBROW_HISTORY_MAX_CHARS", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    try:
+        context_tokens = int(os.environ.get("WINBROW_CONTEXT_TOKENS", "0"))
+    except ValueError:
+        context_tokens = 0
+    if context_tokens > 0:
+        return min(HISTORY_BUDGET_CEILING, int(0.25 * context_tokens * 4))
+    return HISTORY_BUDGET_DEFAULT
+
+
+def history_full_enabled() -> bool:
+    """Full-fidelity history is the DEFAULT.
+
+    Compressed history (first line only, 120/400-char caps) discards the
+    evidence the planner needs to verify its own work and answer follow-ups
+    about it. Opt back into it with WINBROW_HISTORY_FULL=0.
+    """
+    return os.environ.get("WINBROW_HISTORY_FULL", "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
+def _head_tail(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    head = int(limit * 0.6)
+    tail = max(0, limit - head)
+    return (
+        value[:head]
+        + f"...<{len(value) - head - tail} chars omitted>..."
+        + (value[-tail:] if tail else "")
+    )
+
+
+def _format_args(
+    args: Dict[str, Any],
+    value_limit: int = _ARG_VALUE_LIMIT,
+    total_limit: int = _ARG_TOTAL_LIMIT,
+    head_tail: bool = False,
+) -> str:
     """Keep history args readable without echoing whole file payloads."""
     if not args:
         return "{}"
@@ -97,13 +169,21 @@ def _format_args(args: Dict[str, Any]) -> str:
     for key, value in args.items():
         name = str(key)
         if isinstance(value, str):
-            if len(value) <= _ARG_VALUE_LIMIT:
+            if len(value) <= value_limit:
                 parts.append(f"{name}={value!r}")
+            elif head_tail:
+                # Keep the real text (head + tail) instead of replacing it
+                # with "<N chars>". Otherwise full history still hides the
+                # document/script the planner just wrote.
+                parts.append(
+                    f"{name}={_head_tail(value, value_limit)!r}"
+                    f"<full length {len(value)} chars>"
+                )
             elif name.lower() in _LARGE_TEXT_KEYS:
                 parts.append(f"{name}=<{len(value)} chars>")
             else:
                 parts.append(
-                    f"{name}={value[:_ARG_VALUE_LIMIT]!r}..."
+                    f"{name}={value[:value_limit]!r}..."
                     f"<{len(value)} chars>"
                 )
         elif isinstance(value, (dict, list)):
@@ -111,15 +191,15 @@ def _format_args(args: Dict[str, Any]) -> str:
                 blob = json.dumps(value, ensure_ascii=False, default=str)
             except (TypeError, ValueError):
                 blob = str(value)
-            if len(blob) <= _ARG_VALUE_LIMIT:
+            if len(blob) <= value_limit:
                 parts.append(f"{name}={blob}")
             else:
                 parts.append(f"{name}=<{len(blob)} chars JSON>")
         else:
             parts.append(f"{name}={value!r}")
     text = ", ".join(parts)
-    if len(text) > _ARG_TOTAL_LIMIT:
-        text = text[:_ARG_TOTAL_LIMIT] + f"...<{len(text)} chars>"
+    if len(text) > total_limit:
+        text = text[:total_limit] + f"...<{len(text)} chars>"
     return "{" + text + "}"
 
 
@@ -267,10 +347,184 @@ def count_recent_stuck(history: List[Any], window: int = 6) -> int:
     return count
 
 
-def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
-    """Render history with old steps compressed and the last few in detail."""
+def _render_full_entry(
+    entry: Any, step_no: int, output_limit: Optional[int] = None,
+) -> str:
+    skill = _skill_of(entry) or "?"
+    args = _format_args(
+        _args_of(entry), _FULL_ARG_VALUE_LIMIT, _FULL_ARG_TOTAL_LIMIT,
+        head_tail=True,
+    )
+    ok = "✓" if _success_of(entry) else "✗"
+    output = _output_of(entry)
+    if output_limit is not None and len(output) > output_limit:
+        output = (
+            _head_tail(output, output_limit)
+            + f"\n     [budget: output clipped to {output_limit} chars]"
+        )
+    warning = _warning_of(entry)
+    warning_text = f"\n     ⚠ _warning: {warning}" if warning else ""
+    return (
+        f"  Step {step_no}: {skill}({args}) → success={ok}\n"
+        f"     output={output}{warning_text}"
+    )
+
+
+def _safe_filename_part(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "skill"))[:40]
+
+
+def _history_stub(entry: Any, step_no: int, run_id: str = "") -> str:
+    """Deterministic stub. Same step always renders the same text."""
+    output = _output_of(entry)
+    skill = _skill_of(entry) or "result"
+    if not output:
+        return (
+            f"  Step {step_no}: {skill} → [result of step {step_no}, "
+            "removed; no output]"
+        )
+    filename = (
+        f"{_safe_filename_part(run_id or 'run')}_step_{step_no}_"
+        f"{_safe_filename_part(skill)}.txt"
+    )
+    from .clip import results_dir
+    path = results_dir() / filename
+    if not path.exists():
+        save_full_text(output, label=skill, filename=filename)
+    if not path.exists():
+        return (
+            f"  Step {step_no}: {skill} → [result of step {step_no}, "
+            f"{len(output)} chars, removed]"
+        )
+    return (
+        f"  Step {step_no}: {skill} → [result of step {step_no}, "
+        f"{len(output)} chars, removed; full copy at {path}]"
+    )
+
+
+def _record_metrics(
+    metrics: Optional[dict],
+    rendered: List[str],
+    max_chars: int,
+    stubbed: int,
+    recent_clipped: int,
+) -> None:
+    if metrics is None:
+        return
+    size = len("\n".join(rendered))
+    metrics.update({
+        "chars": size,
+        "budget": max_chars,
+        "stubbed": stubbed,
+        "recent_clipped": recent_clipped,
+        "overflow": bool(max_chars > 0 and size > max_chars),
+    })
+
+
+def _format_full_history(
+    history: List[Any],
+    max_chars: int,
+    keep_recent: int,
+    run_id: str,
+    metrics: Optional[dict] = None,
+) -> str:
+    keep_recent = max(1, int(keep_recent))
+    rendered = [
+        _render_full_entry(entry, index + 1)
+        for index, entry in enumerate(history)
+    ]
+    if max_chars <= 0:
+        _record_metrics(metrics, rendered, 0, 0, 0)
+        return "\n".join(rendered)
+
+    total = sum(len(line) + 1 for line in rendered)
+    if total <= max_chars:
+        _record_metrics(metrics, rendered, max_chars, 0, 0)
+        return "\n".join(rendered)
+
+    # Evict with headroom on real budgets so one addition does not force a
+    # cache-breaking rewrite on the very next turn.
+    target = int(max_chars * 0.8) if max_chars >= 10_000 else max_chars
+
+    # Old browser snapshots go first: they are stale and re-readable.
+    evictable = list(range(max(0, len(history) - keep_recent)))
+    if os.environ.get("WINBROW_HISTORY_BROWSER_FIRST", "1").strip().lower() not in {
+        "0", "false", "off", "no",
+    }:
+        evictable.sort(key=lambda i: (0 if _skill_of(history[i]) in BROWSER_SKILLS else 1, i))
+
+    stubbed = 0
+    for index in evictable:
+        if total <= target:
+            break
+        stub = _history_stub(history[index], index + 1, run_id=run_id)
+        total -= len(rendered[index]) + 1
+        total += len(stub) + 1
+        rendered[index] = stub
+        stubbed += 1
+
+    # If the newest block alone is over budget, clip its oldest results (then
+    # any remaining result) rather than sending an over-budget prompt. The
+    # allowance ladder keeps the clipping deterministic for a given budget.
+    recent_clipped = 0
+    if total > max_chars:
+        recent_start = max(0, len(history) - keep_recent)
+        allowances = [
+            max(500, max_chars // keep_recent),
+            2000, 500, 200,
+        ]
+        for allowance in allowances:
+            if total <= max_chars:
+                break
+            for index in range(recent_start, len(history)):
+                if total <= max_chars:
+                    break
+                current = rendered[index]
+                new = _render_full_entry(
+                    history[index], index + 1, output_limit=allowance)
+                if len(new) >= len(current):
+                    continue
+                total += len(new) - len(current)
+                rendered[index] = new
+                recent_clipped += 1
+
+    _record_metrics(metrics, rendered, max_chars, stubbed, recent_clipped)
+    return "\n".join(rendered)
+
+
+def format_history(
+    history: List[Any],
+    full_window: int = FULL_WINDOW,
+    *,
+    full: bool = False,
+    max_chars: Optional[int] = None,
+    keep_recent: int = HISTORY_KEEP_RECENT,
+    run_id: str = "",
+    metrics: Optional[dict] = None,
+) -> str:
+    """Render history for the planner.
+
+    ``full=False`` keeps the legacy compressed window. ``full=True`` renders
+    every step verbatim (subject to the hard char budget), stubbing the oldest
+    non-recent results first and saving their full text under logs/results.
+
+    ``metrics`` is filled with chars/budget/stubbed/recent_clipped/overflow
+    when supplied; the brain loop forwards it to the trace.
+    """
     if not history:
+        if metrics is not None:
+            metrics.update({"chars": 0, "budget": 0, "stubbed": 0,
+                            "recent_clipped": 0, "overflow": False})
         return "  (none — this is the first step)"
+
+    if full:
+        return _format_full_history(
+            history,
+            history_budget_chars() if max_chars is None else int(max_chars),
+            keep_recent,
+            run_id,
+            metrics=metrics,
+        )
 
     full_window = max(1, full_window)
     older_count = max(0, len(history) - full_window)
@@ -318,7 +572,11 @@ def format_history(history: List[Any], full_window: int = FULL_WINDOW) -> str:
             f"{warning_text}"
         )
 
-    return "\n".join(lines)
+    block = "\n".join(lines)
+    if metrics is not None:
+        metrics.update({"chars": len(block), "budget": 0, "stubbed": 0,
+                        "recent_clipped": 0, "overflow": False})
+    return block
 
 
 def _recent_output_limits(recent: List[Any]) -> List[int]:
@@ -326,6 +584,8 @@ def _recent_output_limits(recent: List[Any]) -> List[int]:
     def base_limit(skill: str) -> int:
         if skill in FILE_LIST_SKILLS:
             return FILE_LIST_STEP_LIMIT
+        if skill in OBSERVATION_SKILLS:
+            return OBSERVATION_STEP_LIMIT
         if skill in WEB_SEARCH_SKILLS:
             return WEB_SEARCH_STEP_LIMIT
         if skill in WEB_FETCH_SKILLS:
