@@ -142,6 +142,31 @@ class TaskStore:
                  time.time(), task_id),
             )
 
+    def mark_running_interrupted(self, reason: str = "Interrupted when the server restarted.") -> int:
+        """Fail tasks left 'running' by a crash or hard restart.
+
+        Nothing can still be executing when the server boots, so these rows are
+        zombies; leaving them 'running' makes the UI spin forever on a chat that
+        will never finish.
+        """
+        now = time.time()
+        try:
+            with self._lock, self._connect() as conn:
+                cur = conn.execute(
+                    "UPDATE tasks SET status='failed', error=?, updated_at=?"
+                    " WHERE status='running'",
+                    (reason, now),
+                )
+                conn.execute(
+                    "UPDATE steps SET status='failed', ended_at=?"
+                    " WHERE status='running'",
+                    (now,),
+                )
+                return int(cur.rowcount or 0)
+        except sqlite3.Error as exc:
+            log.debug(f"task store reconcile failed ({exc}).")
+            return 0
+
     def get_task(self, task_id: str, events: int = 5000) -> Optional[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
             row = conn.execute(

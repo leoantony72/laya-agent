@@ -27,6 +27,9 @@ let dashboard = null;
 let tray = null;
 let sidecar = null;
 let sidecarState = "connecting";
+// A single slow probe must not flip the badge: the machine can be saturated by
+// a task (browser automation, model streams) while the sidecar is healthy.
+let healthFailures = 0;
 let islandInteractive = false;
 let islandHitTimer = null;
 
@@ -166,26 +169,38 @@ function toggleDashboard() {
   }
 }
 
+// Sending to a window whose render frame is mid-navigation (Vite HMR reload,
+// sidecar restart) throws "Render frame was disposed". The frame comes back on
+// its own and the renderer re-syncs over REST/WebSocket, so a dropped message
+// here is harmless.
+function sendTo(win, channel, payload) {
+  if (!win || win.isDestroyed()) return;
+  const contents = win.webContents;
+  if (!contents || contents.isDestroyed()) return;
+  try {
+    contents.send(channel, payload);
+  } catch {
+    // Frame disposed; ignore.
+  }
+}
+
 function showServerActivity() {
   showDashboard();
-  const send = () => {
-    if (dashboard && !dashboard.isDestroyed()) {
-      dashboard.webContents.send("main:show-server", {});
-    }
-  };
-  if (dashboard && dashboard.webContents.isLoading()) {
-    dashboard.webContents.once("did-finish-load", send);
+  const win = dashboard;
+  if (!win || win.isDestroyed()) return;
+  const contents = win.webContents;
+  if (!contents || contents.isDestroyed()) return;
+  const send = () => sendTo(win, "main:show-server", {});
+  if (contents.isLoading()) {
+    contents.once("did-finish-load", send);
     return;
   }
   send();
 }
 
 function broadcast(channel, payload) {
-  for (const win of [island, dashboard]) {
-    if (win && !win.isDestroyed()) {
-      win.webContents.send(channel, payload);
-    }
-  }
+  sendTo(island, channel, payload);
+  sendTo(dashboard, channel, payload);
 }
 
 // ---------------------------------------------------------------- connection log
@@ -287,14 +302,22 @@ function watchSidecarStream(stream, isErr) {
 
 // ---------------------------------------------------------------- sidecar
 function health(onResult) {
-  const req = http.get(`${SERVER_URL}/api/system`, { timeout: 1200 }, (res) => {
+  let settled = false;
+  const done = (ok) => {
+    if (settled) return;
+    settled = true;
+    onResult(ok);
+  };
+  // /api/health is intentionally trivial (no imports, no executor, no store),
+  // so a timeout here means the event loop itself is stuck.
+  const req = http.get(`${SERVER_URL}/api/health`, { timeout: 3000 }, (res) => {
     res.resume();
-    onResult(res.statusCode === 200);
+    done(res.statusCode === 200);
   });
-  req.on("error", () => onResult(false));
+  req.on("error", () => done(false));
   req.on("timeout", () => {
     req.destroy();
-    onResult(false);
+    done(false);
   });
 }
 
@@ -633,7 +656,16 @@ if (!gotLock) {
     screen.on("display-removed", () => island && placeIsland());
 
     setInterval(() => {
-      health((ok) => setSidecarState(ok ? "online" : "offline"));
+      health((ok) => {
+        if (ok) {
+          healthFailures = 0;
+          setSidecarState("online");
+          return;
+        }
+        healthFailures += 1;
+        // Two misses (~30s) is a real outage, not a transient stall.
+        if (healthFailures >= 2) setSidecarState("offline");
+      });
     }, 15000);
   });
 

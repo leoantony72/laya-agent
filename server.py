@@ -166,6 +166,26 @@ async def _startup() -> None:
 
     log.info("Starting WinBrow server...")
     agent_events.bind_loop(asyncio.get_running_loop())
+
+    # Anything still marked 'running' is a zombie from a previous process that
+    # was killed or crashed mid-task. Fail it before the UI replays history.
+    try:
+        interrupted = get_store().mark_running_interrupted()
+        if interrupted:
+            log.info(f"Marked {interrupted} interrupted task(s) as failed")
+    except Exception as exc:
+        log.debug(f"interrupted-task reconcile failed (non-fatal): {exc}")
+
+    # Warm modules that httpx/httpcore otherwise import lazily on the first
+    # request. A lazy import runs on the event loop, and if another thread is
+    # mid-import it can wait on Python's import lock for a long time — freezing
+    # every REST/WebSocket response (and making the shell report "offline").
+    for name in ("sniffio", "httpcore", "httpx", "anyio"):
+        try:
+            __import__(name)
+        except Exception as exc:
+            log.debug(f"warm-up import {name} skipped: {exc}")
+
     try:
         await asyncio.get_running_loop().run_in_executor(
             None, lambda: get_store().prune(int(
@@ -559,6 +579,16 @@ async def voice_control(action: str):
     if action in ("interrupt", "stop-speaking"):
         return JSONResponse(await service.interrupt())
     return JSONResponse({"error": "Unknown action"}, status_code=400)
+
+
+@app.get("/api/health")
+async def api_health():
+    """Cheap liveness probe for the desktop shell.
+
+    Deliberately does no imports, executor work, or store access: it must stay
+    answerable while the machine is busy running a task.
+    """
+    return JSONResponse({"ok": True, "version": "3.0.0"})
 
 
 @app.get("/api/system")

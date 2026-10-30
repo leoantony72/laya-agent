@@ -30,7 +30,7 @@ General rules:
 
 RULES: list[dict[str, Any]] = [
     {
-        "text": "Typing into an app: first emit app_focus_or_launch with {\"app_name\": \"<app>\"}, then type_text. Skip the focus step only if that app is already Frontmost.",
+        "text": "Typing into an app: first emit app_focus_or_launch with {\"app_name\": \"<app>\"}, then type_text with the same app. If activation reports running_no_window, launch_failed, or success=false, do not type and do not claim the app opened. Skip the focus step only if that app is already Frontmost.",
         "requires": ["app_focus_or_launch", "type_text"],
         "requires_any": [],
     },
@@ -79,7 +79,7 @@ RULES: list[dict[str, Any]] = [
 
 EXAMPLES: list[dict[str, Any]] = [
     {
-        "text": 'Request: open notepad and type hello\n{"kind":"action","steps":[{"skill":"app_focus_or_launch","args":{"app_name":"notepad"},"why":"open Notepad"},{"skill":"type_text","args":{"text":"hello"},"why":"type the text"}]}',
+        "text": 'Request: open notepad and type hello\n{"kind":"action","steps":[{"skill":"app_focus_or_launch","args":{"app_name":"notepad"},"why":"open Notepad"},{"skill":"type_text","args":{"text":"hello","app":"notepad"},"why":"type the text"}]}',
         "requires": ["app_focus_or_launch", "type_text"],
     },
     {
@@ -87,7 +87,7 @@ EXAMPLES: list[dict[str, Any]] = [
         "requires": ["volume_set_level"],
     },
     {
-        "text": 'Request: look up Ada Lovelace and write it in notepad\n{"kind":"action","steps":[{"skill":"mcp_wikipedia_get_summary","args":{"title":"Ada Lovelace"},"why":"fetch summary"},{"skill":"app_focus_or_launch","args":{"app_name":"notepad"},"why":"open Notepad"},{"skill":"type_text","args":{"text":"$PREVIOUS_OUTPUT"},"why":"type the summary"}]}',
+        "text": 'Request: look up Ada Lovelace and write it in notepad\n{"kind":"action","steps":[{"skill":"mcp_wikipedia_get_summary","args":{"title":"Ada Lovelace"},"why":"fetch summary"},{"skill":"app_focus_or_launch","args":{"app_name":"notepad"},"why":"open Notepad"},{"skill":"type_text","args":{"text":"$PREVIOUS_OUTPUT","app":"notepad"},"why":"type the summary"}]}',
         "requires": ["mcp_wikipedia_get_summary", "app_focus_or_launch", "type_text"],
     },
 ]

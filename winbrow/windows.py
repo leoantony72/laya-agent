@@ -640,35 +640,173 @@ def _window_anchor(name: str, query: str = "") -> str:
     return rf"\b{re.escape(anchor)}\b" if anchor else r"(?!)"
 
 
-def _window_match_score(w, query: str, canonical: str, exe_name: str) -> int:
-    pname = (w.process_name or "").lower()
+def _window_tokens(text: str) -> set[str]:
+    """Meaningful lowercase tokens for process/title matching."""
+    return {
+        token for token in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(token) >= 3 and token not in _GENERIC_WINDOW_TOKENS
+    }
+
+
+def _family_tokens(query: str, canonical: str, exe_name: str,
+                   aliases: tuple[str, ...] = ()) -> tuple[set[str], set[str]]:
+    """Build the token/compact families an app may appear under.
+
+    Handles process names that carry a suffix ("WhatsApp.Root.exe"), joined
+    words ("ms-teams.exe"), and executable aliases ("Code.exe").
+    """
+    tokens: set[str] = set()
+    compacts: set[str] = set()
+    for value in (query, canonical, exe_name, *aliases):
+        raw = re.sub(r"\.exe$", "", str(value or "").strip().lower())
+        norm = re.sub(r"[^a-z0-9]+", " ", raw).strip()
+        if not norm:
+            continue
+        tokens |= _window_tokens(norm)
+        compact = norm.replace(" ", "")
+        if compact:
+            compacts.add(compact)
+    return tokens, {c for c in compacts if len(c) >= 3}
+
+
+def _window_match_score(w, query: str, canonical: str, exe_name: str,
+                        aliases: tuple[str, ...] = ()) -> int:
+    pname = (getattr(w, "process_name", "") or "").lower()
     pbase = re.sub(r"\.exe$", "", pname)
     pcompact = re.sub(r"[^a-z0-9]", "", pbase)
-    title = (w.title or "").lower()
+    ptokens = _window_tokens(pbase)
+    title = (getattr(w, "title", "") or "").lower()
+    family_tokens, family_compacts = _family_tokens(
+        query, canonical, exe_name, aliases)
 
-    candidates: set[str] = set()
-    for value in (query, canonical):
-        norm = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
-        if norm:
-            candidates.add(norm)
-            candidates.add(norm.replace(" ", ""))
-    stem = re.sub(r"\.exe$", "", (exe_name or "").lower())
-    if stem:
-        candidates.add(stem)
-        candidates.add(re.sub(r"(?:32|64)$", "", stem))
-    candidates = {c for c in candidates if len(c) >= 3}
-
-    if pbase and (pbase in candidates or pcompact in candidates):
-        return 4
-    if pbase and any(
-            pbase.startswith(c) or c.startswith(pbase) for c in candidates):
-        return 3
-    if (title and _window_anchor(canonical, query)
-            and re.search(_window_anchor(canonical, query), title, re.I)
+    # Exact process/executable wins ("code" → Code.exe, not OpenCode.exe).
+    if pbase and (pbase in family_compacts or pcompact in family_compacts):
+        return 6
+    # A shared meaningful token covers WhatsApp.Root.exe and ms-teams.exe.
+    if ptokens & family_tokens:
+        return 5
+    # A title hit is weaker and must not pick a browser's WebView helper.
+    anchor = _window_anchor(canonical, query)
+    if (title and anchor and re.search(anchor, title, re.I)
             and not any(b in pname for b in ("chrome", "msedge", "brave",
                                              "firefox", "opera"))):
         return 2
     return 0
+
+
+# Shell surfaces that are top-level windows but never an app's main UI.
+_NON_APP_WINDOW_CLASSES = {
+    "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd",
+    "XamlExplorerHostIslandWindow", "TopLevelWindowForOverflowXam",
+    "SystemTray_Main", "ForegroundStaging", "tooltips_class32",
+    "DummyDWMListenerWindow", "ThumbnailDeviceHelperWnd",
+    "EdgeUiInputTopWndClass", "GDI+ Hook Window Class",
+    "Base_PowerMessageWindow", "crashpad_SessionEndWatcher",
+    "DDEMLEvent", "DDEMLMom", "OleDdeWndClass",
+}
+# Dynamic helper classes (the suffix is per-instance, so match the prefix).
+_NON_APP_WINDOW_PREFIXES = (
+    "H.NotifyIcon", ".NET-BroadcastEventWindow", "GDI+ Hook Window Class",
+    "Chrome_WidgetWin_0", "Electron_NotifyIconHostWindow",
+    "Electron_SystemPreferencesHostWindow",
+)
+
+
+def _window_rank(w, query: str, canonical: str, exe_name: str,
+                 aliases: tuple[str, ...] = ()) -> Optional[tuple]:
+    """Rank windows of the app family, preferring a usable main window.
+
+    Score dominates; then we prefer uncloaked, non-tool, titled, visible,
+    unowned, non-minimized and large windows. A hidden main window therefore
+    beats a visible tray/tooltip helper of the same process.
+    """
+    score = _window_match_score(w, query, canonical, exe_name, aliases)
+    if score <= 0:
+        return None
+    cls = str(getattr(w, "class_name", "") or "")
+    if cls in _NON_APP_WINDOW_CLASSES or cls.startswith(_NON_APP_WINDOW_PREFIXES):
+        return None
+    rect = getattr(w, "rect", (0, 0, 0, 0)) or (0, 0, 0, 0)
+    try:
+        left, top, right, bottom = rect
+        area = max(0, right - left) * max(0, bottom - top)
+    except Exception:
+        area = 0
+    visible = bool(getattr(w, "is_visible", True))
+    title = (getattr(w, "title", "") or "").strip()
+    # A hidden, untitled, tool or zero-size window is plumbing, not UI.
+    if not visible and (not title or getattr(w, "is_toolwindow", False)
+                        or area <= 1):
+        return None
+    return (
+        score,
+        0 if getattr(w, "is_cloaked", False) else 1,
+        0 if getattr(w, "is_toolwindow", False) else 1,
+        1 if title else 0,
+        1 if visible else 0,
+        1 if not int(getattr(w, "owner_hwnd", 0) or 0) else 0,
+        0 if getattr(w, "is_minimized", False) else 1,
+        1 if area >= 200 * 150 else 0,
+        area,
+    )
+
+
+def _list_windows_for_activation(driver):
+    """Call list_windows(include_hidden=True) with old/test doubles too."""
+    try:
+        return driver.list_windows(include_hidden=True)
+    except TypeError:
+        return driver.list_windows()
+
+
+def _find_app_windows(driver, query: str, canonical: str, exe_name: str,
+                      aliases: tuple[str, ...] = ()) -> list:
+    ranked = []
+    for w in _list_windows_for_activation(driver):
+        rank = _window_rank(w, query, canonical, exe_name, aliases)
+        if rank is not None:
+            ranked.append((rank, w))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [w for _, w in ranked]
+
+
+def _activate_window(driver, hwnd: int) -> dict:
+    """Use the verified activator when available (legacy doubles use focus)."""
+    activate = getattr(driver, "activate_window", None)
+    if callable(activate):
+        return activate(hwnd)
+    return driver.focus_window(hwnd)
+
+
+def _activation_ok(res) -> bool:
+    # Legacy drivers returned None; absence of an explicit failure is success.
+    if res is None or not isinstance(res, dict):
+        return True
+    return bool(res.get("success", True))
+
+
+async def _wait_for_visible_app_window(driver, query: str, canonical: str,
+                                       exe_name: str,
+                                       aliases: tuple[str, ...] = (),
+                                       timeout: float = 8.0):
+    """Wait until the app exposes a visible, non-cloaked window we can focus."""
+    deadline = time.time() + max(0.5, timeout)
+    while time.time() < deadline:
+        try:
+            windows = await asyncio.to_thread(
+                _find_app_windows, driver, query, canonical, exe_name, aliases)
+        except Exception:
+            windows = []
+        for w in windows:
+            if not getattr(w, "is_visible", True):
+                continue
+            if getattr(w, "is_cloaked", False):
+                continue
+            res = await asyncio.to_thread(_activate_window, driver, w.hwnd)
+            if _activation_ok(res):
+                return w, res
+        await asyncio.sleep(0.3)
+    return None, None
 
 
 def resolve_app_launch_target(app_name: str) -> Optional[str]:
@@ -703,62 +841,86 @@ def _app_launch_script(target: str) -> str:
     """
 
 
-def _process_matches(exe_name: str, canonical: str) -> bool:
-    stem = re.sub(r"\.exe$", "", (exe_name or "").lower())
-    stem = re.sub(r"(?:32|64)$", "", stem)
-    fallback = re.sub(r"[^a-z0-9]+", "", (canonical or "").lower())
-    if not stem and not fallback:
+def _process_matches(exe_name: str, canonical: str, query: str = "",
+                     aliases: tuple[str, ...] = ()) -> bool:
+    """True when a process in the app's family is running.
+
+    Token-aware: "code" matches Code.exe but not OpenCode.exe; "whatsapp"
+    matches WhatsApp.Root.exe; "teams" matches ms-teams.exe.
+    """
+    family_tokens, family_compacts = _family_tokens(
+        query, canonical, exe_name, aliases)
+    if not family_tokens and not family_compacts:
         return False
     for proc in psutil.process_iter(["name"]):
         try:
             pname = (proc.info.get("name") or "").lower()
             pbase = re.sub(r"\.exe$", "", pname)
             pcompact = re.sub(r"[^a-z0-9]", "", pbase)
-            if stem and (pbase.startswith(stem) or stem.startswith(pbase)):
+            if pbase and (pbase in family_compacts or pcompact in family_compacts):
                 return True
-            if fallback and (pcompact == fallback or pcompact.startswith(fallback)):
+            if _window_tokens(pbase) & family_tokens:
                 return True
         except Exception:
             continue
     return False
 
 
+def _app_activation_failure(canonical: str, state: str, output: str,
+                            candidates: list) -> dict[str, Any]:
+    window = None
+    process = ""
+    if candidates:
+        first = candidates[0]
+        try:
+            window = first.to_dict()
+        except Exception:
+            window = None
+        process = getattr(first, "process_name", "") or ""
+    return {
+        "success": False,
+        "state": state,
+        "output": output,
+        "window": window,
+        "process": process,
+        "app": canonical,
+    }
+
+
 async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
-    """Activate a running app, or launch the resolved installed app."""
+    """Bring an app's *visible* window to the front, launching if needed.
+
+    Generic activation ladder (no app-specific branches):
+      1. Find a window in the app's process family — including hidden,
+         minimized and tray-only windows — and show + foreground it.
+      2. If no window can be activated, ask the existing instance to reveal
+         itself by launching its registered activation target (protocol,
+         AppID, shortcut or exe). Single-instance apps handle this by
+         activating their existing window.
+      3. Wait for a visible, non-cloaked window and verify it is foreground.
+      4. If the process is running but no usable window appears, return
+         ``state="running_no_window"``. Process existence is never success.
+
+    A successful result always includes a verified visible foreground window.
+    """
     raw = str(app_name or "").strip()
     if not raw:
-        return {"success": False, "output": "Missing application name"}
+        return {"success": False, "state": "not_found",
+                "output": "Missing application name"}
 
-    from .apps import clean_query, resolve_app, resolve_shortcut_target, suggestions
+    from .apps import (clean_query, resolve_app, resolve_shortcut_target,
+                       suggestions)
 
     query = clean_query(raw)
     match = await asyncio.to_thread(resolve_app, query)
     canonical = match.entry.name if match is not None else query
     exe_name = match.entry.exe_name if match is not None else ""
+    aliases = tuple(match.entry.aliases) if match is not None else ()
+    kind = match.entry.kind if match is not None else ""
+    target = match.entry.target if match is not None else ""
 
-    # 1. Focus an existing window before launching a second copy.
-    # Exact process base wins ("code" → Code.exe), then prefix, then an
-    # anchored title hit. "code" must never match OpenCode.exe.
-    try:
-        from .computer.driver import ComputerDriver
-        driver = ComputerDriver(guard_screen=False)
-        best, best_score = None, 0
-        for w in driver.list_windows():
-            score = _window_match_score(w, query, canonical, exe_name)
-            if score > best_score:
-                best, best_score = w, score
-        if best is not None:
-            driver.focus_window(best.hwnd)
-            await asyncio.sleep(0.2)
-            return {
-                "success": True,
-                "output": f"Activated {best.process_name or canonical}",
-                "window": best.to_dict(),
-            }
-    except Exception as e:
-        log.debug(f"Native focus check error: {e}")
-
-    # 2. No app matched: never launch a guess.
+    # 1. No catalog match: a running window can still identify the app;
+    # otherwise only launch an exact executable on PATH. Never guess.
     if match is None:
         literal = None
         try:
@@ -766,33 +928,111 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
             literal = shutil.which(query) or shutil.which(query + ".exe")
         except Exception:
             literal = None
-        if not literal:
-            options = await asyncio.to_thread(suggestions, query)
-            hint = ""
-            if options:
-                hint = " Did you mean " + ", ".join(options) + "?"
-            return {
-                "success": False,
-                "output": f"I couldn't find an installed app called '{query}'.{hint}",
-            }
+        if literal:
+            target = literal
+            kind = "exe"
+            exe_name = os.path.basename(literal)
 
-    target = match.entry.target if match is not None else literal
-    if match is not None and match.entry.kind == "shortcut":
+    if kind == "shortcut":
         resolved = await asyncio.to_thread(resolve_shortcut_target, target) or ""
         if resolved:
             exe_name = os.path.basename(resolved)
 
-    res = await run_powershell(_app_launch_script(target))
+    try:
+        from .computer.driver import ComputerDriver
+        driver = ComputerDriver(guard_screen=False)
+    except Exception as e:
+        log.debug(f"Computer driver unavailable for app activation: {e}")
+        return {
+            "success": False,
+            "state": "launch_failed",
+            "output": f"I couldn't inspect windows to open {canonical}: {e}",
+            "window": None,
+            "process": "",
+            "app": canonical,
+        }
+
+    # 2. Existing window — visible, minimized, hidden in the tray, or cloaked.
+    try:
+        candidates = await asyncio.to_thread(
+            _find_app_windows, driver, query, canonical, exe_name, aliases)
+    except Exception as e:
+        log.debug(f"App window enumeration failed for {canonical}: {e}")
+        candidates = []
+
+    activation_error = ""
+    for w in candidates:
+        if getattr(w, "is_cloaked", False):
+            activation_error = activation_error or (
+                "its window is on another virtual desktop")
+            continue
+        res = await asyncio.to_thread(_activate_window, driver, w.hwnd)
+        if _activation_ok(res):
+            was_hidden = (
+                not getattr(w, "is_visible", True)
+                or getattr(w, "is_minimized", False)
+            )
+            state = "activated" if was_hidden else "focused"
+            window_dict = w.to_dict() if hasattr(w, "to_dict") else {}
+            if isinstance(window_dict, dict):
+                # Activation is verified: report the window as it is now, not
+                # as it was enumerated before ShowWindow.
+                window_dict["visible"] = True
+                window_dict["minimized"] = False
+            return {
+                "success": True,
+                "state": state,
+                "output": (
+                    f"Activated {canonical} ({w.process_name or 'window'})"
+                    if was_hidden else
+                    f"Focused {canonical} ({w.process_name or 'window'})"
+                ),
+                "window": window_dict,
+                "process": getattr(w, "process_name", "") or "",
+                "app": canonical,
+            }
+        if isinstance(res, dict) and res.get("output"):
+            activation_error = activation_error or str(res["output"])
+
+    # No launch target. If a window exists, report the activation failure;
+    # otherwise this is an unknown app — never guess.
+    if not target:
+        if candidates:
+            detail = ""
+            if activation_error:
+                detail = f" {activation_error.rstrip('.')}."
+            return _app_activation_failure(
+                canonical, "running_no_window",
+                (f"{canonical} has a window, but I couldn't bring it to the "
+                 f"front.{detail}"),
+                candidates)
+        options = await asyncio.to_thread(suggestions, query)
+        hint = ""
+        if options:
+            hint = " Did you mean " + ", ".join(options) + "?"
+        return {
+            "success": False,
+            "state": "not_found",
+            "output": f"I couldn't find an installed app called '{query}'.{hint}",
+        }
+
+    # 3. Ask the running instance to show itself, or launch it if absent.
+    running_before = await asyncio.to_thread(
+        _process_matches, exe_name, canonical, query, aliases)
+    res = await run_powershell(_app_launch_script(target)) or {}
     stdout = str(res.get("stdout") or "")
     stderr = str(res.get("stderr") or "").strip()
     if "__ERR__:" in stdout:
         detail = stdout.split("__ERR__:", 1)[1].strip()
-        return {"success": False,
-                "output": f"Couldn't launch {canonical}: {detail}"}
+        return _app_activation_failure(
+            canonical, "launch_failed",
+            f"Couldn't launch {canonical}: {detail}", candidates)
     if not res.get("success", False):
         detail = stderr or "launch command failed"
-        return {"success": False,
-                "output": f"Couldn't launch {canonical}: {detail}"}
+        return _app_activation_failure(
+            canonical, "launch_failed",
+            f"Couldn't launch {canonical}: {detail}", candidates)
+
     launch_pid = None
     for line in stdout.splitlines():
         line = line.strip()
@@ -804,35 +1044,43 @@ async def focus_or_launch_app(app_name: str) -> dict[str, Any]:
                 launch_pid = None
     log.info(f"Launch request for {canonical} -> {target} (pid={launch_pid})")
 
-    # 3. Verify the app actually started; never claim success blindly.
-    try:
-        from .computer.driver import ComputerDriver
-        driver = ComputerDriver(guard_screen=False)
-        w_res = driver.wait_for_window(
-            _window_anchor(canonical, query), timeout=5.0)
-        if w_res.get("success") and w_res.get("window"):
-            driver.focus_window(w_res["window"]["hwnd"])
-            await asyncio.sleep(0.25)
-            return {
-                "success": True,
-                "output": f"Launched and focused {canonical}",
-                "window": w_res.get("window"),
-            }
-    except AttributeError:
-        pass
-    except Exception as e:
-        log.debug(f"Window wait/focus after launch error: {e}")
+    # 4. Wait for a window that is actually visible; focus it.
+    found, _ = await _wait_for_visible_app_window(
+        driver, query, canonical, exe_name, aliases, timeout=8.0)
+    if found is not None:
+        state = "activated" if (running_before or candidates) else "launched"
+        verb = "Activated" if state == "activated" else "Launched and focused"
+        return {
+            "success": True,
+            "state": state,
+            "output": f"{verb} {canonical} ({found.process_name or 'window'})",
+            "window": found.to_dict() if hasattr(found, "to_dict") else {},
+            "process": getattr(found, "process_name", "") or "",
+            "app": canonical,
+        }
 
-    if launch_pid and psutil.pid_exists(launch_pid):
-        return {"success": True, "output": f"Launched {canonical}"}
-    if _process_matches(exe_name, canonical):
-        return {"success": True, "output": f"Launched {canonical}"}
-    if match is not None and match.entry.kind in ("appid", "protocol"):
-        return {"success": True, "output": f"Launched {canonical}"}
-    return {
-        "success": False,
-        "output": f"I started {canonical}, but couldn't confirm its window appeared.",
-    }
+    # 5. Honest failure: process existence is not "open".
+    process_running = await asyncio.to_thread(
+        _process_matches, exe_name, canonical, query, aliases)
+    if process_running or candidates:
+        detail = ""
+        if candidates:
+            first = candidates[0]
+            detail = (
+                " Its window exists but could not be shown"
+                f" ({getattr(first, 'process_name', '') or 'unknown process'})."
+            )
+        if activation_error:
+            detail = f" {activation_error.rstrip('.')}."
+        return _app_activation_failure(
+            canonical, "running_no_window",
+            (f"{canonical} is running in the background, but it has no visible "
+             f"window I can type into.{detail}"),
+            candidates)
+    return _app_activation_failure(
+        canonical, "launch_failed",
+        f"I started {canonical}, but no visible window appeared.",
+        candidates)
 
 
 async def clean_desktop_to_folder() -> dict[str, Any]:

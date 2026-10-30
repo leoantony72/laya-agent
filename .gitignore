@@ -12,6 +12,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+# ...but the frontend's source modules live in src/lib and must be tracked.
+!frontend/src/lib/
 parts/
 sdist/
 var/

@@ -154,8 +154,17 @@ export default function Dashboard({ agent }: { agent: AgentState }) {
   const chatItems = useMemo(() => {
     return agent.sessionOrder
       .map((id) => agent.sessions[id])
-      .filter((s): s is NonNullable<typeof s> => Boolean(s));
-  }, [agent.sessionOrder, agent.sessions]);
+      .filter((s): s is NonNullable<typeof s> => Boolean(s))
+      // A freshly created chat is a local placeholder until its first message
+      // creates a task; keep it while active, but don't leave it in the rail
+      // after the user moves back to an existing conversation.
+      .filter(
+        (s) =>
+          s.id === agent.activeSessionId ||
+          (s.taskCount ?? 0) > 0 ||
+          s.status === "running",
+      );
+  }, [agent.sessionOrder, agent.sessions, agent.activeSessionId]);
 
   function submit(overrideText?: string): void {
     const text = (overrideText ?? draft).trim();

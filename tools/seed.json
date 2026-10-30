@@ -77,7 +77,7 @@
   },
   {
     "name": "app_focus_or_launch",
-    "description": "Open an application, or bring its window to the front if already open.",
+    "description": "Open an application and bring a visible window to the front, including apps that are running only in the tray. Reports state=running_no_window when the process exists but no usable window can be shown.",
     "examples": [
       "open chrome",
       "switch to vs code",
@@ -412,7 +412,7 @@
   },
   {
     "name": "type_text",
-    "description": "Type or write text into the currently focused window/app via clipboard paste.",
+    "description": "Type or write text into the currently focused window/app via clipboard paste. Pass app to focus and verify the target first.",
     "examples": [
       "type Hello World",
       "write my email is test@example.com",
@@ -426,6 +426,13 @@
         "instructions": "What text to type or write?",
         "criteria": {},
         "default": "Hello World"
+      },
+      {
+        "name": "app",
+        "kind": "text",
+        "instructions": "Optional target app name. The app's visible window is focused and verified before any text is typed.",
+        "criteria": {},
+        "default": ""
       }
     ],
     "script": "\n            $text = \"{{text}}\"\n            Add-Type -AssemblyName System.Windows.Forms\n            [System.Windows.Forms.Clipboard]::SetText($text)\n            $ws = New-Object -ComObject WScript.Shell\n            Start-Sleep -Milliseconds 200\n            $ws.SendKeys(\"^v\")\n            return \"Typed: $text\"\n            ",

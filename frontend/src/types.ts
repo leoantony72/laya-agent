@@ -31,6 +31,8 @@ export interface ConfirmRequest {
   message?: string;
   createdAt?: number;
   expiresAt?: number;
+  /** Task that is waiting on this decision (used to update its trace). */
+  taskId?: string;
 }
 
 export type VoicePhase = "off" | "idle" | "listening" | "thinking" | "speaking";

@@ -16,6 +16,11 @@ rapidfuzz>=3.9
 sounddevice
 onnxruntime
 pyyaml
+# Async HTTP used by the cloud brain stream. `sniffio` is imported lazily by
+# httpcore on the first connection; pin it explicitly and preload it at boot so
+# that import never runs (and can block) on the asyncio event loop mid-task.
+httpx>=0.27
+sniffio>=1.3
 # Native web access (web_search / web_fetch); no browser required
 requests>=2.31
 beautifulsoup4>=4.12

@@ -369,6 +369,13 @@ class WinBrowAgent:
         # Optional UI/CLI callback: async (question) -> answer string. When
         # absent, a clarify stops the loop and is surfaced as needs_input.
         self.ask_user_fn = ask_user_fn
+        # Set when app_focus_or_launch fails (e.g. a tray-only app with no
+        # visible window). type_text refuses to type into whatever happens to
+        # be foreground until a later activation succeeds.
+        self._last_focus_failure: Optional[dict[str, Any]] = None
+        # Last successfully activated app in this turn. A planner that omits
+        # type_text's optional app argument still gets its focus re-verified.
+        self._last_focus_target: Optional[dict[str, Any]] = None
         self.brain = AgentBrain(
             gateway=self.gateway,
             registry=self.registry,
@@ -529,11 +536,27 @@ class WinBrowAgent:
                 return browser_out
             from .windows import focus_or_launch_app
             out = await focus_or_launch_app(app_name)
+            if out.get("success"):
+                self._last_focus_failure = None
+                self._last_focus_target = {
+                    "app": app_name,
+                    "window": out.get("window") or {},
+                }
+            else:
+                self._last_focus_failure = {
+                    "app": app_name,
+                    "state": str(out.get("state") or ""),
+                    "output": str(out.get("output") or ""),
+                }
+                self._last_focus_target = None
             return {
                 "type": "tool_execution",
                 "tool": tool_name,
-                "success": bool(out.get("success", True)),
+                "success": bool(out.get("success", False)),
                 "output": out.get("output", f"Focused {app_name}"),
+                "state": str(out.get("state") or ""),
+                "window": out.get("window"),
+                "process": str(out.get("process") or ""),
                 "elapsed_ms": 15.0,
             }
         if tool_name == "open_common_app":
@@ -551,28 +574,159 @@ class WinBrowAgent:
             text = str(args.get("text", ""))
             # Ensure target application is focused before typing
             target_app = str(args.get("app") or "").strip().lower()
+            if not target_app and self._last_focus_target:
+                target_app = str(
+                    self._last_focus_target.get("app") or "").strip().lower()
             u_low = (utterance or "").lower()
             if not target_app:
-                for app in ("notepad", "word", "code", "calc"):
-                    if app in u_low:
+                for app in ("notepad", "word", "excel", "powerpoint",
+                            "code", "calc"):
+                    if re.search(rf"\b{re.escape(app)}\b", u_low):
                         target_app = app
                         break
-            if target_app:
-                from .windows import focus_or_launch_app
-                await focus_or_launch_app(target_app)
-                await asyncio.sleep(0.2)
             from .computer.driver import ComputerDriver
             driver = ComputerDriver(guard_screen=False)
+            if target_app:
+                from .windows import focus_or_launch_app
+                focus = await focus_or_launch_app(target_app)
+                if not focus.get("success"):
+                    self._last_focus_failure = {
+                        "app": target_app,
+                        "state": str(focus.get("state") or ""),
+                        "output": str(focus.get("output") or ""),
+                    }
+                    self._last_focus_target = None
+                    return {
+                        "type": "tool_execution",
+                        "tool": tool_name,
+                        "success": False,
+                        "output": (
+                            "Did not type anything: "
+                            f"{focus.get('output') or 'the target app could not be focused'}"
+                        ),
+                        "state": str(focus.get("state") or ""),
+                        "window": focus.get("window"),
+                        "elapsed_ms": 15.0,
+                    }
+                self._last_focus_failure = None
+                self._last_focus_target = {
+                    "app": target_app,
+                    "window": focus.get("window") or {},
+                }
+                await asyncio.sleep(0.15)
+                # Activation is verified, but another window can still steal
+                # focus in the gap. Never paste into an unverified app.
+                expected = focus.get("window") or {}
+                expected_pid = int(expected.get("pid") or 0)
+                expected_proc = str(expected.get("process") or "").lower()
+                expected_hwnd = int(expected.get("hwnd") or 0)
+                fg = driver.get_foreground()
+                actual = (fg.get("window") or {}) if fg.get("success") else {}
+                actual_pid = int(actual.get("pid") or 0)
+                actual_proc = str(actual.get("process") or "").lower()
+                actual_hwnd = int(actual.get("hwnd") or 0)
+                same_window = bool(expected_hwnd and actual_hwnd == expected_hwnd)
+                same_proc = bool(expected_proc and actual_proc == expected_proc)
+                if not (expected_pid or expected_proc or expected_hwnd):
+                    return {
+                        "type": "tool_execution",
+                        "tool": tool_name,
+                        "success": False,
+                        "output": (
+                            "Did not type: the activation result did not "
+                            f"identify a verifiable window for {target_app}."
+                        ),
+                        "state": "focus_unverified",
+                        "window": actual,
+                        "elapsed_ms": 15.0,
+                    }
+                if not fg.get("success") or not actual:
+                    return {
+                        "type": "tool_execution",
+                        "tool": tool_name,
+                        "success": False,
+                        "output": (
+                            "Did not type: I could not verify which window has "
+                            f"focus after activating {target_app}."
+                        ),
+                        "state": "focus_unverified",
+                        "window": actual,
+                        "elapsed_ms": 15.0,
+                    }
+                if expected_pid:
+                    if (actual_pid != expected_pid
+                            and not same_proc and not same_window):
+                        return {
+                            "type": "tool_execution",
+                            "tool": tool_name,
+                            "success": False,
+                            "output": (
+                                "Did not type: focus moved to another window "
+                                f"({actual_proc or actual_pid}) after activating "
+                                f"{target_app}."
+                            ),
+                            "state": "focus_lost",
+                            "window": actual,
+                            "elapsed_ms": 15.0,
+                        }
+                elif expected_proc and not same_proc:
+                    return {
+                        "type": "tool_execution",
+                        "tool": tool_name,
+                        "success": False,
+                        "output": (
+                            "Did not type: focus moved to another window "
+                            f"({actual_proc or actual_pid}) after activating "
+                            f"{target_app}."
+                        ),
+                        "state": "focus_lost",
+                        "window": actual,
+                        "elapsed_ms": 15.0,
+                    }
+            elif self._last_focus_failure:
+                # A failed app activation earlier in this turn means there is
+                # no verified target. Typing now would land in whatever window
+                # happens to be in front.
+                failure = self._last_focus_failure
+                return {
+                    "type": "tool_execution",
+                    "tool": tool_name,
+                    "success": False,
+                    "output": (
+                        "Did not type: the last app activation failed "
+                        f"({failure.get('output') or failure.get('state') or 'no window'}). "
+                        "The requested app has no verified visible window."
+                    ),
+                    "state": str(failure.get("state") or ""),
+                    "elapsed_ms": 0.0,
+                }
             out = driver.type_text(text, via_clipboard=True)
             return {
                 "type": "tool_execution",
                 "tool": tool_name,
                 "success": bool(out.get("success", True)),
-                "output": f"Typed text into active window ({len(text)} chars)",
+                "output": (
+                    f"Typed text into {target_app or 'active window'} "
+                    f"({len(text)} chars)"
+                ),
                 "elapsed_ms": 20.0,
             }
         # v3/M1: Python-backed native computer atoms (no script template)
         if getattr(tool, "impl", None) == COMPUTER_IMPL:
+            if tool_name == "computer_type" and self._last_focus_failure:
+                # Legacy alias for type_text: it must obey the same rule.
+                failure = self._last_focus_failure
+                return {
+                    "type": "computer",
+                    "tool": tool_name,
+                    "success": False,
+                    "output": (
+                        "Did not type: the last app activation failed "
+                        f"({failure.get('output') or failure.get('state') or 'no window'}). "
+                        "The requested app has no verified visible window."
+                    ),
+                    "state": str(failure.get("state") or ""),
+                }
             dispatch = COMPUTER_SKILL_DISPATCH.get(tool_name)
             if dispatch is not None:
                 # Async atoms (OCR) run off the event loop via the brain's
@@ -1342,6 +1496,9 @@ class WinBrowAgent:
         3. Record turn in session + episodic memory; return structured trace
         """
         t0 = time.perf_counter()
+        # A failed app activation only applies to the turn that produced it.
+        self._last_focus_failure = None
+        self._last_focus_target = None
         session = self.session if session_id == "default" else get_session(session_id)
 
         # Ensure gateway is ready if keys became available in env
